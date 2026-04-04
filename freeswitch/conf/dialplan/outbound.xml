@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  拨号计划 dialplan/outbound.xml                              ║
+  ║                                                              ║
+  ║  拨号计划是 FreeSWITCH 的呼叫路由核心。                       ║
+  ║  每路通话进入后，从上到下匹配 extension，                     ║
+  ║  第一个匹配的 extension 决定通话如何被处理。                  ║
+  ║                                                              ║
+  ║  Context 说明：                                              ║
+  ║  outbound_calls: 外呼通话（运营商呼出接通后进入）             ║
+  ║  internal      : 内部分机通话                                ║
+  ║  agents        : 人工坐席接听上下文                          ║
+  ╚══════════════════════════════════════════════════════════════╝
+-->
+<include>
+
+  <!-- ============================================================
+       外呼通话上下文
+       由 sofia/outbound profile 触发
+       ============================================================ -->
+    <context name="outbound_calls">
+
+    <extension name="auto_prefix_outbound">
+      <condition field="destination_number" expression="^(\d{11})$">
+
+        <action application="set" data="effective_caller_id_number=202603311547"/>
+
+        <!-- Route through carrier trunk with provider-required prefix 97776 -->
+        <action application="bridge" data="sofia/gateway/carrier_trunk/97776$1"/>
+
+      </condition>
+    </extension>
+
+    <!--
+      ★ 核心 Extension：AI 外呼通话处理
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      触发条件：
+        1. 通话方向为 outbound（外呼方向）
+        2. 携带 ai_agent=true 变量（由 originate 命令设置）
+
+      处理流程：
+        answer → 设置音频参数 → 开始录音 → 交给后端 CallAgent
+    -->
+    <extension name="ai_outbound_answered" continue="false">
+      <!-- 双重条件匹配：方向 + 标记 -->
+      <condition field="${direction}"   expression="^outbound$" break="never"/>
+      <condition field="${ai_agent}"    expression="^true$"     break="on-true">
+
+        <!-- 1. 应答通话（接通被叫） -->
+        <action application="answer"/>
+
+        <!-- 2. 等待媒体稳定（部分运营商需要短暂等待） -->
+        <action application="sleep" data="200"/>
+
+        <!-- 3. 配置音频参数
+             media_bug_answer_req=true: 确保 answer 后才能挂载媒体 bug
+             RECORD_STEREO=false: 单声道录音，节省空间 -->
+        <action application="set" data="media_bug_answer_req=true"/>
+        <action application="set" data="RECORD_STEREO=false"/>
+        <action application="set" data="RECORD_TITLE=AI外呼录音"/>
+        <!-- 设置录音文件路径（含任务ID，便于后续查找） -->
+        <action application="set" data="record_file=$${recording_base_dir}/${task_id}/${uuid}.wav"/>
+
+        <!-- 4. 开始录音（合规要求：所有通话必须录音） -->
+        <action application="record_session" data="${record_file}"/>
+
+        <!-- 5. ★ 关键：将通话控制权交给后端 CallAgent
+             FreeSWITCH 主动连接后端的 ESL Socket 服务器
+             async = 异步模式（FS 可以继续处理其他事件）
+             full  = 完整事件模式（接收所有事件） -->
+        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
+
+        <!-- socket 返回后（CallAgent 挂断或异常），执行清理 -->
+        <action application="hangup" data="NORMAL_CLEARING"/>
+      </condition>
+    </extension>
+
+    <!--
+      外呼无人接听 / 忙音 / 拒绝
+      记录失败原因到频道变量，由 CDR 模块写入记录
+    -->
+    <extension name="ai_outbound_failed" continue="false">
+      <condition field="${direction}"   expression="^outbound$" break="never"/>
+      <condition field="${ai_agent}"    expression="^true$"     break="never"/>
+      <condition field="${hangup_cause}" expression="^(NO_ANSWER|USER_BUSY|CALL_REJECTED|NO_ROUTE_DESTINATION)$" break="on-true">
+        <!-- 记录失败原因，后端 CDR 可读取 -->
+        <action application="set" data="call_result=failed_${hangup_cause}"/>
+        <action application="log" data="WARNING 外呼失败 [${destination_number}] 原因: ${hangup_cause}"/>
+      </condition>
+    </extension>
+
+    <!--
+      转接人工坐席
+      由 CallAgent 通过 ESL 执行 transfer 时触发
+      destination_number 格式：human_agent_<分机号>
+    -->
+    <extension name="transfer_to_human" continue="false">
+      <condition field="destination_number" expression="^human_agent_(\d+)$" break="on-true">
+        <!-- 播放转接提示音 -->
+        <action application="playback" data="tone_stream://%(200,0,440);loops=2"/>
+        <!-- 标记来源（坐席系统可见） -->
+        <action application="set" data="transfer_source=ai_agent"/>
+        <action application="set" data="transfer_reason=${user_intent}"/>
+        <!-- 转入人工坐席上下文 -->
+        <action application="transfer" data="$1 XML agents"/>
+      </condition>
+    </extension>
+
+    <!--
+      兜底：无法匹配的通话直接挂断
+    -->
+    <extension name="catch_all">
+      <condition field="destination_number" expression="^.*$">
+        <action application="log"    data="WARNING 未匹配通话被挂断: ${destination_number}"/>
+        <action application="hangup" data="NO_ROUTE_DESTINATION"/>
+      </condition>
+    </extension>
+
+  </context>
+
+
+  <!-- ============================================================
+       内部分机上下文
+       人工坐席注册后，内部拨号使用
+       ============================================================ -->
+  <context name="internal">
+
+    <!-- 分机互拨（4位分机号） -->
+    <extension name="extension_call">
+      <condition field="destination_number" expression="^(\d{4})$">
+        <action application="set"    data="call_timeout=30"/>
+        <action application="bridge" data="user/$1@${domain_name}"/>
+      </condition>
+    </extension>
+
+    <!-- 内部分机呼出到运营商 -->
+    <extension name="outbound_via_carrier">
+      <condition field="destination_number" expression="^9(\d{10,11})$">
+        <action application="set"    data="effective_caller_id_number=$${outbound_caller_id}"/>
+        <action application="set"    data="effective_caller_id_name=$${outbound_caller_name}"/>
+        <!-- Add the required prefix for SIP provider (97776) -->
+        <action application="bridge" data="sofia/gateway/$${carrier_gateway}/97776$1"/>
+      </condition>
+    </extension>
+
+  </context>
+
+
+  <!-- ============================================================
+       人工坐席排队上下文
+       被转入的通话在此等待坐席接听
+       ============================================================ -->
+  <context name="agents">
+
+    <extension name="agent_queue">
+      <condition field="destination_number" expression="^(\d+)$">
+        <action application="answer"/>
+        <!-- 告知客户正在转接 -->
+        <action application="sleep"    data="500"/>
+        <!-- 播放等待音乐（循环，直到坐席接听） -->
+        <action application="set"      data="fifo_music=local_stream://moh"/>
+        <!-- 进入呼叫中心队列
+             agent_queue@default = 队列名@domain
+             in  = 以呼叫方身份进入队列等待
+        -->
+        <action application="fifo"     data="agent_queue@default in local_stream://moh"/>
+        <!-- 坐席未接（超时） -->
+        <action application="playback" data="ivr/ivr-goodbye.wav"/>
+        <action application="hangup"   data="NORMAL_CLEARING"/>
+      </condition>
+    </extension>
+
+    <!-- 坐席登录（坐席拨 *xxx 接入队列等待接听） -->
+    <extension name="agent_login">
+      <condition field="destination_number" expression="^\*(\d+)$">
+        <action application="answer"/>
+        <action application="set"  data="fifo_member_wait=nowait"/>
+        <!-- 坐席以"接听方"进入队列 -->
+        <action application="fifo" data="$1@default out wait"/>
+      </condition>
+    </extension>
+
+  </context>
+
+</include>

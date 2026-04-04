@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x:*)",
+      "Bash(python3:*)",
+      "Bash(docker-compose:*)",
+      "Bash(python:*)",
+      "Bash(yq .:*)",
+      "Bash(docker/freeswitch/conf/vars.xml:*)",
+      "Bash(docker/freeswitch/conf/directory/default.xml:*)",
+      "Bash(curl:*)",
+      "Bash(docker/freeswitch/conf/sip_profiles/internal.xml:*)",
+      "Bash(docker/freeswitch/conf/sip_profiles/external.xml:*)",
+      "Bash(docker/freeswitch/conf/sip_profiles_external/external.xml:*)",
+      "Bash(docker/freeswitch/conf_full/sip_profiles/external.xml:*)",
+      "Bash(docker/freeswitch/init_freeswitch.sh:*)",
+      "Bash(docker/freeswitch/conf_temp/sip_profiles/external.xml:*)",
+      "Bash(docker/freeswitch/conf_temp/vars.xml:*)",
+      "Bash(docker/freeswitch/conf_temp/autoload_configs/event_socket.conf.xml:*)",
+      "Bash(docker/freeswitch/conf_temp/autoload_configs/acl.conf.xml:*)",
+      "Bash(docker/freeswitch/conf_temp/autoload_configs/modules.conf.xml:*)",
+      "Bash(docker/freeswitch/conf_temp/directory/default.xml:*)",
+      "Bash(docker/freeswitch/conf_custom/user_external.xml:*)",
+      "Bash(docker/freeswitch/init_custom_conf.sh:*)",
+      "Bash(docker/freeswitch/conf_simple/autoload_configs/event_socket.conf.xml:*)",
+      "Bash(docker/freeswitch/conf_complete/autoload_configs/acl.conf.xml:*)",
+      "Bash(docker/freeswitch/setup_gateway.sh:*)",
+      "Bash(xargs ls:*)"
+    ]
+  }
+}

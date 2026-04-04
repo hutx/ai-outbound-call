@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>智能外呼管理平台</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1117;--surface:#1a1d27;--surface2:#20233200;--border:#252836;
+  --text:#e2e4ec;--muted:#6b7080;--blue:#4f9cf9;--green:#3ecf8e;
+  --amber:#f5a623;--red:#f56565;--purple:#a78bfa;--teal:#2dd4bf;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,'PingFang SC',sans-serif;font-size:13px;display:flex;height:100vh;overflow:hidden}
+
+/* ── Sidebar ────────────────────────────── */
+.sidebar{width:196px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.logo{padding:16px;border-bottom:1px solid var(--border)}
+.logo h1{font-size:14px;font-weight:600}
+.logo span{font-size:11px;color:var(--muted)}
+.nav{flex:1;padding:6px 0}
+.nav-item{display:flex;align-items:center;gap:9px;padding:9px 16px;cursor:pointer;color:var(--muted);border-left:3px solid transparent;transition:all .15s;user-select:none}
+.nav-item:hover{color:var(--text);background:rgba(255,255,255,.04)}
+.nav-item.active{color:var(--blue);background:rgba(79,156,249,.08);border-left-color:var(--blue)}
+.nav-icon{font-size:14px;width:16px;text-align:center}
+.sidebar-foot{padding:12px 16px;border-top:1px solid var(--border)}
+.sys-badge{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%}
+.dot.green{background:var(--green);box-shadow:0 0 5px var(--green)}
+.dot.red{background:var(--red)}
+.dot.amber{background:var(--amber)}
+
+/* ── Main ───────────────────────────────── */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:13px 22px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.topbar h2{font-size:15px;font-weight:500}
+.topbar-right{display:flex;gap:8px;align-items:center}
+.content{flex:1;overflow-y:auto;padding:20px 22px}
+
+/* ── Cards ──────────────────────────────── */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:13px 15px}
+.stat-card label{font-size:11px;color:var(--muted);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
+.stat-val{font-size:24px;font-weight:600}
+.stat-val.blue{color:var(--blue)}.stat-val.green{color:var(--green)}.stat-val.amber{color:var(--amber)}.stat-val.purple{color:var(--purple)}
+.stat-sub{font-size:11px;color:var(--muted);margin-top:3px}
+
+/* ── Section ────────────────────────────── */
+.section{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:14px;overflow:hidden}
+.sec-head{display:flex;align-items:center;justify-content:space-between;padding:11px 15px;border-bottom:1px solid var(--border)}
+.sec-head h3{font-size:13px;font-weight:500}
+.sec-body{padding:14px 15px}
+
+/* ── Table ──────────────────────────────── */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--muted);font-weight:400;padding:7px 10px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+td{padding:9px 10px;border-bottom:1px solid rgba(37,40,54,.7);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.empty-row td{text-align:center;color:var(--muted);padding:24px}
+
+/* ── Buttons ────────────────────────────── */
+.btn{padding:6px 14px;border-radius:7px;border:1px solid var(--border);background:transparent;color:var(--text);font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.06)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.primary{background:var(--blue);color:#fff;border-color:transparent}
+.btn.primary:hover{filter:brightness(1.1)}
+.btn.danger{color:var(--red);border-color:rgba(245,101,101,.4)}
+.btn.danger:hover{background:rgba(245,101,101,.1)}
+.btn.sm{padding:3px 9px;font-size:11px}
+.btn.xs{padding:2px 7px;font-size:10px}
+
+/* ── Pills ──────────────────────────────── */
+.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:500;white-space:nowrap}
+.pill .dot{width:5px;height:5px}
+.pill.running{background:rgba(79,156,249,.15);color:var(--blue)}
+.pill.done{background:rgba(62,207,142,.12);color:var(--green)}
+.pill.paused{background:rgba(245,166,35,.12);color:var(--amber)}
+.pill.pending{background:rgba(107,112,128,.15);color:var(--muted)}
+.pill.cancelled,.pill.error{background:rgba(245,101,101,.12);color:var(--red)}
+.pill.high,.pill.interested{background:rgba(62,207,142,.12);color:var(--green)}
+.pill.medium{background:rgba(79,156,249,.12);color:var(--blue)}
+.pill.low,.pill.unknown,.pill.none{background:rgba(107,112,128,.15);color:var(--muted)}
+.pill.not_interested{background:rgba(245,101,101,.1);color:var(--red)}
+
+/* ── Progress ───────────────────────────── */
+.prog-wrap{display:flex;align-items:center;gap:7px}
+.prog-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden;width:90px;flex-shrink:0}
+.prog-fill{height:100%;border-radius:2px;background:var(--blue);transition:width .4s}
+.prog-pct{font-size:11px;color:var(--muted);min-width:30px}
+
+/* ── Live call ──────────────────────────── */
+.call-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:11px 13px;margin-bottom:8px}
+.call-card:last-child{margin-bottom:0}
+.call-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.call-phone{font-weight:500;font-size:13px}
+.call-timer{font-family:monospace;font-size:12px;color:var(--muted)}
+.bubble{display:inline-block;padding:5px 10px;border-radius:10px;font-size:12px;max-width:85%;margin:2px 0;line-height:1.5}
+.bubble.ai{background:rgba(79,156,249,.15);color:#c5dcfc;border-bottom-left-radius:2px}
+.bubble.user{background:var(--surface);border:1px solid var(--border);float:right;clear:both;border-bottom-right-radius:2px}
+.clear{clear:both}
+
+/* ── Modal ──────────────────────────────── */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center}
+.overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:22px;width:500px;max-height:90vh;overflow-y:auto}
+.modal h3{font-size:15px;font-weight:500;margin-bottom:16px}
+.form-group{margin-bottom:13px}
+.form-group label{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px}
+.form-group input,.form-group select,.form-group textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:8px 10px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:var(--blue)}
+.form-group textarea{resize:vertical;min-height:90px;font-family:monospace;font-size:12px}
+.form-hint{font-size:11px;color:var(--muted);margin-top:4px}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;padding-top:14px;border-top:1px solid var(--border)}
+
+/* ── Notification ───────────────────────── */
+.notif{position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:8px;font-size:13px;z-index:200;transform:translateY(60px);opacity:0;transition:all .25s;pointer-events:none;max-width:320px}
+.notif.show{transform:translateY(0);opacity:1}
+.notif.ok{background:#1a3a2e;border:1px solid var(--green);color:var(--green)}
+.notif.err{background:#3a1a1a;border:1px solid var(--red);color:var(--red)}
+.notif.info{background:#1a2a3a;border:1px solid var(--blue);color:var(--blue)}
+
+/* ── Page visibility ────────────────────── */
+.page{display:none}.page.active{display:block}
+
+/* ── Script cards ───────────────────────── */
+.script-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.script-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;cursor:pointer;transition:border-color .15s}
+.script-card:hover{border-color:var(--blue)}
+.script-card.add{display:flex;align-items:center;justify-content:center;gap:6px;color:var(--muted);border-style:dashed}
+.script-card.add:hover{color:var(--text);border-color:var(--text)}
+.script-name{font-weight:500;font-size:13px;margin-bottom:5px}
+.script-desc{font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:10px}
+
+/* ── Scrollbar ──────────────────────────── */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar ──────────────────────────────────────────────── -->
+<div class="sidebar">
+  <div class="logo">
+    <h1>智能外呼平台</h1>
+    <span id="ver-badge">v2.0.0</span>
+  </div>
+  <nav class="nav">
+    <div class="nav-item active" onclick="nav('monitor',this)"><span class="nav-icon">◎</span>实时监控</div>
+    <div class="nav-item" onclick="nav('tasks',this)"><span class="nav-icon">☰</span>外呼任务</div>
+    <div class="nav-item" onclick="nav('records',this)"><span class="nav-icon">◷</span>通话记录</div>
+    <div class="nav-item" onclick="nav('blacklist',this)"><span class="nav-icon">⊘</span>黑名单</div>
+    <div class="nav-item" onclick="nav('scripts',this)"><span class="nav-icon">◈</span>话术管理</div>
+    <div class="nav-item" onclick="nav('callbacks',this)"><span class="nav-icon">↩</span>回拨计划</div>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="sys-badge" id="sys-status">
+      <div class="dot amber" id="status-dot"></div>
+      <span id="status-text">连接中...</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Main ─────────────────────────────────────────────────── -->
+<div class="main">
+
+<!-- ══ 实时监控 ══════════════════════════════════════════════ -->
+<div id="page-monitor" class="page active">
+  <div class="topbar">
+    <h2>实时监控</h2>
+    <div class="topbar-right">
+      <span class="pill running" id="badge-concurrent"><span class="dot"></span>并发: <span id="conc-val">0</span> / <span id="conc-max">50</span></span>
+      <button class="btn primary" onclick="openModal('task-modal')">+ 新建任务</button>
+    </div>
+  </div>
+  <div class="content">
+    <div class="stat-grid">
+      <div class="stat-card"><label>今日外呼</label><div class="stat-val blue" id="s-total">—</div><div class="stat-sub" id="s-total-sub">—</div></div>
+      <div class="stat-card"><label>接通率</label><div class="stat-val green" id="s-connect">—</div><div class="stat-sub">行业均值 58%</div></div>
+      <div class="stat-card"><label>意向率</label><div class="stat-val amber" id="s-intent">—</div><div class="stat-sub" id="s-intent-sub">—</div></div>
+      <div class="stat-card"><label>活跃任务</label><div class="stat-val purple" id="s-tasks">—</div><div class="stat-sub">个任务进行中</div></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head"><h3>当前通话 <span id="live-count" style="color:var(--muted);font-weight:400"></span></h3><button class="btn sm" onclick="fetchStats()">刷新</button></div>
+      <div id="live-container" class="sec-body">
+        <div style="color:var(--muted);text-align:center;padding:20px">暂无活跃通话</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head"><h3>任务进度</h3></div>
+      <div style="padding:0">
+        <table><thead><tr><th>任务名称</th><th>话术</th><th>号码数</th><th>进度</th><th>接通率</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="task-mini-tbody"><tr class="empty-row"><td colspan="7">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 外呼任务 ══════════════════════════════════════════════ -->
+<div id="page-tasks" class="page">
+  <div class="topbar"><h2>外呼任务</h2><div class="topbar-right"><button class="btn primary" onclick="openModal('task-modal')">+ 新建任务</button></div></div>
+  <div class="content">
+    <div class="section"><div style="padding:0">
+      <table><thead><tr><th>任务 ID</th><th>名称</th><th>话术</th><th>数量</th><th>进度</th><th>接通</th><th>意向</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody id="tasks-tbody"><tr class="empty-row"><td colspan="10">暂无任务</td></tr></tbody>
+      </table>
+    </div></div>
+  </div>
+</div>
+
+<!-- ══ 通话记录 ══════════════════════════════════════════════ -->
+<div id="page-records" class="page">
+  <div class="topbar">
+    <h2>通话记录</h2>
+    <div class="topbar-right">
+      <input id="rec-task-filter" type="text" placeholder="任务 ID 过滤" style="background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px;color:var(--text);font-size:12px;width:180px;outline:none"/>
+      <button class="btn" onclick="fetchRecords()">查询</button>
+      <button class="btn" onclick="exportCSV()">导出 CSV</button>
+    </div>
+  </div>
+  <div class="content">
+    <div class="stat-grid" id="rec-stats" style="grid-template-columns:repeat(5,1fr);margin-bottom:14px">
+      <div class="stat-card"><label>总计</label><div class="stat-val blue" id="rs-total">—</div></div>
+      <div class="stat-card"><label>接通</label><div class="stat-val green" id="rs-conn">—</div></div>
+      <div class="stat-card"><label>意向</label><div class="stat-val amber" id="rs-intent">—</div></div>
+      <div class="stat-card"><label>接通率</label><div class="stat-val blue" id="rs-crate">—</div></div>
+      <div class="stat-card"><label>均时长</label><div class="stat-val purple" id="rs-dur">—</div></div>
+    </div>
+    <div class="section"><div style="padding:0">
+      <table><thead><tr><th>号码</th><th>任务</th><th>话术</th><th>时间</th><th>时长</th><th>意图</th><th>结果</th><th>AI 轮</th><th>录音</th></tr></thead>
+      <tbody id="records-tbody"><tr class="empty-row"><td colspan="9">加载中...</td></tr></tbody>
+      </table>
+    </div></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button class="btn sm" id="prev-btn" onclick="recPage--; fetchRecords()" disabled>← 上一页</button>
+      <span id="page-info" style="font-size:12px;color:var(--muted);line-height:30px">第 1 页</span>
+      <button class="btn sm" id="next-btn" onclick="recPage++; fetchRecords()">下一页 →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 黑名单 ════════════════════════════════════════════════ -->
+<div id="page-blacklist" class="page">
+  <div class="topbar">
+    <h2>黑名单管理</h2>
+    <div class="topbar-right">
+      <button class="btn primary" onclick="openModal('bl-modal')">+ 添加号码</button>
+    </div>
+  </div>
+  <div class="content">
+    <div class="section" style="margin-bottom:10px;background:rgba(245,101,101,.06);border-color:rgba(245,101,101,.2)">
+      <div class="sec-body" style="font-size:12px;color:var(--muted)">
+        ⚠ 黑名单中的号码将被所有外呼任务自动跳过。用户在通话中说"不要再打了"后系统会自动加入。
+      </div>
+    </div>
+    <div class="section"><div style="padding:0">
+      <table><thead><tr><th>手机号码</th><th>加入原因</th><th>加入时间</th><th>操作</th></tr></thead>
+      <tbody id="bl-tbody"><tr class="empty-row"><td colspan="4">加载中...</td></tr></tbody>
+      </table>
+    </div></div>
+  </div>
+</div>
+
+<!-- ══ 话术管理 ══════════════════════════════════════════════ -->
+<div id="page-scripts" class="page">
+  <div class="topbar"><h2>话术管理</h2></div>
+  <div class="content">
+    <div style="margin-bottom:12px;font-size:12px;color:var(--muted)">
+      话术脚本从 <code style="background:var(--surface);padding:2px 6px;border-radius:4px;color:var(--blue)">SCRIPTS_PATH</code> 环境变量指定的 JSON 文件加载。修改文件后重启服务即可热加载。
+    </div>
+    <div class="script-grid" id="scripts-grid">
+      <div style="color:var(--muted);font-size:12px">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 回拨计划 ══════════════════════════════════════════════ -->
+<div id="page-callbacks" class="page">
+  <div class="topbar"><h2>回拨计划</h2><div class="topbar-right"><button class="btn sm" onclick="fetchCallbacks()">刷新</button></div></div>
+  <div class="content">
+    <div class="section"><div style="padding:0">
+      <table><thead><tr><th>手机号码</th><th>关联任务</th><th>预约时间</th><th>备注</th></tr></thead>
+      <tbody id="cb-tbody"><tr class="empty-row"><td colspan="4">加载中...</td></tr></tbody>
+      </table>
+    </div></div>
+  </div>
+</div>
+
+</div><!-- end .main -->
+
+<!-- ══ Modal：新建任务 ════════════════════════════════════════ -->
+<div class="overlay" id="task-modal" onclick="if(event.target===this)closeModal('task-modal')">
+  <div class="modal">
+    <h3>新建外呼任务</h3>
+    <div class="form-group">
+      <label>任务名称 *</label>
+      <input id="f-name" type="text" placeholder="例：2025 Q2 理财产品推广"/>
+    </div>
+    <div class="form-group">
+      <label>话术模板 *</label>
+      <select id="f-script"></select>
+    </div>
+    <div class="form-group">
+      <label>外显主叫号码（备案号）</label>
+      <input id="f-caller" type="text" placeholder="例：02100000000"/>
+      <div class="form-hint">留空使用默认配置</div>
+    </div>
+    <div class="form-group">
+      <label>并发路数（1 – 50）</label>
+      <input id="f-concurrent" type="number" value="5" min="1" max="50"/>
+    </div>
+    <div class="form-group">
+      <label>失败重试次数</label>
+      <input id="f-retries" type="number" value="1" min="0" max="3"/>
+    </div>
+    <div class="form-group">
+      <label>手机号码列表 *</label>
+      <textarea id="f-phones" placeholder="每行一个手机号&#10;13800138001&#10;13800138002&#10;13912345678"></textarea>
+      <div class="form-hint" id="phone-count-hint">0 个号码</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('task-modal')">取消</button>
+      <button class="btn primary" onclick="submitTask()">创建并启动</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ Modal：添加黑名单 ══════════════════════════════════════ -->
+<div class="overlay" id="bl-modal" onclick="if(event.target===this)closeModal('bl-modal')">
+  <div class="modal" style="width:380px">
+    <h3>添加黑名单号码</h3>
+    <div class="form-group">
+      <label>手机号码 *</label>
+      <input id="bl-phone" type="text" placeholder="13800138000"/>
+    </div>
+    <div class="form-group">
+      <label>加入原因</label>
+      <input id="bl-reason" type="text" placeholder="例：用户明确拒绝"/>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('bl-modal')">取消</button>
+      <button class="btn danger" onclick="submitBlacklist()">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ Notification ══════════════════════════════════════════ -->
+<div class="notif" id="notif"></div>
+
+<script>
+// ── Config ─────────────────────────────────────────────────
+const API_TOKEN = '';  // 从 localStorage 或 URL param 读取
+const API = '';        // 相对路径，同源
+let recPage = 1;
+const REC_LIMIT = 50;
+
+// ── Utils ───────────────────────────────────────────────────
+function $(id){ return document.getElementById(id) }
+function fmt_time(iso){ return iso ? iso.replace('T',' ').slice(0,16) : '—' }
+function fmt_dur(s){ if(!s) return '—'; return Math.floor(s/60)+"'"+String(s%60).padStart(2,'0')+'"' }
+function mask_phone(p){ return p ? p.slice(0,3)+'****'+p.slice(-4) : '—' }
+
+function notify(msg, type='ok', ms=3000){
+  const el=$('notif'); el.textContent=msg; el.className='notif show '+type;
+  setTimeout(()=>el.classList.remove('show'), ms);
+}
+
+async function api(path, opts={}){
+  const headers = {'Content-Type':'application/json'};
+  if(API_TOKEN) headers['Authorization']='Bearer '+API_TOKEN;
+  const r = await fetch(API+path, {headers,...opts});
+  if(!r.ok){ const e=await r.json().catch(()=>({detail:r.statusText})); throw new Error(e.detail||r.statusText); }
+  return r.json();
+}
+
+// ── Navigation ──────────────────────────────────────────────
+function nav(page, el){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  $('page-'+page).classList.add('active');
+  el.classList.add('active');
+  // Lazy load
+  if(page==='tasks')     fetchTasks();
+  if(page==='records')   fetchRecords();
+  if(page==='blacklist') fetchBlacklist();
+  if(page==='scripts')   fetchScripts();
+  if(page==='callbacks') fetchCallbacks();
+}
+
+// ── Modal ───────────────────────────────────────────────────
+function openModal(id){
+  $(id).classList.add('show');
+  if(id==='task-modal') fetchScripts(true); // populate select
+}
+function closeModal(id){ $(id).classList.remove('show') }
+
+// ── Stats & Live ────────────────────────────────────────────
+async function fetchStats(){
+  try {
+    const d = await api('/api/stats');
+    $('conc-val').textContent = d.active_calls;
+    $('conc-max').textContent = d.max_concurrent;
+    $('s-tasks').textContent = d.active_tasks;
+
+    // live calls display
+    $('live-count').textContent = `— ${d.active_calls} 路`;
+    if(d.active_calls === 0){
+      $('live-container').innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">暂无活跃通话</div>';
+    }
+
+    // task mini table
+    renderTaskTable('task-mini-tbody', (d.tasks||[]).slice(0,8), false);
+
+    // status dot
+    $('status-dot').className = 'dot green';
+    $('status-text').textContent = '系统正常';
+  } catch(e){
+    $('status-dot').className='dot red';
+    $('status-text').textContent='连接失败';
+  }
+}
+
+async function fetchTodayStats(){
+  try {
+    const d = await api('/api/calls/stats');
+    $('s-total').textContent = (d.total||0).toLocaleString();
+    $('s-total-sub').textContent = '今日累计';
+    $('s-connect').textContent = (d.connect_rate||0).toFixed(1)+'%';
+    $('s-intent').textContent = (d.intent_rate||0).toFixed(1)+'%';
+    $('s-intent-sub').textContent = `意向 ${d.intent||0} 人`;
+    // rec stats
+    $('rs-total').textContent = d.total||0;
+    $('rs-conn').textContent  = d.connected||0;
+    $('rs-intent').textContent= d.intent||0;
+    $('rs-crate').textContent = (d.connect_rate||0).toFixed(1)+'%';
+    $('rs-dur').textContent   = fmt_dur(d.avg_duration);
+  } catch(e){}
+}
+
+// ── Tasks ───────────────────────────────────────────────────
+const STATUS_CLS = {RUNNING:'running',COMPLETED:'done',PAUSED:'paused',PENDING:'pending',CANCELLED:'cancelled',FAILED:'error'};
+const STATUS_LABEL = {RUNNING:'进行中',COMPLETED:'已完成',PAUSED:'已暂停',PENDING:'待启动',CANCELLED:'已取消',FAILED:'失败'};
+
+function renderTaskTable(tbodyId, tasks, full=true){
+  const tbody=$(tbodyId);
+  if(!tasks||!tasks.length){ tbody.innerHTML='<tr class="empty-row"><td colspan="'+(full?10:7)+'">暂无任务</td></tr>'; return; }
+  tbody.innerHTML=tasks.map(t=>{
+    const sc=STATUS_CLS[t.status]||'pending';
+    const sl=STATUS_LABEL[t.status]||t.status;
+    const pct=t.progress||0;
+    const cr=t.connect_rate!=null?(t.connect_rate.toFixed(1)+'%'):'—';
+    const fullCols=full?`<td style="font-family:monospace;font-size:10px;color:var(--muted)">${(t.task_id||'').slice(0,14)}</td>`:'';
+    const ops = t.status==='RUNNING'
+      ? `<button class="btn xs" onclick="pauseTask('${t.task_id}')">暂停</button>`
+      : t.status==='PAUSED'
+      ? `<button class="btn xs primary" onclick="resumeTask('${t.task_id}')">恢复</button> <button class="btn xs danger" onclick="cancelTask('${t.task_id}')">取消</button>`
+      : `<button class="btn xs" onclick="viewTaskRecords('${t.task_id}')">记录</button>`;
+    const intentCol=full?`<td>${t.intent_count||0}</td>`:'';
+    return `<tr>
+      ${fullCols}
+      <td>${t.name||'—'}</td>
+      <td style="color:var(--muted)">${t.script_id||'—'}</td>
+      <td>${t.total||0}</td>
+      <td><div class="prog-wrap"><div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div><span class="prog-pct">${pct}%</span></div></td>
+      <td style="color:var(--green)">${cr}</td>
+      ${intentCol}
+      <td><span class="pill ${sc}">${sl}</span></td>
+      ${full?`<td style="color:var(--muted);font-size:11px">${fmt_time(t.created_at)}</td>`:''}
+      <td>${ops}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function fetchTasks(){
+  try {
+    const d=await api('/api/tasks');
+    renderTaskTable('tasks-tbody',d.tasks||[],true);
+  } catch(e){ notify('加载任务失败: '+e.message,'err') }
+}
+
+async function pauseTask(id){ try{ await api('/api/tasks/'+id+'/pause',{method:'POST'}); notify('已暂停','ok'); fetchTasks(); fetchStats(); }catch(e){notify(e.message,'err')} }
+async function resumeTask(id){ try{ await api('/api/tasks/'+id+'/resume',{method:'POST'}); notify('已恢复','ok'); fetchTasks(); fetchStats(); }catch(e){notify(e.message,'err')} }
+async function cancelTask(id){ if(!confirm('确认取消任务？')) return; try{ await api('/api/tasks/'+id,{method:'DELETE'}); notify('已取消','ok'); fetchTasks(); fetchStats(); }catch(e){notify(e.message,'err')} }
+
+function viewTaskRecords(taskId){
+  $('rec-task-filter').value = taskId;
+  recPage = 1;
+  nav('records', document.querySelectorAll('.nav-item')[2]);
+}
+
+// ── Submit Task ─────────────────────────────────────────────
+async function submitTask(){
+  const name=      $('f-name').value.trim();
+  const script_id= $('f-script').value;
+  const concurrent=parseInt($('f-concurrent').value)||5;
+  const retries=   parseInt($('f-retries').value)||1;
+  const caller=    $('f-caller').value.trim();
+  const phones=    $('f-phones').value.split('\n').map(s=>s.trim()).filter(s=>/^1[3-9]\d{9}$/.test(s));
+
+  if(!name){  notify('请填写任务名称','err'); return }
+  if(!phones.length){ notify('没有有效的手机号码（11位，1开头）','err'); return }
+
+  try {
+    const body={name,script_id,phone_numbers:phones,concurrent_limit:concurrent,max_retries:retries};
+    if(caller) body.caller_id=caller;
+    const d=await api('/api/tasks',{method:'POST',body:JSON.stringify(body)});
+    closeModal('task-modal');
+    notify(`任务已创建：${d.task_id}（${phones.length} 个号码）`,'ok',4000);
+    fetchTasks(); fetchStats();
+    // reset form
+    $('f-name').value=''; $('f-phones').value=''; $('phone-count-hint').textContent='0 个号码';
+  } catch(e){ notify('创建失败：'+e.message,'err') }
+}
+
+// phone count hint
+document.addEventListener('DOMContentLoaded',()=>{
+  $('f-phones').addEventListener('input',()=>{
+    const cnt=$('f-phones').value.split('\n').map(s=>s.trim()).filter(s=>/^1[3-9]\d{9}$/.test(s)).length;
+    $('phone-count-hint').textContent = cnt+' 个有效号码';
+  });
+});
+
+// ── Call Records ────────────────────────────────────────────
+const INTENT_CLS ={interested:'high',high:'high',medium:'medium',low:'low',not_interested:'not_interested',callback:'medium',request_human:'medium',unknown:'unknown',busy:'low',need_more_info:'medium'};
+const INTENT_LABEL={interested:'高意向',high:'高意向',medium:'中意向',low:'低意向',not_interested:'无意向',callback:'约回拨',request_human:'要人工',unknown:'未知',busy:'繁忙',need_more_info:'需了解'};
+const RESULT_CLS ={completed:'done',transferred:'running',error:'error',not_answered:'pending',blacklisted:'cancelled'};
+const RESULT_LABEL={completed:'完成',transferred:'转人工',error:'异常',not_answered:'无人接',blacklisted:'黑名单'};
+
+async function fetchRecords(){
+  const tid=$('rec-task-filter').value.trim();
+  const offset=(recPage-1)*REC_LIMIT;
+  try {
+    const d=await api(`/api/calls?limit=${REC_LIMIT}&offset=${offset}${tid?'&task_id='+tid:''}`);
+    const rows=d.records||[];
+    $('prev-btn').disabled=recPage<=1;
+    $('next-btn').disabled=rows.length<REC_LIMIT;
+    $('page-info').textContent=`第 ${recPage} 页`;
+
+    if(!rows.length){ $('records-tbody').innerHTML='<tr class="empty-row"><td colspan="9">无记录</td></tr>'; }
+    else {
+      $('records-tbody').innerHTML=rows.map(r=>`<tr>
+        <td style="font-family:monospace">${mask_phone(r.phone_number)}</td>
+        <td style="font-size:11px;color:var(--muted)">${(r.task_id||'').slice(0,12)}</td>
+        <td style="color:var(--muted)">${r.script_id||'—'}</td>
+        <td style="color:var(--muted)">${fmt_time(r.created_at)}</td>
+        <td>${fmt_dur(r.duration_seconds)}</td>
+        <td><span class="pill ${INTENT_CLS[r.intent]||'unknown'}">${INTENT_LABEL[r.intent]||r.intent||'—'}</span></td>
+        <td><span class="pill ${RESULT_CLS[r.result]||'pending'}">${RESULT_LABEL[r.result]||r.result||'—'}</span></td>
+        <td>${r.user_utterances||0} / ${r.ai_utterances||0}</td>
+        <td>${r.recording_path?`<button class="btn xs" onclick="playRecording('${r.recording_path}')">▶ 播放</button>`:'<span style="color:var(--muted)">无</span>'}</td>
+      </tr>`).join('');
+    }
+    fetchTodayStats();
+  } catch(e){ notify('查询失败: '+e.message,'err') }
+}
+
+function playRecording(path){
+  const url=API+'/recordings/'+path.split('/').pop();
+  const audio=new Audio(url); audio.play().catch(()=>notify('播放失败，检查录音文件是否存在','err'));
+}
+
+function exportCSV(){
+  const tid=$('rec-task-filter').value.trim();
+  const url=API+'/api/calls?limit=10000&format=csv'+(tid?'&task_id='+tid:'');
+  notify('正在生成 CSV...','info');
+  fetch(url).then(r=>r.blob()).then(b=>{
+    const a=document.createElement('a'); a.href=URL.createObjectURL(b);
+    a.download='calls_export.csv'; a.click();
+  }).catch(()=>notify('导出失败','err'));
+}
+
+// ── Blacklist ───────────────────────────────────────────────
+async function fetchBlacklist(){
+  try {
+    const d=await api('/api/blacklist');
+    const items=d.items||[];
+    if(!items.length){ $('bl-tbody').innerHTML='<tr class="empty-row"><td colspan="4">黑名单为空</td></tr>'; return; }
+    $('bl-tbody').innerHTML=items.map(i=>`<tr>
+      <td style="font-family:monospace">${i.phone}</td>
+      <td style="color:var(--muted)">${i.reason||'—'}</td>
+      <td style="color:var(--muted)">${fmt_time(i.created_at)}</td>
+      <td><button class="btn xs danger" onclick="removeBlacklist('${i.phone}')">移除</button></td>
+    </tr>`).join('');
+  } catch(e){ notify('加载黑名单失败: '+e.message,'err') }
+}
+
+async function submitBlacklist(){
+  const phone=$('bl-phone').value.trim();
+  const reason=$('bl-reason').value.trim()||'手动添加';
+  if(!/^1[3-9]\d{9}$/.test(phone)){ notify('请输入有效的手机号码','err'); return }
+  try {
+    await api('/api/blacklist',{method:'POST',body:JSON.stringify({phone,reason})});
+    closeModal('bl-modal');
+    notify(phone+' 已加入黑名单','ok');
+    $('bl-phone').value=''; $('bl-reason').value='';
+    fetchBlacklist();
+  } catch(e){ notify('添加失败: '+e.message,'err') }
+}
+
+async function removeBlacklist(phone){
+  if(!confirm(`确认将 ${phone} 从黑名单移除？`)) return;
+  try {
+    await api('/api/blacklist/'+phone,{method:'DELETE'});
+    notify(phone+' 已移除','ok');
+    fetchBlacklist();
+  } catch(e){ notify('移除失败: '+e.message,'err') }
+}
+
+// ── Scripts ─────────────────────────────────────────────────
+let _scripts=[];
+
+async function fetchScripts(populate=false){
+  try {
+    const d=await api('/api/scripts');
+    _scripts=d.scripts||[];
+    if(populate){
+      $('f-script').innerHTML=_scripts.map(s=>`<option value="${s.id}">${s.product_name}</option>`).join('');
+      return;
+    }
+    $('scripts-grid').innerHTML=_scripts.map(s=>`
+      <div class="script-card">
+        <div class="script-name">${s.product_name}</div>
+        <div class="script-desc">${s.product_desc||''}</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <span class="pill done">${s.points_count} 个卖点</span>
+          <span style="font-size:11px;color:var(--muted)">${s.target||''}</span>
+        </div>
+      </div>
+    `).join('')+`
+      <div class="script-card add" onclick="notify('请修改 SCRIPTS_PATH 环境变量指定的 JSON 文件添加话术','info',4000)">
+        <span style="font-size:18px">+</span> 新建话术
+      </div>`;
+  } catch(e){ notify('加载话术失败: '+e.message,'err') }
+}
+
+// ── Callbacks ───────────────────────────────────────────────
+async function fetchCallbacks(){
+  try {
+    const d=await api('/api/callbacks');
+    const items=d.items||[];
+    if(!items.length){ $('cb-tbody').innerHTML='<tr class="empty-row"><td colspan="4">暂无待回拨记录</td></tr>'; return; }
+    $('cb-tbody').innerHTML=items.map(i=>`<tr>
+      <td style="font-family:monospace">${mask_phone(i.phone)}</td>
+      <td style="font-size:11px;color:var(--muted)">${(i.task_id||'—').slice(0,12)}</td>
+      <td>${i.callback_time||'—'}</td>
+      <td style="color:var(--muted)">${i.note||'—'}</td>
+    </tr>`).join('');
+  } catch(e){ notify('加载回拨计划失败: '+e.message,'err') }
+}
+
+// ── WebSocket ────────────────────────────────────────────────
+function connectWS(){
+  const token=API_TOKEN?'?token='+API_TOKEN:'';
+  const ws=new WebSocket(`ws://${location.host}/ws/monitor${token}`);
+  ws.onopen=()=>{ $('status-dot').className='dot green'; $('status-text').textContent='已连接' };
+  ws.onmessage=e=>{
+    try {
+      const d=JSON.parse(e.data);
+      if(d.type==='stats'){
+        $('conc-val').textContent=d.active_calls;
+        $('s-tasks').textContent=d.active_tasks;
+        $('live-count').textContent=`— ${d.active_calls} 路`;
+        renderTaskTable('task-mini-tbody',(d.tasks||[]).slice(0,8),false);
+      }
+    } catch(_){}
+  };
+  ws.onerror=()=>{ $('status-dot').className='dot red'; $('status-text').textContent='连接错误' };
+  ws.onclose=()=>{ $('status-dot').className='dot red'; $('status-text').textContent='已断开'; setTimeout(connectWS,4000) };
+  setInterval(()=>ws.readyState===1&&ws.send('ping'),25000);
+}
+
+// ── Init ─────────────────────────────────────────────────────
+(async()=>{
+  connectWS();
+  await fetchStats();
+  await fetchTodayStats();
+  await fetchScripts(true);
+  setInterval(fetchStats, 10000);
+  setInterval(fetchTodayStats, 30000);
+})();
+</script>
+</body>
+</html>

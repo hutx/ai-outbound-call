@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SIP Profile - 外部 SIP 中继配置
+  用于连接云通信服务商 (阿里云/腾讯云/Twilio 等)
+-->
+<profile name="external">
+  <gateways>
+        <!--
+          ★ 主运营商 SIP 网关
+          替换为实际运营商信息后生效
+          国内常用：阿里云通信 / 华为云 / 天翼云 / 云讯
+        -->
+      <gateway name="carrier_trunk">
+        <param name="realm"            value="59.110.91.40:6922"/>
+        <param name="proxy"            value="59.110.91.40:6922"/>
+        <param name="username"         value="202603311547"/>
+        <param name="caller-id-in-from" value="true"/>
+        <param name="rtp-ip"           value="$${local_ip_v4}"/>
+        <param name="sip-ip"           value="$${local_ip_v4}"/>
+        <param name="ext-rtp-ip"       value="auto-nat"/>
+        <param name="ext-sip-ip"       value="auto-nat"/>
+        <param name="auth-username"    value="202603311547"/>
+        <param name="contact-params"   value="tport=udp"/>
+        <param name="retry-seconds"    value="30"/>
+        <param name="apply-candidate-acl" value="rfc1918.auto"/>
+        <param name="apply-proxy-acl"    value="rfc1918.auto"/>
+        <param name="proxy-addr"         value="59.110.91.40:6922"/>
+        <param name="outbound-proxy"     value="59.110.91.40:6922"/>
+        <param name="sip_CID-as-cause"   value="true"/>
+        <param name="inbound-late-negotiation" value="true"/>
+        <param name="inbound-codec-negotiation" value="greedy"/>
+      </gateway>
+
+        <!-- 备用网关（主备容灾，主 gateway 失败自动切换） -->
+        <!--
+        <gateway name="carrier_trunk_backup">
+          <param name="username"       value="BACKUP_USER"/>
+          <param name="password"       value="BACKUP_PASS"/>
+          <param name="proxy"          value="backup.carrier.com:5060"/>
+          <param name="register"       value="true"/>
+          <param name="expire-seconds" value="1800"/>
+          <param name="retry-seconds"  value="30"/>
+          <param name="ping"           value="25"/>
+        </gateway>
+        -->
+      </gateways>
+
+  <settings>
+    <!-- 基础配置 -->
+    <param name="name" value="external"/>
+    <param name="realm" value="auto-nat"/>
+    <param name="sip-ip" value="$${external_sip_ip}"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+    
+    <!-- 端口配置 -->
+    <param name="sip-port" value="5080"/>
+    <param name="tls-port" value="5081"/>
+    <param name="rtcp-ip" value="$${external_rtp_ip}"/>
+    <param name="ext-rtp-port" value="10000-10100"/>
+    
+    <!-- 编解码器优先级 -->
+    <param name="inbound-codec-prefs" value="$${global_codec_prefs}"/>
+    <param name="outbound-codec-prefs" value="$${global_codec_prefs}"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    
+    <!-- NAT 穿透 -->
+    <param name="apply-candidate-acl" value="wan_v4.auto"/>
+    <param name="apply-inbound-acl" value="wan_v4.auto"/>
+    <param name="apply-register-acl" value="wan_v4.auto"/>
+    <param name="nat-options-ping" value="true"/>
+    <param name="all-reg-options-ping" value="true"/>
+    <param name="tcp-binding-ip" value="$${external_sip_ip}"/>
+    <param name="tls-binding-ip" value="$${external_sip_ip}"/>
+    
+    <!-- 超时配置 -->
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <param name="auto-restart" value="true"/>
+    <param name="capture-server" value="udp:127.0.0.1:9060"/>
+    
+    <!-- 注册配置 -->
+    <param name="register-in-advance" value="60"/>
+    <param name="registration-expiry" value="600"/>
+    <param name="retry-seconds" value="60"/>
+    
+    <!-- 其他配置 -->
+    <param name="context" value="public"/>
+    <param name="codec-prefs" value="$${global_codec_prefs}"/>
+    <param name="manage-presence" value="false"/>
+    <param name="odbc-dsn" value="pgsql://host=postgres dbname=freeswitch user=freeswitch password=freeswitch"/>
+    <param name="dbname" value="sofia"/>
+    <param name="pres-dbname" value="sofia"/>
+    <param name="force-register-domain" value="$$${domain}"/>
+    <param name="force-subscription-domain" value="$$${domain}"/>
+    <param name="force-register-db-domain" value="$$${domain}"/>
+    <param name="disable-register" value="false"/>
+    <param name="disable-q850-reason" value="false"/>
+    <param name="disable-transfer" value="false"/>
+    <param name="disable-hold" value="false"/>
+    <param name="auth-calls" value="false"/>
+    <param name="inbound-bypass-media" value="false"/>
+    <param name="inbound-proxy-media" value="false"/>
+    <param name="inbound-late-negotiation" value="false"/>
+    <param name="inbound-zrtp-passthru" value="false"/>
+    <param name="aggressive-nat-detection" value="false"/>
+    <param name="NDLB-broken-auth-hash" value="false"/>
+    <param name="NDLB-send-replaces" value="true"/>
+    <param name="NDLB-force-rport" value="false"/>
+    <param name="contact-in-message" value="false"/>
+    <param name="disable-srv503" value="true"/>
+    <param name="enable-3pcc" value="false"/>
+    <param name="tls" value="false"/>
+    <param name="tls-only" value="false"/>
+    <param name="tls-bind-params" value="transport=tls"/>
+    <param name="tls-cert-dir" value=""/>
+    <param name="tls-verify-policy" value="none"/>
+    <param name="tls-verify-depth" value="2"/>
+    <param name="tls-verify-in-subjects" value=""/>
+    <param name="tls-version" value="tlsv1.2"/>
+  </settings>
+</profile>
