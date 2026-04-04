@@ -1,0 +1,37 @@
+# Handle line endings for cross-platform compatibility
+* text=auto eol=lf
+
+# Force binary files to be stored as-is
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.exe binary
+*.dll binary
+*.so binary
+*.pyc binary
+*.db binary
+
+# Treat configuration files as text
+*.conf text
+*.cfg text
+*.ini text
+*.yml text
+*.yaml text
+
+# Treat script files with proper line endings
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Docker files
+Dockerfile* text eol=lf
+docker-compose*.yml text eol=lf
+*.dockerfile text eol=lf
+
+# Log files should not be tracked
+*.log linguist-generated
