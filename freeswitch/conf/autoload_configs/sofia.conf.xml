@@ -36,8 +36,8 @@
           国内常用：阿里云通信 / 华为云 / 天翼云 / 云讯
         -->
         <gateway name="carrier_trunk">
-          <!-- <param name="username"         value="$${carrier_username}"/> -->
-          <!-- <param name="password"         value="$${carrier_password}"/> -->
+          <param name="username"         value="$${carrier_username}"/>
+          <param name="password"         value="$${carrier_password}"/>
           <!-- <param name="realm"            value="$${carrier_sip_server}:6922"/> -->
           <param name="proxy"            value="$${carrier_sip_server}:6922"/>
           <param name="register"         value="false"/>
@@ -50,7 +50,7 @@
           <param name="ping-min"         value="1"/>
           <!-- 主叫号码从 From 头取（false = 从 Contact 取） -->
           <param name="caller-id-in-from" value="true"/>
-          <param name="extension" value="202603311547"/>
+          <param name="extension" value="$${carrier_username}"/>
           <param name="contact-params"   value="transport=udp"/>
         </gateway>
 
