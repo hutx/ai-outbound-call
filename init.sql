@@ -203,9 +203,13 @@ CREATE TABLE IF NOT EXISTS call_scripts (
     script_type      VARCHAR(30)   NOT NULL DEFAULT 'financial', -- financial/insurance/loan
     opening_script   TEXT          NOT NULL,                     -- 开场白话术
     opening_pause    INTEGER       NOT NULL DEFAULT 2000,        -- 开场白后停顿时长(毫秒)
-    main_script      JSONB         NOT NULL,                     -- 主要话术内容
-    objection_handling JSONB       NOT NULL DEFAULT '{}',        -- 异议处理话术
+    main_script      TEXT          NOT NULL,                     -- 主要话术内容（纯文本）
     closing_script   TEXT,                                       -- 结束语话术
+    opening_barge_in         BOOLEAN       NOT NULL DEFAULT false,  -- 开场白支持打断
+    closing_barge_in         BOOLEAN       NOT NULL DEFAULT false,  -- 结束语支持打断
+    conversation_barge_in    BOOLEAN       NOT NULL DEFAULT true,   -- 其他对话支持打断
+    barge_in_protect_start   INTEGER       NOT NULL DEFAULT 3,      -- 开始 N 秒内不打断
+    barge_in_protect_end     INTEGER       NOT NULL DEFAULT 3,      -- 结束前 N 秒不打断
     created_at       TIMESTAMP     NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMP     NOT NULL DEFAULT NOW(),
     is_active        BOOLEAN       NOT NULL DEFAULT true
@@ -227,7 +231,7 @@ CREATE TRIGGER set_call_scripts_updated_at
     EXECUTE FUNCTION trigger_set_timestamp();
 
 -- 插入初始话术数据
-INSERT INTO call_scripts (script_id, name, description, script_type, opening_script, opening_pause, main_script, objection_handling, closing_script)
+INSERT INTO call_scripts (script_id, name, description, script_type, opening_script, opening_pause, main_script, closing_script, opening_barge_in, closing_barge_in, conversation_barge_in, barge_in_protect_start, barge_in_protect_end)
 VALUES
 (
     'finance_product_a',
@@ -236,22 +240,9 @@ VALUES
     'financial',
     '您好，我是XX银行的智能客服小智，本通话由人工智能完成。请问您现在方便说话吗？',
     2000,
-    '{
-        "product_name": "稳享理财A款",
-        "product_desc": "年化收益率3.8%，起投1万元，T+1到账，无手续费",
-        "target_customer": "有理财需求的储蓄型客户",
-        "key_selling_points": [
-            "收益稳定，高于普通存款",
-            "灵活申赎，资金不被锁定",
-            "银行保本，安全有保障"
-        ]
-    }',
-    '{
-        "利率太低": "相比活期存款年化0.35%，我们的3.8%已经是市场上同类产品中较高的，而且保本保息",
-        "不需要": "完全理解，请问您目前是有其他理财渠道，还是暂时不考虑投资？",
-        "没钱": "没关系，我们起投门槛只有1万元，而且随时可以赎回"
-    }',
-    '好的，如果您有任何问题随时可以联系我们，祝您生活愉快，再见！'
+    E'【推介产品】稳享理财A款\n【产品介绍】年化收益率3.8%，起投1万元，T+1到账，无手续费\n【目标客群】有理财需求的储蓄型客户\n\n【核心卖点】\n- 收益稳定，高于普通存款\n- 灵活申赎，资金不被锁定\n- 银行保本，安全有保障\n\n【异议处理】\n- 若客户说"利率太低"：相比活期存款年化0.35%，我们的3.8%已经是市场上同类产品中较高的，而且保本保息\n- 若客户说"不需要"：完全理解，请问您目前是有其他理财渠道，还是暂时不考虑投资？\n- 若客户说"没钱"：没关系，我们起投门槛只有1万元，而且随时可以赎回',
+    '好的，如果您有任何问题随时可以联系我们，祝您生活愉快，再见！',
+    false, false, true, 3, 3
 ),
 (
     'insurance_renewal',
@@ -260,22 +251,9 @@ VALUES
     'insurance',
     '您好，我是XX保险公司的智能客服，本通话由人工智能完成。想提醒您保单即将到期，请问您现在方便说话吗？',
     1500,
-    '{
-        "product_name": "人寿险续保提醒",
-        "product_desc": "您的保单即将到期，续保享受老客户专属折扣",
-        "target_customer": "即将到期的保险客户",
-        "key_selling_points": [
-            "老客户续保享9折优惠",
-            "无需重新体检",
-            "保障范围升级"
-        ]
-    }',
-    '{
-        "不想续了": "请问是对哪方面不满意？我们可以为您推荐更适合的方案",
-        "太贵了": "老客户专属折扣后价格很优惠，而且保障金额也提升了",
-        "需要考虑": "没问题，您可以先了解一下我们的续保政策，有问题随时联系"
-    }',
-    '好的，感谢您的配合，如果有任何疑问请随时联系我们，再见！'
+    E'【推介产品】人寿险续保提醒\n【产品介绍】您的保单即将到期，续保享受老客户专属折扣\n【目标客群】即将到期的保险客户\n\n【核心卖点】\n- 老客户续保享9折优惠\n- 无需重新体检\n- 保障范围升级\n\n【异议处理】\n- 若客户说"不想续了"：请问是对哪方面不满意？我们可以为您推荐更适合的方案\n- 若客户说"太贵了"：老客户专属折扣后价格很优惠，而且保障金额也提升了\n- 若客户说"需要考虑"：没问题，您可以先了解一下我们的续保政策，有问题随时联系',
+    '好的，感谢您的配合，如果有任何疑问请随时联系我们，再见！',
+    false, false, true, 3, 3
 ),
 (
     'loan_followup',
@@ -284,22 +262,9 @@ VALUES
     'financial',
     '您好，我是XX银行的智能客服小智，之前您咨询过我们的消费贷款产品，现在利率有所下调，请问您现在方便说话吗？',
     2500,
-    '{
-        "product_name": "消费贷款回访",
-        "product_desc": "您之前询问过我们的消费贷款，现在利率有所下调",
-        "target_customer": "曾咨询过贷款的潜在客户",
-        "key_selling_points": [
-            "年化利率仅3.6%",
-            "最高可贷50万",
-            "最快当天放款"
-        ]
-    }',
-    '{
-        "不需要了": "好的，如果以后有资金需求欢迎联系我们",
-        "利率高": "我们目前是市场上利率最低的产品之一，您方便说说您期望的利率是多少吗",
-        "资料复杂": "其实我们的申请流程非常简单，线上即可完成，我可以为您介绍一下"
-    }',
-    '好的，如果您改变主意了随时可以联系我们，祝您工作顺利，再见！'
+    E'【推介产品】消费贷款回访\n【产品介绍】您之前询问过我们的消费贷款，现在利率有所下调\n【目标客群】曾咨询过贷款的潜在客户\n\n【核心卖点】\n- 年化利率仅3.6%\n- 最高可贷50万\n- 最快当天放款\n\n【异议处理】\n- 若客户说"不需要了"：好的，如果以后有资金需求欢迎联系我们\n- 若客户说"利率高"：我们目前是市场上利率最低的产品之一，您方便说说您期望的利率是多少吗\n- 若客户说"资料复杂"：其实我们的申请流程非常简单，线上即可完成，我可以为您介绍一下',
+    '好的，如果您改变主意了随时可以联系我们，祝您工作顺利，再见！',
+    false, false, true, 3, 3
 ),
 (
     'marketing_event',
@@ -308,22 +273,9 @@ VALUES
     'marketing',
     '您好，我是XX商城的智能客服，本通话由人工智能完成。我们正在进行年中大促活动，请问您现在方便了解一下吗？',
     2000,
-    '{
-        "product_name": "年中大促活动",
-        "product_desc": "全场低至3折起，满减优惠叠加券限时领取",
-        "target_customer": "近90天有消费记录的活跃用户",
-        "key_selling_points": [
-            "全场低至3折起",
-            "满200减100叠加优惠券",
-            "限时3天，错过等一年"
-        ]
-    }',
-    '{
-        "没兴趣": "我们这次是针对老客户专属的活动，有很多热门品牌参与，可以看看有没有需要的",
-        "太忙了": "只需要占用您30秒，这次活动力度真的很大，您可以关注下",
-        "已经买过了": "太感谢您的支持了，我们还有返场券可以领取，下次购物更划算"
-    }',
-    '好的，感谢您的接听，活动详情请查看我们发送的短信，祝您生活愉快，再见！'
+    E'【推介产品】年中大促活动\n【产品介绍】全场低至3折起，满减优惠叠加券限时领取\n【目标客群】近90天有消费记录的活跃用户\n\n【核心卖点】\n- 全场低至3折起\n- 满200减100叠加优惠券\n- 限时3天，错过等一年\n\n【异议处理】\n- 若客户说"没兴趣"：我们这次是针对老客户专属的活动，有很多热门品牌参与，可以看看有没有需要的\n- 若客户说"太忙了"：只需要占用您30秒，这次活动力度真的很大，您可以关注下\n- 若客户说"已经买过了"：太感谢您的支持了，我们还有返场券可以领取，下次购物更划算',
+    '好的，感谢您的接听，活动详情请查看我们发送的短信，祝您生活愉快，再见！',
+    false, false, true, 3, 3
 );
 
 -- 全局黑名单（DO NOT CALL 清单，系统默认保护号码）

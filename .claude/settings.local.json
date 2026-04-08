@@ -39,7 +39,8 @@
       "Bash(.venv/bin/pip install:*)",
       "Bash(.venv/bin/python3:*)",
       "Bash(docker ps:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }

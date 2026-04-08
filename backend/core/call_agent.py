@@ -23,7 +23,8 @@ from backend.services.llm_service import LLMService
 from backend.services.esl_service import ESLSocketCallSession, ESLError
 from backend.services.crm_service import crm
 from backend.utils.db import save_call_record
-from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call
+from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call, get_barge_in_config
+from backend.services.script_service import script_service
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,11 @@ class AudioStreamAdapter:
     两段式 VAD：
     - 首次等待超时（2s）：给用户提供时间开始说话
     - 说话中 VAD（500ms）：用户说话后，停顿 500ms 即认为说完
+
+    打断保护期：
+    - barge_in_enabled=False：完全不允许打断
+    - protect_start_ms：播放前 N 毫秒不打断
+    - protect_end_ms：播放最后 N 毫秒不打断
     """
 
     def __init__(
@@ -54,18 +60,29 @@ class AudioStreamAdapter:
         audio_queue: asyncio.Queue,
         vad_silence_ms: int = 500,
         barge_in_cb: Optional[asyncio.Event] = None,
+        barge_in_enabled: bool = True,
+        total_duration_ms: float = 0,
+        protect_start_ms: int = 3000,
+        protect_end_ms: int = 3000,
     ):
         self._queue = audio_queue
         self._vad_silence_ms = vad_silence_ms
         self._barge_in_event = barge_in_cb
         self._stopped = False
         self._started_speaking = False  # 是否已经检测到用户开始说话
+        # 打断策略
+        self._barge_in_enabled = barge_in_enabled
+        self._total_duration_ms = total_duration_ms
+        self._protect_start_ms = protect_start_ms
+        self._protect_end_ms = protect_end_ms
+        self._play_start_time: Optional[float] = None  # 播放开始时间
 
     def stop(self):
         self._stopped = True
 
     async def stream(self) -> AsyncGenerator[bytes, None]:
         last_audio_ts = time.time()
+        self._play_start_time = time.time()
         while not self._stopped:
             try:
                 chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
@@ -79,8 +96,16 @@ class AudioStreamAdapter:
                 continue
             if not chunk:
                 break
-            # 触发 barge-in（如果 AI 正在说话）
-            if self._barge_in_event and not self._barge_in_event.is_set():
+            # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
+            should_barge_in = False
+            if self._barge_in_enabled and self._play_start_time is not None:
+                elapsed_ms = (time.time() - self._play_start_time) * 1000
+                remaining_ms = self._total_duration_ms - elapsed_ms
+                in_protect_start = elapsed_ms < self._protect_start_ms
+                in_protect_end = remaining_ms < self._protect_end_ms
+                should_barge_in = not in_protect_start and not in_protect_end
+
+            if should_barge_in and self._barge_in_event and not self._barge_in_event.is_set():
                 self._barge_in_event.set()
             if not self._started_speaking:
                 self._started_speaking = True
@@ -109,8 +134,13 @@ class CallAgent:
         self.llm = llm or LLMService()
 
         self._system_prompt: str = ""  # 在 connect() 后从 channel vars 构建
+        self._script_config = None  # 话术脚本配置，用于获取打断策略
         self._barge_in = asyncio.Event()
         self._barge_in.set()  # 初始置位（表示目前没有在播放）
+        # 最近一次 _say 的打断配置，用于传递给 _listen_user
+        self._last_barge_in_config = {
+            "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
+        }
 
         # 注册状态机动作
         self.sm.register_handler("transfer",  self._do_transfer)
@@ -145,10 +175,11 @@ class CallAgent:
             if not self.ctx.customer_info:
                 self.ctx.customer_info = await crm.query_customer_info(self.ctx.phone_number)
 
-            # 4. 构建 System Prompt
+            # 4. 构建 System Prompt + 缓存话术配置
             self._system_prompt = await get_system_prompt_for_call(
                 self.ctx.script_id, self.ctx.customer_info
             )
+            self._script_config = await script_service.get_script(self.ctx.script_id)
 
             # 5. 启动事件监听
             event_task = asyncio.create_task(self.session.read_events())
@@ -195,7 +226,13 @@ class CallAgent:
         while self.sm.should_continue() and self.session._connected:
             # 监听用户
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
-            user_text = await self._listen_user()
+            cfg = self._last_barge_in_config
+            user_text = await self._listen_user(
+                barge_in_enabled=cfg["enabled"],
+                protect_start_ms=cfg["protect_start_ms"],
+                protect_end_ms=cfg["protect_end_ms"],
+                total_duration_ms=cfg["duration_ms"],
+            )
             logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r}")
 
             if not user_text:
@@ -231,12 +268,14 @@ class CallAgent:
         text = opening["reply"]
         self.ctx.messages.append({"role": "assistant", "content": text})
         self.ctx.ai_utterances += 1
-        await self._say(text, record=False)
+        await self._say(text, record=False, speech_type="opening")
 
     # ─────────────────────────────────────────────────────────
     # 监听用户（ASR）
     # ─────────────────────────────────────────────────────────
-    async def _listen_user(self) -> str:
+    async def _listen_user(self, *, barge_in_enabled: bool = True,
+                           protect_start_ms: int = 3000, protect_end_ms: int = 3000,
+                           total_duration_ms: float = 0) -> str:
         self.sm.transition(CallState.USER_SPEAKING)
         audio_queue = await self.session.start_audio_capture()
         queue_size = audio_queue.qsize()
@@ -250,6 +289,10 @@ class CallAgent:
             audio_queue,
             vad_silence_ms=config.asr.vad_silence_ms,
             barge_in_cb=self._barge_in,
+            barge_in_enabled=barge_in_enabled,
+            total_duration_ms=total_duration_ms,
+            protect_start_ms=protect_start_ms,
+            protect_end_ms=protect_end_ms,
         )
 
         final_text = ""
@@ -325,27 +368,46 @@ class CallAgent:
         return reply_text, action
 
     # ─────────────────────────────────────────────────────────
-    # TTS + 播放（支持 barge-in）
+    # TTS + 播放（支持 barge-in，流式输出）
     # ─────────────────────────────────────────────────────────
-    async def _say(self, text: str, record: bool = True):
+    async def _say(self, text: str, record: bool = True,
+                   speech_type: str = "conversation"):
         if not text or not self.session._connected:
             return
         self.sm.transition(CallState.AI_SPEAKING)
+
+        # 获取打断策略配置
+        barge_in_config = await get_barge_in_config(self.ctx.script_id, speech_type)
+        barge_in_enabled = barge_in_config["barge_in_enabled"]
+        protect_start_ms = int(barge_in_config["protect_start_sec"] * 1000)
+        protect_end_ms = int(barge_in_config["protect_end_sec"] * 1000)
+
+        # 流式模式下总时长未知，设为 0（barge-in 仅依赖 protect_start_ms 判断）
+        total_duration_ms = 0.0
+
+        # 存储打断配置到实例变量，供 _listen_user 使用
+        self._last_barge_in_config = {
+            "enabled": barge_in_enabled,
+            "protect_start_ms": protect_start_ms,
+            "protect_end_ms": protect_end_ms,
+            "duration_ms": total_duration_ms,
+        }
+
         self._barge_in.clear()  # 开始播放，barge-in 检测生效
 
         try:
             t0 = time.time()
-            audio_path = await asyncio.wait_for(
-                self.tts.synthesize(text), timeout=TTS_TIMEOUT
-            )
-            logger.debug(f"[{self.ctx.uuid}] TTS {(time.time()-t0)*1000:.0f}ms → {audio_path}")
+            # 流式 TTS：边合成边播
+            audio_chunks = self.tts.synthesize_stream(text)
+            logger.debug(f"[{self.ctx.uuid}] TTS 流式开始")
 
             # barge-in：如果用户已经开始说话则跳过播放
             if self._barge_in.is_set():
                 logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，跳过播放")
                 return
 
-            await self.session.play(audio_path)
+            await self.session.play_stream(audio_chunks, text=text)
+            logger.debug(f"[{self.ctx.uuid}] TTS 流式播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
         except asyncio.TimeoutError:
             logger.error(f"[{self.ctx.uuid}] TTS 超时")
         except Exception as e:
@@ -361,7 +423,7 @@ class CallAgent:
         self.sm.transition(CallState.TRANSFERRING)
         self.ctx.result = CallResult.TRANSFERRED
         ext = params.get("extension", "8001")
-        await self._say("好的，正在为您转接人工客服，请稍等。")
+        await self._say("好的，正在为您转接人工客服，请稍等。", speech_type="closing")
         await asyncio.sleep(0.3)
         await self.session.transfer_to_human(ext)
         # 写入转接原因供 CDR
@@ -370,7 +432,7 @@ class CallAgent:
     async def _do_hangup(self, params: dict):
         farewell = params.get("farewell", "好的，感谢您的时间，祝您生活愉快，再见！")
         logger.info(f"[{self.ctx.uuid}] 主动挂断")
-        await self._say(farewell)
+        await self._say(farewell, speech_type="closing")
         await asyncio.sleep(0.4)  # 让 TTS 播放完
         await self.session.hangup()
 

@@ -4,9 +4,8 @@
 """
 import asyncio
 import logging
-from typing import Dict, Optional, List
+from typing import Optional, List
 from dataclasses import dataclass
-import json
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -27,17 +26,21 @@ class ScriptConfig:
     script_type: str
     opening_script: str
     opening_pause: int
-    main_script: Dict
-    objection_handling: Dict
+    main_script: str
     closing_script: Optional[str]
     is_active: bool = True
+    opening_barge_in: bool = False
+    closing_barge_in: bool = False
+    conversation_barge_in: bool = True
+    barge_in_protect_start: int = 3
+    barge_in_protect_end: int = 3
 
 
 class ScriptService:
     """话术服务类"""
 
     def __init__(self):
-        self._cache: Dict[str, ScriptConfig] = {}
+        self._cache: dict[str, ScriptConfig] = {}
         self._cache_last_update = 0
 
     async def get_script(self, script_id: str) -> Optional[ScriptConfig]:
@@ -64,10 +67,14 @@ class ScriptService:
                     script_type=db_script.script_type,
                     opening_script=db_script.opening_script,
                     opening_pause=db_script.opening_pause,
-                    main_script=json.loads(db_script.main_script) if isinstance(db_script.main_script, str) else db_script.main_script,
-                    objection_handling=json.loads(db_script.objection_handling) if isinstance(db_script.objection_handling, str) else db_script.objection_handling,
+                    main_script=db_script.main_script,
                     closing_script=db_script.closing_script,
-                    is_active=db_script.is_active
+                    is_active=db_script.is_active,
+                    opening_barge_in=db_script.opening_barge_in,
+                    closing_barge_in=db_script.closing_barge_in,
+                    conversation_barge_in=db_script.conversation_barge_in,
+                    barge_in_protect_start=db_script.barge_in_protect_start,
+                    barge_in_protect_end=db_script.barge_in_protect_end
                 )
 
                 # 加入缓存
@@ -94,10 +101,14 @@ class ScriptService:
                         script_type=db_script.script_type,
                         opening_script=db_script.opening_script,
                         opening_pause=db_script.opening_pause,
-                        main_script=json.loads(db_script.main_script) if isinstance(db_script.main_script, str) else db_script.main_script,
-                        objection_handling=json.loads(db_script.objection_handling) if isinstance(db_script.objection_handling, str) else db_script.objection_handling,
+                        main_script=db_script.main_script,
                         closing_script=db_script.closing_script,
-                        is_active=db_script.is_active
+                        is_active=db_script.is_active,
+                        opening_barge_in=db_script.opening_barge_in,
+                        closing_barge_in=db_script.closing_barge_in,
+                        conversation_barge_in=db_script.conversation_barge_in,
+                        barge_in_protect_start=db_script.barge_in_protect_start,
+                        barge_in_protect_end=db_script.barge_in_protect_end
                     )
                     scripts.append(script_config)
 
@@ -153,10 +164,14 @@ class ScriptService:
                     script_type=script_config.script_type,
                     opening_script=script_config.opening_script,
                     opening_pause=script_config.opening_pause,
-                    main_script=json.dumps(script_config.main_script) if isinstance(script_config.main_script, dict) else script_config.main_script,
-                    objection_handling=json.dumps(script_config.objection_handling) if isinstance(script_config.objection_handling, dict) else script_config.objection_handling,
+                    main_script=script_config.main_script,
                     closing_script=script_config.closing_script,
-                    is_active=script_config.is_active
+                    is_active=script_config.is_active,
+                    opening_barge_in=script_config.opening_barge_in,
+                    closing_barge_in=script_config.closing_barge_in,
+                    conversation_barge_in=script_config.conversation_barge_in,
+                    barge_in_protect_start=script_config.barge_in_protect_start,
+                    barge_in_protect_end=script_config.barge_in_protect_end
                 )
 
                 session.add(new_script)
@@ -212,60 +227,21 @@ async def build_system_prompt_from_db(script_id: str, customer_info: dict) -> st
     if not script_config:
         logger.warning(f"话术脚本未找到: {script_id}，使用默认话术")
         # 返回默认话术
-        script = {
-            "product_name": "默认产品",
-            "product_desc": "默认产品描述",
-            "target_customer": "默认客户",
-            "key_selling_points": ["默认卖点1", "默认卖点2"],
-        }
-        objection_handling = {"默认异议": "默认回应"}
+        main_script_text = "【推介产品】默认产品\n【产品介绍】默认产品描述\n【目标客群】默认客户"
         opening_pause = 2000
-        customer_name = customer_info.get("name", "您")
-        customer_note = customer_info.get("note", "")
     else:
-        script = script_config.main_script
-        objection_handling = script_config.objection_handling if isinstance(script_config.objection_handling, dict) else {}
+        main_script_text = script_config.main_script
         opening_pause = script_config.opening_pause
-        customer_name = customer_info.get("name", "您")
-        customer_note = customer_info.get("note", "")
 
-    # 构建异议处理文本
-    objections_text = "\n".join([
-        f'  - 若客户说"{k}"，回应："{v}"'
-        for k, v in objection_handling.items()
-    ])
+    customer_name = customer_info.get("name", "您")
+    customer_note = customer_info.get("note", "")
 
     # 使用从数据库获取的停顿时长
-    opening_pause_desc = f"（停顿{opening_pause}毫秒后继续）"
+    # opening_pause_desc = f"（停顿{opening_pause}毫秒后继续）"
 
-    return f"""你是一名专业的银行智能客服，名叫"小智"。你正在进行一次电话外呼。
+    return f"""
 
-【重要合规声明 - 必须遵守】
-1. 开场白必须包含："本通话由人工智能完成" 这句话
-2. 客户明确拒绝2次后，立即礼貌结束通话，不得再次推销
-3. 不得承诺不实收益或夸大宣传
-4. 客户要求转人工时，立即响应
-
-{opening_pause_desc}
-
-【本次外呼信息】
-- 客户姓名：{customer_name}
-- 推介产品：{script["product_name"]}
-- 产品介绍：{script["product_desc"]}
-- 目标客群：{script["target_customer"]}
-- 客户备注：{customer_note or "无"}
-
-【核心卖点（自然融入对话，不要生硬罗列）】
-{chr(10).join(f"  • {p}" for p in script["key_selling_points"])}
-
-【异议处理话术】
-{objections_text if objections_text else '  （暂无异议处理话术）'}
-
-【对话风格要求】
-- 语气亲切自然，像朋友聊天，不要照本宣科
-- 每次回复控制在2-3句话内，不要长篇大论
-- 多提问、引导客户说话，了解真实需求
-- 遇到客户问具体数字，直接给出，不要回避
+{main_script_text}
 
 【输出格式 - 严格遵守】
 你必须返回合法的 JSON，格式如下：
