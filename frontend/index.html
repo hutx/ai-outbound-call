@@ -449,20 +449,42 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <input id="sf-opening-pause" type="number" value="2000" min="500" step="500"/>
     </div>
     <div class="form-group">
-      <label>主要话术内容（JSON 格式）*</label>
-      <textarea id="sf-main-script" style="min-height:130px" placeholder='{"product_name":"XX理财产品","product_desc":"稳健型理财产品","target_customer":"25-55岁有闲置资金的客户","key_selling_points":["年化收益率4.5%","低风险","随时可赎回"]}'>
+      <label>主要话术内容 *</label>
+      <textarea id="sf-main-script" style="min-height:180px" placeholder="【推介产品】XX理财产品&#10;【产品介绍】稳健型理财产品，年化收益4.5%&#10;【目标客群】25-55岁有闲置资金的客户&#10;&#10;【核心卖点】&#10;- 年化收益率4.5%&#10;- 低风险&#10;- 随时可赎回&#10;&#10;【异议处理】&#10;- 若客户说&quot;太贵了&quot;：这个产品门槛很低，1000元起投&#10;- 若客户说&quot;没时间&quot;：只需要占用您两分钟时间&#10;- 若客户说&quot;不需要&quot;：没关系，了解一下也不错">
 </textarea>
-      <div class="form-hint">JSON 对象格式，包含 product_name/product_desc/target_customer/key_selling_points</div>
-    </div>
-    <div class="form-group">
-      <label>异议处理话术（JSON 格式）</label>
-      <textarea id="sf-objection" style="min-height:100px" placeholder='{"太贵了":"这个产品门槛很低，1000元起投","没时间":"只需要占用您两分钟时间","不需要":"没关系，了解一下也不错"}'>
-</textarea>
-      <div class="form-hint">JSON 键值对格式，键为异议内容，值为回应话术</div>
+      <div class="form-hint">纯文本格式，包含产品介绍、核心卖点、异议处理等</div>
     </div>
     <div class="form-group">
       <label>结束语话术（可选）</label>
       <textarea id="sf-closing" rows="2" placeholder="感谢您的接听，祝您生活愉快！"></textarea>
+    </div>
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:12px">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px">打断策略配置</div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="sf-opening-barge-in" type="checkbox"/> 开场白支持打断
+        </label>
+      </div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="sf-closing-barge-in" type="checkbox"/> 结束语支持打断
+        </label>
+      </div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="sf-conversation-barge-in" type="checkbox" checked/> 其他对话支持打断
+        </label>
+      </div>
+      <div style="display:flex;gap:16px">
+        <div class="form-group" style="flex:1">
+          <label>开始 N 秒内不打断（秒）</label>
+          <input id="sf-protect-start" type="number" value="3" min="0" max="60"/>
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>结束前 N 秒不打断（秒）</label>
+          <input id="sf-protect-end" type="number" value="3" min="0" max="60"/>
+        </div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('script-modal')">取消</button>
@@ -1079,26 +1101,43 @@ function connectTestCallWebSocket(callId, phoneNumber) {
           return;
         }
       } else {
-        // 二进制数据 = 后端发送的 WAV 音频，直接播放
-        playWebSocketAudio(event.data);
+        // 二进制数据 = 后端发送的音频
+        if (streamingAudioCtx && streamingActive) {
+          // 流式模式：推入 PCM 队列
+          pushStreamingPCM(event.data);
+        } else {
+          // 非流式模式：整块播放
+          playWebSocketAudio(event.data);
+        }
         return;
       }
 
       if (data.type === 'ai_response') {
         // 显示AI的回复
         addChatMessage('ai', data.text, callId);
-        // 如果后端会发送真实 TTS 音频，跳过浏览器 TTS
-        if (data.has_audio) {
-          console.log('AI 回复将伴随真实 TTS 音频，跳过浏览器 TTS:', data.text);
-          // 暂停发送麦克风音频，防止 AI 播报时 VAD 误判
+
+        if (data.streaming) {
+          // 流式模式：初始化 PCM 播放队列，后续二进制数据逐 chunk 播放
+          console.log('AI 回复进入流式 TTS 模式:', data.text);
+          startStreamingPlayback();
+          isAiSpeaking = true;
+        } else if (data.has_audio) {
+          // 非流式：停止任何流式播放，等待后续二进制数据
+          stopStreamingPlayback();
+          console.log('AI 回复将伴随完整 TTS 音频，跳过浏览器 TTS:', data.text);
           isAiSpeaking = true;
         } else {
-          // 否则使用浏览器 TTS 播放
+          // 无音频，停止流式播放并使用浏览器 TTS
+          stopStreamingPlayback();
           speakText(data.text);
         }
       } else if (data.type === 'user_speech') {
         // 显示用户说的话（经过ASR识别）
         addChatMessage('user', data.text, callId);
+      } else if (data.type === 'streaming_audio_done') {
+        // 流式 TTS 音频发送完毕，停止播放
+        console.log('流式 TTS 完成，停止播放');
+        stopStreamingPlayback();
       } else if (data.type === 'call_status') {
         console.log('通话状态更新:', data.status);
         addChatMessage('system', `通话状态: ${data.message || data.status}`, callId);
@@ -1126,6 +1165,7 @@ function connectTestCallWebSocket(callId, phoneNumber) {
     console.log('测试通话WebSocket已关闭:', event.code, event.reason);
     testCallActive = false;
     stopRecording();
+    stopStreamingPlayback();  // 清理流式播放资源
     addChatMessage('system', '通话已结束', callId);
   };
 }
@@ -1165,6 +1205,105 @@ function playWebSocketAudio(arrayBuffer) {
   } catch (e) {
     console.error('playWebSocketAudio 错误:', e);
   }
+}
+
+/**
+ * 流式 PCM 音频播放（边收边播）
+ * 后端发送的是 8000Hz 16bit mono 裸 PCM（不含 WAV 头）
+ * 使用 ScriptProcessorNode 实现低延迟流式播放
+ */
+let streamingAudioCtx = null;
+let streamingScriptNode = null;
+let streamingPCMBuffer = [];     // 存放 PCM chunk (Int16Array)
+let streamingActive = false;     // 是否正在流式播放
+let streamingBufferOffset = 0;   // 当前 chunk 的读取偏移
+
+function startStreamingPlayback() {
+  try {
+    // 停止旧的流式播放（如果有）
+    stopStreamingPlayback();
+
+    // 创建 AudioContext（8000Hz 采样率与 TTS 输出一致）
+    streamingAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 8000
+    });
+
+    // 创建 ScriptProcessorNode（bufferSize=4096, 0输入, 1输出）
+    streamingScriptNode = streamingAudioCtx.createScriptProcessor(4096, 0, 1);
+    streamingActive = true;
+
+    streamingScriptNode.onaudioprocess = (e) => {
+      if (!streamingActive) return;
+      const output = e.outputBuffer.getChannelData(0);
+      const bufferSize = output.length;
+
+      // 从 PCM 队列中取数据填充到输出缓冲区
+      let written = 0;
+      while (written < bufferSize && streamingPCMBuffer.length > 0) {
+        const chunk = streamingPCMBuffer[0];
+        const available = chunk.length - streamingBufferOffset;
+        const toCopy = Math.min(available, bufferSize - written);
+
+        for (let i = 0; i < toCopy; i++) {
+          // PCM 16bit (signed int16) → Float32 (-1.0 ~ 1.0)
+          output[written + i] = chunk[streamingBufferOffset + i] / 32768.0;
+        }
+
+        streamingBufferOffset += toCopy;
+        written += toCopy;
+
+        // 当前 chunk 读完，移除
+        if (streamingBufferOffset >= chunk.length) {
+          streamingPCMBuffer.shift();
+          streamingBufferOffset = 0;
+        }
+      }
+
+      // 如果队列为空且已激活，填充静音（等待更多数据）
+      if (written < bufferSize) {
+        for (let i = written; i < bufferSize; i++) {
+          output[i] = 0;
+        }
+      }
+    };
+
+    streamingScriptNode.connect(streamingAudioCtx.destination);
+    console.log('流式 PCM 播放已启动');
+  } catch (e) {
+    console.error('startStreamingPlayback 错误:', e);
+  }
+}
+
+function pushStreamingPCM(data) {
+  if (!streamingActive) return;
+  try {
+    // 将 ArrayBuffer 转换为 Int16Array（PCM 16bit）
+    const int16 = new Int16Array(data);
+    streamingPCMBuffer.push(int16);
+    console.log(`推入 PCM chunk: ${data.byteLength} bytes, 队列长度: ${streamingPCMBuffer.length}`);
+  } catch (e) {
+    console.error('pushStreamingPCM 错误:', e);
+  }
+}
+
+function stopStreamingPlayback() {
+  if (streamingScriptNode) {
+    try {
+      streamingScriptNode.disconnect();
+    } catch (e) {}
+    streamingScriptNode = null;
+  }
+  if (streamingAudioCtx) {
+    try {
+      streamingAudioCtx.close();
+    } catch (e) {}
+    streamingAudioCtx = null;
+  }
+  streamingPCMBuffer = [];
+  streamingBufferOffset = 0;
+  streamingActive = false;
+  isAiSpeaking = false;  // 恢复麦克风发送
+  console.log('流式 PCM 播放已停止，恢复麦克风');
 }
 
 // 添加全局语音控制变量
@@ -1617,8 +1756,13 @@ function openCreateScript(){
   $('sf-name').value=''; $('sf-description').value='';
   $('sf-script-type').value='financial';
   $('sf-opening').value=''; $('sf-opening-pause').value='2000';
-  $('sf-main-script').value=''; $('sf-objection').value='';
+  $('sf-main-script').value='';
   $('sf-closing').value='';
+  $('sf-opening-barge-in').checked=false;
+  $('sf-closing-barge-in').checked=false;
+  $('sf-conversation-barge-in').checked=true;
+  $('sf-protect-start').value=3;
+  $('sf-protect-end').value=3;
   openModalDirect('script-modal');
 }
 
@@ -1632,9 +1776,13 @@ async function openEditScript(scriptId){
     $('sf-name').value=d.name; $('sf-description').value=d.description||'';
     $('sf-script-type').value=d.script_type;
     $('sf-opening').value=d.opening_script; $('sf-opening-pause').value=d.opening_pause||2000;
-    $('sf-main-script').value=d.main_script?JSON.stringify(d.main_script,null,2):'';
-    $('sf-objection').value=d.objection_handling?JSON.stringify(d.objection_handling,null,2):'';
+    $('sf-main-script').value=d.main_script||'';
     $('sf-closing').value=d.closing_script||'';
+    $('sf-opening-barge-in').checked=!!d.opening_barge_in;
+    $('sf-closing-barge-in').checked=!!d.closing_barge_in;
+    $('sf-conversation-barge-in').checked=d.conversation_barge_in!==false;
+    $('sf-protect-start').value=d.barge_in_protect_start??3;
+    $('sf-protect-end').value=d.barge_in_protect_end??3;
     openModalDirect('script-modal');
   }catch(e){ notify('加载话术详情失败: '+e.message,'err') }
 }
@@ -1646,26 +1794,24 @@ async function saveScript(){
   const scriptType=$('sf-script-type').value;
   const opening=$('sf-opening').value.trim();
   const openingPause=parseInt($('sf-opening-pause').value)||2000;
-  let mainScript, objectionHandling;
+  const mainScript=$('sf-main-script').value.trim();
 
   if(!scriptId){ notify('请输入话术ID','err'); return }
   if(!name){ notify('请输入话术名称','err'); return }
   if(!opening){ notify('请输入开场白话术','err'); return }
-
-  try{
-    mainScript=JSON.parse($('sf-main-script').value);
-  }catch(e){ notify('主要话术内容JSON格式错误: '+e.message,'err'); return }
-  try{
-    const raw=$('sf-objection').value.trim();
-    objectionHandling=raw?JSON.parse(raw):{};
-  }catch(e){ notify('异议处理话术JSON格式错误: '+e.message,'err'); return }
+  if(!mainScript){ notify('请输入主要话术内容','err'); return }
 
   const closing=$('sf-closing').value.trim();
   const body={
     name, description, script_type:scriptType,
     opening_script:opening, opening_pause:openingPause,
-    main_script:mainScript, objection_handling:objectionHandling,
-    closing_script:closing||null
+    main_script:mainScript,
+    closing_script:closing||null,
+    opening_barge_in: $('sf-opening-barge-in').checked,
+    closing_barge_in: $('sf-closing-barge-in').checked,
+    conversation_barge_in: $('sf-conversation-barge-in').checked,
+    barge_in_protect_start: parseInt($('sf-protect-start').value)||3,
+    barge_in_protect_end: parseInt($('sf-protect-end').value)||3
   };
 
   try{
@@ -1702,15 +1848,21 @@ async function viewScriptDetail(scriptId){
       </div>
       <div style="margin-top:14px">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">主要话术</div>
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;line-height:1.7;font-family:monospace;white-space:pre-wrap">${d.main_script?JSON.stringify(d.main_script,null,2):'—'}</div>
-      </div>
-      <div style="margin-top:14px">
-        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">异议处理</div>
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;line-height:1.7;font-family:monospace;white-space:pre-wrap">${d.objection_handling&&Object.keys(d.objection_handling).length?JSON.stringify(d.objection_handling,null,2):'—'}</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;line-height:1.7;white-space:pre-wrap">${d.main_script||'—'}</div>
       </div>
       <div style="margin-top:14px">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">结束语</div>
         <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;line-height:1.7;white-space:pre-wrap">${d.closing_script||'—'}</div>
+      </div>
+      <div style="margin-top:14px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">打断策略</div>
+        <table style="width:100%">
+          <tr><td style="color:var(--muted);width:100px;padding:6px 10px">开场白打断</td><td style="padding:6px 10px">${d.opening_barge_in?'<span style="color:var(--green)">● 支持</span>':'<span style="color:var(--muted)">● 不支持</span>'}</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">结束语打断</td><td style="padding:6px 10px">${d.closing_barge_in?'<span style="color:var(--green)">● 支持</span>':'<span style="color:var(--muted)">● 不支持</span>'}</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">对话打断</td><td style="padding:6px 10px">${d.conversation_barge_in!==false?'<span style="color:var(--green)">● 支持</span>':'<span style="color:var(--muted)">● 不支持</span>'}</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">开始保护期</td><td style="padding:6px 10px">${d.barge_in_protect_start??3} 秒</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">结束保护期</td><td style="padding:6px 10px">${d.barge_in_protect_end??3} 秒</td></tr>
+        </table>
       </div>
     `;
     $('sd-body').innerHTML=html;

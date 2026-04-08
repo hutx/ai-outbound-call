@@ -526,6 +526,50 @@ async def start_test_call(req: TestCallRequest):
             logger.info(f"Mock stop playback in call {self.uuid}")
             self._playback_done.set()
 
+        async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
+            """流式播放：逐 chunk 发送 PCM 到前端 WebSocket（边合成边播）"""
+            self._playback_done.clear()
+            self._speech_active = True
+
+            # 等待 WebSocket 连接就绪（最多等 5 秒）
+            try:
+                await asyncio.wait_for(self._ws_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.uuid}] play_stream() 等待 WebSocket 超时")
+                self._speech_active = False
+                self._playback_done.set()
+                return
+
+            if self.ws_connection:
+                # 先发送流式标记，通知前端进入流式播放模式
+                try:
+                    await self.ws_connection.send_json({
+                        "type": "ai_response", "text": text,
+                        "has_audio": True, "streaming": True
+                    })
+                    logger.info(f"[{self.uuid}] play_stream() 发送流式标记: {text[:50]}...")
+                except Exception:
+                    pass
+                # 逐 chunk 发送 PCM 数据
+                try:
+                    async for chunk in audio_chunks:
+                        if chunk and self.ws_connection:
+                            await self.ws_connection.send_bytes(chunk)
+                    logger.info(f"[{self.uuid}] play_stream() PCM 发送完毕")
+                except Exception as e:
+                    logger.warning(f"[{self.uuid}] play_stream() 发送失败: {e}")
+
+                # 发送流式完成信号，通知前端停止 ScriptProcessorNode
+                try:
+                    await self.ws_connection.send_json({
+                        "type": "streaming_audio_done"
+                    })
+                except Exception:
+                    pass
+
+            self._speech_active = False
+            self._playback_done.set()
+
         async def speak_text(self, text: str) -> str:
             """模拟TTS语音合成并播放"""
             logger.info(f"Mock TTS: {text}")
@@ -668,9 +712,9 @@ async def start_test_call(req: TestCallRequest):
     #  Monkey-patch _say 以保存文本供 play() 发送到前端
     _original_say = agent._say
 
-    async def _patched_say(text: str, record: bool = True):
+    async def _patched_say(text: str, record: bool = True, **kwargs):
         agent.session._current_tts_text = text  # 保存文本供 mock play 使用
-        await _original_say(text, record)
+        await _original_say(text, record, **kwargs)
 
     agent._say = _patched_say
 

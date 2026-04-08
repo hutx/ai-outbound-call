@@ -9,7 +9,7 @@ import hashlib
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 import aiohttp
 import aiofiles
 import dashscope
@@ -31,6 +31,14 @@ class BaseTTS(ABC):
         输出: 音频文件路径（WAV 格式，FreeSWITCH 可直接播放）
         """
         pass
+
+    @abstractmethod
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """
+        流式合成语音，逐 chunk 产出 PCM 音频数据
+        输出: 8000Hz 16bit mono 裸 PCM（不含 WAV 头）
+        """
+        yield b""
 
     def _get_cache_path(self, text: str, ext: str = "wav") -> str:
         """基于文本内容和音色生成缓存文件路径"""
@@ -109,6 +117,27 @@ class AliTTSClient(BaseTTS):
         logger.warning("阿里云 TTS 失败，降级到 Edge TTS")
         return await EdgeTTSClient().synthesize(text)
 
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成：阿里云 TTS 暂不支持流式，降级到文件再读取"""
+        try:
+            audio_path = await self.synthesize(text)
+            if audio_path and os.path.exists(audio_path):
+                import struct
+                with open(audio_path, "rb") as f:
+                    header = f.read(44)  # 跳过 WAV 头
+                    while True:
+                        chunk = f.read(1600)  # 100ms @ 8000Hz 16bit
+                        if not chunk:
+                            break
+                        yield chunk
+                return
+        except Exception as e:
+            logger.error(f"阿里云 TTS 流式降级失败: {e}")
+        # 最终降级：静音
+        chunk_size = 1600
+        for _ in range(3):
+            yield b"\x00\x00" * (chunk_size // 2)
+
 
 class EdgeTTSClient(BaseTTS):
     """
@@ -148,6 +177,56 @@ class EdgeTTSClient(BaseTTS):
         except Exception as e:
             logger.error(f"Edge TTS 失败: {e}")
             return await self._generate_silence(1.0)
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成：edge-tts 原生输出 MP3，需转码为 PCM
+
+        使用后台任务收集 MP3 → ffmpeg 转码 → 逐 chunk 输出 PCM
+        """
+        try:
+            import edge_tts
+
+            # 先用 edge-tts 完整合成 MP3（edge-tts stream 输出 MP3 帧，无法直接流式转码）
+            # 将 MP3 通过 ffmpeg 管道转为 PCM，边转边 yield
+            mp3_data = b""
+            communicate = edge_tts.Communicate(text, self.voice, rate="+5%")
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_data += chunk["audio"]
+
+            if not mp3_data:
+                logger.warning("Edge TTS 返回空音频")
+                sample_rate = 8000
+                yield b"\x00\x00" * int(sample_rate * 0.3)
+                return
+
+            # 通过 ffmpeg 将 MP3 转为 PCM（8000Hz 16bit mono），流式读取
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", "pipe:0",
+                "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ar", "8000", "-ac", "1", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+
+            # 写入 MP3 到 stdin
+            proc.stdin.write(mp3_data)
+            proc.stdin.close()
+
+            # 流式读取 PCM 输出
+            while True:
+                chunk = await proc.stdout.read(1600)  # 约 100ms @ 8000Hz 16bit mono
+                if not chunk:
+                    break
+                yield chunk
+
+            await proc.wait()
+        except Exception as e:
+            logger.error(f"Edge TTS 流式失败: {e}")
+            # 降级：生成短静音
+            sample_rate = 8000
+            yield b"\x00\x00" * int(sample_rate * 0.3)
 
     async def _generate_silence(self, duration_sec: float) -> str:
         """生成静音文件（最终降级）"""
@@ -202,6 +281,25 @@ class CosyVoiceClient(BaseTTS):
             logger.error(f"CosyVoice 调用失败: {e}")
             return await EdgeTTSClient().synthesize(text)
 
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成：CosyVoice 暂不支持流式，降级到文件再读取"""
+        try:
+            audio_path = await self.synthesize(text)
+            if audio_path and os.path.exists(audio_path):
+                with open(audio_path, "rb") as f:
+                    f.read(44)  # 跳过 WAV 头
+                    while True:
+                        chunk = f.read(1600)
+                        if not chunk:
+                            break
+                        yield chunk
+                return
+        except Exception as e:
+            logger.error(f"CosyVoice 流式降级失败: {e}")
+        chunk_size = 1600
+        for _ in range(3):
+            yield b"\x00\x00" * (chunk_size // 2)
+
 
 class MockTTSClient(BaseTTS):
     """Mock TTS（开发测试用，直接返回静音文件）"""
@@ -223,6 +321,16 @@ class MockTTSClient(BaseTTS):
                 f.write(struct.pack("<I", len(audio_data)))
                 f.write(audio_data)
         return path
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成：生成短静音 PCM chunk，模拟流式行为"""
+        logger.info(f"[Mock TTS Stream] 合成文本: {text[:50]}...")
+        sample_rate = 8000
+        chunk_size = int(sample_rate * 0.1)  # 100ms/chunk
+        # 生成 3 个 chunk（300ms 静音）
+        for _ in range(3):
+            await asyncio.sleep(0.05)  # 模拟合成延迟
+            yield b"\x00\x00" * chunk_size
 
 
 class BailianCosyVoiceClient(BaseTTS):
@@ -292,6 +400,106 @@ class BailianCosyVoiceClient(BaseTTS):
             pitch_rate=1.0,
         )
         return synth.call(text)
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成：通过 callback 将同步回调桥接为 AsyncGenerator
+
+        注意：百炼 TTS 输出 WAV 格式（含 44 字节头），需要剥离头部
+        只发送裸 PCM 数据给前端
+        """
+        if not dashscope.api_key:
+            logger.error("百炼 TTS: API Key 为空")
+            return
+
+        import queue as _queue
+        from dashscope.audio.tts_v2 import ResultCallback
+
+        q = _queue.Queue(maxsize=200)
+        error_ref = {"value": None}
+
+        class _StreamCallback(ResultCallback):
+            def on_open(self):
+                pass
+
+            def on_data(self, data):
+                if data:
+                    try:
+                        q.put_nowait(data)
+                    except _queue.Full:
+                        logger.warning("TTS 回调队列已满，丢弃数据")
+
+            def on_complete(self):
+                try:
+                    q.put_nowait(None)  # 结束标记
+                except _queue.Full:
+                    pass
+
+            def on_error(self, message):
+                error_ref["value"] = Exception(f"百炼 TTS 错误: {message}")
+                try:
+                    q.put_nowait(None)
+                except _queue.Full:
+                    pass
+
+            def on_close(self):
+                pass
+
+            def on_event(self, message):
+                pass
+
+        callback = _StreamCallback()
+        synth = SpeechSynthesizer(
+            model=self.model_name,
+            voice=self.voice,
+            format=self.AUDIO_FORMAT,
+            volume=50,
+            speech_rate=self.speech_rate,
+            pitch_rate=1.0,
+            callback=callback,
+        )
+
+        # 在线程池中启动同步 TTS 调用
+        def _run():
+            try:
+                synth.call(text)
+            except Exception as e:
+                error_ref["value"] = e
+                try:
+                    q.put_nowait(None)
+                except _queue.Full:
+                    pass
+
+        loop = asyncio.get_event_loop()
+        task = loop.run_in_executor(None, _run)
+
+        # 从队列中异步取数据，剥离 WAV 头
+        header_stripped = False
+        while True:
+            try:
+                chunk = await asyncio.get_event_loop().run_in_executor(
+                    None, q.get, True, 2.0
+                )
+            except _queue.Empty:
+                # 队列 2 秒无数据，检查是否已完成
+                if error_ref["value"]:
+                    logger.error(f"TTS 流式错误: {error_ref['value']}")
+                    break
+                continue
+
+            if chunk is None:
+                break
+            if chunk:
+                # 第一个 chunk 可能包含 WAV 头，需要剥离
+                if not header_stripped:
+                    header_stripped = True
+                    if len(chunk) > 44 and chunk[:4] == b"RIFF":
+                        chunk = chunk[44:]  # 跳过 WAV 头
+                    elif len(chunk) <= 44:
+                        # 太小了，可能是纯头部，跳过
+                        continue
+                yield chunk
+
+        await task
 
 
 def create_tts_client(cfg: Optional[TTSConfig] = None) -> BaseTTS:

@@ -3,8 +3,7 @@
 提供增删改查话术脚本的REST API接口
 """
 from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Optional
-import json
+from typing import List
 
 from backend.services.script_service import script_service, ScriptConfig
 from backend.core.auth import require_auth
@@ -27,9 +26,12 @@ async def list_scripts(current_user: dict = Depends(require_auth)):
                 "script_type": s.script_type,
                 "opening_script": s.opening_script,
                 "opening_pause": s.opening_pause,
-                "has_main_script": s.main_script is not None,
-                "has_objection_handling": s.objection_handling is not None,
                 "closing_script": s.closing_script,
+                "opening_barge_in": s.opening_barge_in,
+                "closing_barge_in": s.closing_barge_in,
+                "conversation_barge_in": s.conversation_barge_in,
+                "barge_in_protect_start": s.barge_in_protect_start,
+                "barge_in_protect_end": s.barge_in_protect_end,
                 "is_active": s.is_active
             }
             for s in scripts
@@ -56,8 +58,12 @@ async def get_script(script_id: str, current_user: dict = Depends(require_auth))
             "opening_script": script.opening_script,
             "opening_pause": script.opening_pause,
             "main_script": script.main_script,
-            "objection_handling": script.objection_handling,
             "closing_script": script.closing_script,
+            "opening_barge_in": script.opening_barge_in,
+            "closing_barge_in": script.closing_barge_in,
+            "conversation_barge_in": script.conversation_barge_in,
+            "barge_in_protect_start": script.barge_in_protect_start,
+            "barge_in_protect_end": script.barge_in_protect_end,
             "is_active": script.is_active
         }
     except HTTPException:
@@ -84,7 +90,6 @@ async def create_script(script_data: dict, current_user: dict = Depends(require_
         opening_script = script_data["opening_script"]
         opening_pause = script_data.get("opening_pause", 2000)
         main_script = script_data["main_script"]
-        objection_handling = script_data.get("objection_handling", {})
         closing_script = script_data.get("closing_script")
         is_active = script_data.get("is_active", True)
 
@@ -106,9 +111,13 @@ async def create_script(script_data: dict, current_user: dict = Depends(require_
             opening_script=opening_script,
             opening_pause=opening_pause,
             main_script=main_script,
-            objection_handling=objection_handling,
             closing_script=closing_script,
-            is_active=is_active
+            is_active=is_active,
+            opening_barge_in=script_data.get("opening_barge_in", False),
+            closing_barge_in=script_data.get("closing_barge_in", False),
+            conversation_barge_in=script_data.get("conversation_barge_in", True),
+            barge_in_protect_start=script_data.get("barge_in_protect_start", 3),
+            barge_in_protect_end=script_data.get("barge_in_protect_end", 3)
         )
 
         # 调用服务创建脚本
@@ -151,12 +160,20 @@ async def update_script(script_id: str, script_data: dict, current_user: dict = 
             update_data["opening_pause"] = script_data["opening_pause"]
         if "main_script" in script_data:
             update_data["main_script"] = script_data["main_script"]
-        if "objection_handling" in script_data:
-            update_data["objection_handling"] = script_data["objection_handling"]
         if "closing_script" in script_data:
             update_data["closing_script"] = script_data["closing_script"]
         if "is_active" in script_data:
             update_data["is_active"] = script_data["is_active"]
+        if "opening_barge_in" in script_data:
+            update_data["opening_barge_in"] = script_data["opening_barge_in"]
+        if "closing_barge_in" in script_data:
+            update_data["closing_barge_in"] = script_data["closing_barge_in"]
+        if "conversation_barge_in" in script_data:
+            update_data["conversation_barge_in"] = script_data["conversation_barge_in"]
+        if "barge_in_protect_start" in script_data:
+            update_data["barge_in_protect_start"] = script_data["barge_in_protect_start"]
+        if "barge_in_protect_end" in script_data:
+            update_data["barge_in_protect_end"] = script_data["barge_in_protect_end"]
 
         # 调用服务更新脚本
         success = await script_service.update_script(script_id, **update_data)
