@@ -8,7 +8,7 @@
   ║  - 可实现重试逻辑                                            ║
   ║                                                              ║
   ║  调用方式：                                                   ║
-  ║  fs_cli -x "luarun originate_call.lua 13800138000 task_001"  ║
+  ║  fs_cli -x "luarun originate_call.lua 19042638084 task_001"  ║
   ╚══════════════════════════════════════════════════════════════╝
 --]]
 
@@ -51,7 +51,7 @@ local originate_cmd = string.format(
   call_uuid,
   task_id,
   script_id,
-  "02100000000",  -- 替换为实际备案号码
+  "202603311547",  -- 替换为实际备案号码
   phone_number
 )
 

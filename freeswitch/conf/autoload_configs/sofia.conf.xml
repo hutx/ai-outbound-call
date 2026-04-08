@@ -38,7 +38,7 @@
         <gateway name="carrier_trunk">
           <param name="username"         value="$${carrier_username}"/>
           <param name="password"         value="$${carrier_password}"/>
-          <!-- <param name="realm"            value="$${carrier_sip_server}:6922"/> -->
+          <param name="realm"            value="$${carrier_sip_server}:6922"/>
           <param name="proxy"            value="$${carrier_sip_server}:6922"/>
           <param name="register"         value="false"/>
           <param name="expire-seconds"   value="1800"/>
@@ -50,8 +50,23 @@
           <param name="ping-min"         value="1"/>
           <!-- 主叫号码从 From 头取（false = 从 Contact 取） -->
           <param name="caller-id-in-from" value="true"/>
+          <param name="caller-id-in-uri" value="true"/>
           <param name="extension" value="$${carrier_username}"/>
           <param name="contact-params"   value="transport=udp"/>
+          <param name="from-user"   value="$${outbound_caller_id}"/>
+          <param name="from-domain"   value="$${carrier_sip_server}"/>
+
+          <!-- 🌟 自动加前缀（网关层处理，拨号计划无需手动拼） -->
+          <param name="prefix" value="$${prefix}"/>
+          
+          <!-- 保活与超时 -->
+          <param name="ping" value="25"/>
+          <param name="expire-seconds" value="600"/>
+          <param name="retry-seconds" value="30"/>
+          
+          <!-- 传输协议：6922 端口通常为 UDP，如供应商明确要求 TCP 请改为 tport=tcp -->
+          <!-- <param name="contact-params" value="tport=udp"/> -->
+        
         </gateway>
 
         <!-- 备用网关（主备容灾，主 gateway 失败自动切换） -->

@@ -1,6 +1,6 @@
 """
 TTS 语音合成服务
-抽象层：支持阿里云 TTS 和 CosyVoice 本地部署
+抽象层：支持阿里云 TTS、百炼 CosyVoice 和 Edge TTS
 """
 import asyncio
 import logging
@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 import aiohttp
 import aiofiles
+import dashscope
+from dashscope.audio.tts_v2 import SpeechSynthesizer, AudioFormat
 
 from backend.core.config import config, TTSConfig
 
@@ -31,8 +33,11 @@ class BaseTTS(ABC):
         pass
 
     def _get_cache_path(self, text: str, ext: str = "wav") -> str:
-        """基于文本内容生成缓存文件路径"""
-        text_hash = hashlib.md5(text.encode()).hexdigest()[:12]
+        """基于文本内容和音色生成缓存文件路径"""
+        # 缓存 key 包含音色信息，换音色时自动失效
+        voice = getattr(self, 'voice', '')
+        cache_key = f"tts_{voice}_{text}"
+        text_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
         output_dir = config.tts.output_dir
         os.makedirs(output_dir, exist_ok=True)
         return os.path.join(output_dir, f"tts_{text_hash}.{ext}")
@@ -42,16 +47,13 @@ class AliTTSClient(BaseTTS):
     """
     阿里云智能语音服务 TTS
     文档: https://help.aliyun.com/document_detail/84435.html
-
-    安装依赖:
-    pip install aliyun-python-sdk-core nls-python-sdk
     """
 
     def __init__(self, cfg: TTSConfig):
         self.appkey = cfg.ali_appkey
         self.token = cfg.ali_token
         self.voice = cfg.voice
-        self.speech_rate = int((cfg.speech_rate - 1.0) * 100)  # 转换为 -500~500
+        self.speech_rate = int((cfg.speech_rate - 1.0) * 100)
         self.format = cfg.audio_format
 
     async def synthesize(self, text: str) -> str:
@@ -59,7 +61,6 @@ class AliTTSClient(BaseTTS):
         if os.path.exists(cache_path):
             return cache_path
 
-        # 阿里云 TTS SDK 是同步的，用线程池包装
         import threading
         loop = asyncio.get_event_loop()
 
@@ -88,21 +89,15 @@ class AliTTSClient(BaseTTS):
                 )
 
                 tts.start(
-                    text=text,
-                    voice=self.voice,
-                    aformat=self.format,
-                    speech_rate=self.speech_rate,
-                    volume=80,
-                    sample_rate=8000,
+                    text=text, voice=self.voice, aformat=self.format,
+                    speech_rate=self.speech_rate, volume=80, sample_rate=8000,
                 )
-
                 return result_audio
             except Exception as e:
                 logger.error(f"阿里云 TTS 调用失败: {e}")
                 return b""
 
         audio_data = await loop.run_in_executor(None, _sync_tts)
-
         if audio_data:
             async with aiofiles.open(cache_path, "wb") as f:
                 await f.write(audio_data)
@@ -111,7 +106,6 @@ class AliTTSClient(BaseTTS):
             return await self._fallback_tts(text)
 
     async def _fallback_tts(self, text: str) -> str:
-        """降级到 Edge TTS（免费，质量较好）"""
         logger.warning("阿里云 TTS 失败，降级到 Edge TTS")
         return await EdgeTTSClient().synthesize(text)
 
@@ -119,16 +113,12 @@ class AliTTSClient(BaseTTS):
 class EdgeTTSClient(BaseTTS):
     """
     Microsoft Edge TTS（免费方案，无需 API Key）
-    质量不错，适合开发测试和低成本场景
-
-    安装依赖:
-    pip install edge-tts
     """
 
     VOICE_MAP = {
-        "female_standard": "zh-CN-XiaoxiaoNeural",  # 女声，标准
-        "male_standard":   "zh-CN-YunxiNeural",      # 男声，标准
-        "female_warm":     "zh-CN-XiaoyiNeural",     # 女声，温柔
+        "female_standard": "zh-CN-XiaoxiaoNeural",
+        "male_standard":   "zh-CN-YunxiNeural",
+        "female_warm":     "zh-CN-XiaoyiNeural",
     }
 
     def __init__(self, voice_key: str = "female_warm"):
@@ -141,27 +131,20 @@ class EdgeTTSClient(BaseTTS):
 
         try:
             import edge_tts
-            # Edge TTS 输出 MP3，需要转换为 WAV（8000Hz，16bit，mono）供 FreeSWITCH 使用
             mp3_path = cache_path.replace(".wav", ".mp3")
             communicate = edge_tts.Communicate(text, self.voice, rate="+5%")
             await communicate.save(mp3_path)
 
-            # 用 ffmpeg 转换格式
             wav_path = cache_path
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y",
-                "-i", mp3_path,
-                "-ar", "8000",     # FreeSWITCH 内部采样率
-                "-ac", "1",        # 单声道
-                "-acodec", "pcm_s16le",  # 16bit PCM
-                wav_path,
+                "ffmpeg", "-y", "-i", mp3_path,
+                "-ar", "8000", "-ac", "1", "-acodec", "pcm_s16le", wav_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()
             os.remove(mp3_path)
             return wav_path
-
         except Exception as e:
             logger.error(f"Edge TTS 失败: {e}")
             return await self._generate_silence(1.0)
@@ -170,27 +153,24 @@ class EdgeTTSClient(BaseTTS):
         """生成静音文件（最终降级）"""
         path = os.path.join(config.tts.output_dir, "silence.wav")
         if not os.path.exists(path):
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"anullsrc=r=8000:cl=mono",
-                "-t", str(duration_sec),
-                "-acodec", "pcm_s16le",
-                path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
+            import struct
+            sample_rate = 8000
+            num_samples = int(sample_rate * duration_sec)
+            audio_data = b"\x00\x00" * num_samples
+            with open(path, "wb") as f:
+                f.write(b"RIFF")
+                f.write(struct.pack("<I", 36 + len(audio_data)))
+                f.write(b"WAVEfmt ")
+                f.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate,
+                                     sample_rate * 2, 2, 16))
+                f.write(b"data")
+                f.write(struct.pack("<I", len(audio_data)))
+                f.write(audio_data)
         return path
 
 
 class CosyVoiceClient(BaseTTS):
-    """
-    CosyVoice 本地 TTS（阿里开源，效果极佳）
-    项目地址: https://github.com/FunAudioLLM/CosyVoice
-
-    假设已启动 HTTP 推理服务：
-    python webui.py --port 50000
-    """
+    """CosyVoice 本地 TTS（本地 HTTP 推理服务）"""
 
     def __init__(self, cfg: TTSConfig):
         self.url = cfg.cosyvoice_url
@@ -204,15 +184,10 @@ class CosyVoiceClient(BaseTTS):
 
         try:
             async with aiohttp.ClientSession() as session:
-                payload = {
-                    "text": text,
-                    "spk_id": self.voice,
-                    "speed": self.speed,
-                    "stream": False,
-                }
                 async with session.post(
                     f"{self.url}/inference_sft",
-                    json=payload,
+                    json={"text": text, "spk_id": self.voice,
+                          "speed": self.speed, "stream": False},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status == 200:
@@ -223,7 +198,6 @@ class CosyVoiceClient(BaseTTS):
                     else:
                         logger.error(f"CosyVoice 返回错误: {resp.status}")
                         return await EdgeTTSClient().synthesize(text)
-
         except Exception as e:
             logger.error(f"CosyVoice 调用失败: {e}")
             return await EdgeTTSClient().synthesize(text)
@@ -234,32 +208,90 @@ class MockTTSClient(BaseTTS):
 
     async def synthesize(self, text: str) -> str:
         logger.info(f"[Mock TTS] 合成文本: {text[:50]}...")
-        # 生成一个极短的静音 WAV
         path = "/tmp/tts_mock.wav"
         if not os.path.exists(path):
-            # 生成 0.1s 静音 WAV (44 bytes header + minimal data)
             import struct
-            sample_rate = 8000
-            duration = 0.3
-            num_samples = int(sample_rate * duration)
-            audio_data = b"\x00\x00" * num_samples  # 16bit 零值
+            sample_rate, duration = 8000, 0.3
+            audio_data = b"\x00\x00" * int(sample_rate * duration)
             with open(path, "wb") as f:
-                # WAV header
                 f.write(b"RIFF")
                 f.write(struct.pack("<I", 36 + len(audio_data)))
-                f.write(b"WAVE")
-                f.write(b"fmt ")
-                f.write(struct.pack("<I", 16))   # chunk size
-                f.write(struct.pack("<H", 1))    # PCM
-                f.write(struct.pack("<H", 1))    # mono
-                f.write(struct.pack("<I", sample_rate))
-                f.write(struct.pack("<I", sample_rate * 2))
-                f.write(struct.pack("<H", 2))    # block align
-                f.write(struct.pack("<H", 16))   # bits per sample
+                f.write(b"WAVEfmt ")
+                f.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate,
+                                     sample_rate * 2, 2, 16))
                 f.write(b"data")
                 f.write(struct.pack("<I", len(audio_data)))
                 f.write(audio_data)
         return path
+
+
+class BailianCosyVoiceClient(BaseTTS):
+    """
+    阿里云百炼平台 CosyVoice 语音合成服务
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    使用 dashscope.audio.tts_v2.SpeechSynthesizer SDK
+    文档：https://help.aliyun.com/zh/model-studio/cosyvoice-python-sdk
+    """
+
+    # FreeSWITCH 需要 WAV 8000Hz 16bit mono
+    AUDIO_FORMAT = AudioFormat.WAV_8000HZ_MONO_16BIT
+
+    def __init__(self, cfg: TTSConfig):
+        self.model_name = cfg.bailian_tts_model or "cosyvoice-v3-flash"
+        self.voice = cfg.voice or "longyingxiao_v3"
+        # speech_rate: [0.5, 2.0], 默认 1.0
+        self.speech_rate = max(0.5, min(2.0, cfg.speech_rate))
+        self.output_dir = cfg.output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # 设置 dashscope API Key（SDK 全局配置）
+        api_key = cfg.bailian_access_token or ""
+        logger.info(f"百炼 TTS: API Key → {api_key[:10]}****" if api_key else "百炼 TTS: API Key 为空")
+        if not api_key:
+            logger.error("百炼 TTS: BAILIAN_ACCESS_TOKEN 未配置")
+        dashscope.api_key = api_key
+
+    async def synthesize(self, text: str) -> str:
+        logger.info(f"百炼 TTS: API Key → {dashscope.api_key}")
+        cache_path = self._get_cache_path(f"bailian_{text}")
+        if os.path.exists(cache_path):
+            return cache_path
+
+        if not dashscope.api_key:
+            logger.error("百炼 TTS: API Key 为空，降级 Edge TTS")
+            return await EdgeTTSClient().synthesize(text)
+
+        try:
+            loop = asyncio.get_event_loop()
+            audio_data = await loop.run_in_executor(
+                None, self._sync_call, text,
+            )
+
+            if audio_data:
+                async with aiofiles.open(cache_path, "wb") as f:
+                    await f.write(audio_data)
+                logger.info(f"百炼 TTS 成功 → {cache_path}")
+                return cache_path
+            else:
+                logger.warning("百炼 TTS 返回空音频，降级 Edge TTS")
+                return await EdgeTTSClient().synthesize(text)
+
+        except Exception as e:
+            logger.error(f"百炼 TTS 调用失败: {e}", exc_info=True)
+            return await EdgeTTSClient().synthesize(text)
+
+    def _sync_call(self, text: str) -> bytes:
+        """在线程池中同步调用 dashscope TTS SDK"""
+        synth = SpeechSynthesizer(
+            model=self.model_name,
+            voice=self.voice,
+            format=self.AUDIO_FORMAT,
+            volume=50,
+            speech_rate=self.speech_rate,
+            pitch_rate=1.0,
+        )
+        return synth.call(text)
 
 
 def create_tts_client(cfg: Optional[TTSConfig] = None) -> BaseTTS:
@@ -275,9 +307,16 @@ def create_tts_client(cfg: Optional[TTSConfig] = None) -> BaseTTS:
     elif cfg.provider == "cosyvoice_local":
         logger.info("使用 CosyVoice 本地 TTS")
         return CosyVoiceClient(cfg)
+    elif cfg.provider == "bailian":
+        logger.info("使用阿里云百炼 CosyVoice TTS")
+        return BailianCosyVoiceClient(cfg)
     elif cfg.provider == "mock":
         logger.info("使用 Mock TTS（仅开发测试）")
         return MockTTSClient()
     else:
         logger.warning(f"未知 TTS 提供商 {cfg.provider}，使用 Edge TTS")
         return EdgeTTSClient()
+
+
+# 全局单例
+tts = create_tts_client()

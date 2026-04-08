@@ -1,16 +1,19 @@
 """
 ASR 语音识别服务
-抽象层：统一接口，底层支持 FunASR（本地）和讯飞（云端）
+抽象层：统一接口，底层支持 FunASR（本地）、讯飞、阿里云 NLS 和百炼 ASR
 """
 import asyncio
 import logging
 import json
 import struct
+import time
 import wave
 import io
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Optional
 import websockets
+import dashscope
+from dashscope.audio.asr import Recognition, RecognitionResult
 
 from backend.core.config import config, ASRConfig
 
@@ -316,6 +319,7 @@ class AliASRClient(BaseASR):
 
     # Token 缓存（进程级，多路通话共用，避免重复换取）
     _token_cache: dict = {}   # {"token": str, "expires_at": float}
+    _token_lock: asyncio.Lock = asyncio.Lock()  # 并发控制锁
 
     # NLS Token 获取接口
     _TOKEN_URL = "https://nls-meta.cn-shanghai.aliyuncs.com/pop/2018-05-18/tokens"
@@ -340,32 +344,43 @@ class AliASRClient(BaseASR):
         优先级：env 直接配置 > 进程缓存 > 动态换取
         Token 有效期 24h，提前 5min 刷新
         """
-        import time
-
         # 1. 直接配置了 Token（测试/调试场景）
         if self.nls_token:
+            if not self.nls_token.strip():
+                raise ValueError("配置了空的 ALI_NLS_TOKEN，请检查环境变量")
             return self.nls_token
 
-        # 2. 检查进程缓存
+        # 2. 检查进程缓存（带并发保护的双检锁模式）
         cache = AliASRClient._token_cache
-        if cache.get("token") and cache.get("expires_at", 0) - time.time() > 300:
+        expires_at = cache.get("expires_at", 0)
+
+        # 首次检查：快速路径（无锁）
+        if cache.get("token") and expires_at > time.time() + 300:
             return cache["token"]
 
-        # 3. 用 AK/SK 动态换取
-        if not self.ak_id or not self.ak_secret:
-            raise RuntimeError(
-                "阿里云 ASR 未配置认证信息，请设置以下任一组合：\n"
-                "  方案A（推荐）: ALI_ACCESS_KEY_ID + ALI_ACCESS_KEY_SECRET\n"
-                "  方案B（临时）: ALI_NLS_TOKEN"
-            )
+        # 需要刷新或创建锁
+        async with AliASRClient._token_lock:
+            # 双检：获取锁后再次确认（防止其他协程已刷新）
+            cache = AliASRClient._token_cache
+            expires_at = cache.get("expires_at", 0)
+            if cache.get("token") and expires_at > time.time() + 300:
+                return cache["token"]
 
-        token, expire_time = await self._fetch_token_from_api()
-        AliASRClient._token_cache = {
-            "token": token,
-            "expires_at": float(expire_time),
-        }
-        logger.info(f"阿里云 NLS Token 已刷新，有效至 {expire_time}")
-        return token
+            # 3. 用 AK/SK 动态换取
+            if not self.ak_id or not self.ak_secret:
+                raise RuntimeError(
+                    "阿里云 ASR 未配置认证信息，请设置以下任一组合：\n"
+                    "  方案A（推荐）: ALI_ACCESS_KEY_ID + ALI_ACCESS_KEY_SECRET\n"
+                    "  方案B（临时）: ALI_NLS_TOKEN"
+                )
+
+            token, expire_time = await self._fetch_token_from_api()
+            AliASRClient._token_cache = {
+                "token": token,
+                "expires_at": float(expire_time),
+            }
+            logger.info(f"阿里云 NLS Token 已刷新，有效至 {expire_time}")
+            return token
 
     async def _fetch_token_from_api(self) -> tuple[str, int]:
         """
@@ -680,6 +695,153 @@ class MockASRClient(BaseASR):
         yield ASRResult(text=text, is_final=True)
 
 
+class BailianASRClient(BaseASR):
+    """
+    阿里云百炼平台 ASR 语音识别服务
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    使用 dashscope.audio.asr.Recognition SDK
+    文档：https://help.aliyun.com/zh/model-studio/fun-asr-realtime-python-sdk
+    """
+
+    def __init__(self, cfg: ASRConfig):
+        self.model_name = cfg.bailian_asr_model or "paraformer-v2"
+        self.sample_rate = cfg.sample_rate
+        self.vad_silence_ms = cfg.vad_silence_ms
+
+        # 设置 dashscope API Key
+        api_key = cfg.bailian_access_token or ""
+        logger.info(f"百炼 ASR: API Key → {api_key[:10]}****" if api_key else "百炼 ASR: API Key 为空")
+        if not api_key:
+            logger.error("百炼 ASR: BAILIAN_ACCESS_TOKEN 未配置")
+        dashscope.api_key = api_key
+
+    async def recognize_stream(
+        self, audio_gen: AsyncGenerator[bytes, None]
+    ) -> AsyncGenerator[ASRResult, None]:
+        if not dashscope.api_key:
+            logger.error("百炼 ASR: API Key 为空")
+            yield ASRResult(text="", is_final=True)
+            return
+
+        try:
+            result_queue: asyncio.Queue = asyncio.Queue()
+            final_text: str = ""
+            loop = asyncio.get_event_loop()
+            audio_sent: bool = False
+            total_bytes_sent: int = 0  # 统计发送的音频总字节数
+
+            # 创建回调对象
+            class _Callback:
+                def on_open(self):
+                    with open("/tmp/asr_debug.log", "a") as f:
+                        f.write(f"[{time.time():.3f}] on_open\n")
+                    logger.info(f"百炼 ASR: on_open")
+                    loop.call_soon_threadsafe(result_queue.put_nowait, "connected")
+
+                def on_event(self, result):
+                    with open("/tmp/asr_debug.log", "a") as f:
+                        f.write(f"[{time.time():.3f}] on_event: {result}\n")
+                    nonlocal final_text
+                    sentence = result.get_sentence()
+                    if not sentence or not isinstance(sentence, dict):
+                        return
+                    text = sentence.get("text", "").strip()
+                    is_final = RecognitionResult.is_sentence_end(sentence)
+                    if text:
+                        final_text = text
+                        with open("/tmp/asr_debug.log", "a") as f:
+                            f.write(f"[{time.time():.3f}]  → text={text!r} is_final={is_final}\n")
+                        loop.call_soon_threadsafe(
+                            result_queue.put_nowait,
+                            ASRResult(text=text, is_final=is_final),
+                        )
+
+                def on_complete(self):
+                    with open("/tmp/asr_debug.log", "a") as f:
+                        f.write(f"[{time.time():.3f}] on_complete\n")
+                    logger.info("百炼 ASR: on_complete")
+                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
+
+                def on_close(self):
+                    with open("/tmp/asr_debug.log", "a") as f:
+                        f.write(f"[{time.time():.3f}] on_close\n")
+
+                def on_error(self, result):
+                    with open("/tmp/asr_debug.log", "a") as f:
+                        f.write(f"[{time.time():.3f}] on_error: {result}\n")
+                    err_msg = str(result)
+                    if "NO_VALID_AUDIO" in err_msg:
+                        logger.debug(f"百炼 ASR: 无有效音频输入")
+                    else:
+                        logger.error(f"百炼 ASR 错误: {result}")
+                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
+
+            callback = _Callback()
+            with open("/tmp/asr_debug.log", "a") as f:
+                f.write(f"[{time.time():.3f}] Creating Recognition: model={self.model_name}, sample_rate={self.sample_rate}, format=pcm\n")
+            logger.info(f"百炼 ASR: 创建 Recognition, model={self.model_name}, sample_rate={self.sample_rate}")
+            recognition = Recognition(
+                model=self.model_name,
+                callback=callback,
+                format="pcm",
+                sample_rate=self.sample_rate,
+            )
+
+            with open("/tmp/asr_debug.log", "a") as f:
+                f.write(f"[{time.time():.3f}] Calling recognition.start()\n")
+            recognition.start()
+
+            # 并发：发送音频帧 + 接收结果
+            async def _send_frames():
+                nonlocal audio_sent, total_bytes_sent
+                chunk_count = 0
+                async for chunk in audio_gen:
+                    if not chunk:
+                        break
+                    chunk_count += 1
+                    total_bytes_sent += len(chunk)
+                    recognition.send_audio_frame(chunk)
+                    audio_sent = True
+                logger.info(f"百炼 ASR: 发送完毕, {chunk_count} 帧, {total_bytes_sent} bytes")
+                if audio_sent:
+                    recognition.stop()
+                else:
+                    logger.warning("百炼 ASR: 无音频输入，直接完成")
+                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
+
+            send_task = asyncio.create_task(_send_frames())
+
+            try:
+                # 从队列中 yield 结果
+                while True:
+                    try:
+                        item = await asyncio.wait_for(
+                            result_queue.get(), timeout=15.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"百炼 ASR 接收超时 (audio_sent={audio_sent}, bytes={total_bytes_sent})")
+                        break
+
+                    if item is None:
+                        break
+                    if item == "connected":
+                        # on_open 信号，跳过
+                        continue
+                    yield item
+            except GeneratorExit:
+                logger.debug("百炼 ASR: 生成器被提前退出")
+            finally:
+                # 确保 _send_frames 被取消且 recognition.stop() 被调用
+                if not send_task.done():
+                    send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+
+        except Exception as e:
+            logger.error(f"百炼 ASR 处理异常: {e}", exc_info=True)
+            yield ASRResult(text="", is_final=True)
+
+
 def create_asr_client(cfg: Optional[ASRConfig] = None) -> BaseASR:
     """工厂函数：根据配置创建对应的 ASR 客户端"""
     cfg = cfg or config.asr
@@ -693,6 +855,9 @@ def create_asr_client(cfg: Optional[ASRConfig] = None) -> BaseASR:
     elif cfg.provider == "ali":
         logger.info(f"使用阿里云 NLS 实时转写 (appkey={cfg.ali_asr_appkey[:6]}...)")
         return AliASRClient(cfg)
+    elif cfg.provider == "bailian":
+        logger.info("使用阿里云百炼 ASR 服务")
+        return BailianASRClient(cfg)
     elif cfg.provider == "mock":
         logger.info("使用 Mock ASR（仅开发测试）")
         return MockASRClient()

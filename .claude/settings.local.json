@@ -25,7 +25,21 @@
       "Bash(docker/freeswitch/conf_simple/autoload_configs/event_socket.conf.xml:*)",
       "Bash(docker/freeswitch/conf_complete/autoload_configs/acl.conf.xml:*)",
       "Bash(docker/freeswitch/setup_gateway.sh:*)",
-      "Bash(xargs ls:*)"
+      "Bash(xargs ls:*)",
+      "Bash(uv run:*)",
+      "Bash(pip install:*)",
+      "Bash(uvicorn backend.api.main:app:*)",
+      "Bash(lsof:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:bailian.console.aliyun.com)",
+      "WebFetch(domain:help.aliyun.com)",
+      "Bash(ls:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python3:*)",
+      "Bash(docker ps:*)",
+      "Bash(git:*)"
     ]
   }
 }
