@@ -95,6 +95,8 @@ class AsyncESLConnection:
         发起外呼。所有业务参数作为 channel 变量传入，
         CallAgent 通过 ESL channel_vars 读取。
         """
+        # 运营商要求加前缀 97776（在拨号前拼接）
+        dest = f"97776{phone}"
         cmd = (
             f"originate {{"
             f"origination_uuid={call_uuid},"
@@ -106,10 +108,10 @@ class AsyncESLConnection:
             f"ignore_early_media=true,"
             f"hangup_after_bridge=false"
             f"}}"
-            f"sofia/gateway/{gateway}/{phone} "
+            f"sofia/gateway/{gateway}/{dest} "
             f"&socket({socket_host}:{socket_port} async full)"
         )
-        logger.info(f"ESL originate → {phone} (uuid={call_uuid[:8]}, task={task_id})")
+        logger.info(f"ESL originate → {phone} (uuid={call_uuid[:8]}, task={task_id}, dest={dest})")
         return await self.bgapi(cmd, job_uuid=call_uuid)
 
     async def close(self):
@@ -262,6 +264,8 @@ class ESLSocketCallSession:
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._connected = True
         self._playback_done = asyncio.Event()
+        self._hangup_cause: Optional[str] = None
+        self._sip_code: Optional[int] = None
 
     @property
     def uuid(self) -> Optional[str]:
@@ -389,7 +393,13 @@ class ESLSocketCallSession:
 
             if name in ("CHANNEL_HANGUP", "CHANNEL_HANGUP_COMPLETE"):
                 cause = event.get("Hangup-Cause", "UNKNOWN")
-                logger.info(f"[{self._uuid}] 通话挂断: {cause}")
+                sip_code = event.get("sip_hangup_disposition", "")
+                # 存储到 session 属性，供 CallAgent._cleanup 读取
+                self._hangup_cause = cause
+                if "recv_" in sip_code:
+                    # sip_hangup_disposition 格式如 "recv_refused" / "recv_403" 等
+                    self._sip_code = sip_code
+                logger.info(f"[{self._uuid}] 通话挂断: {cause} (sip_disposition={sip_code})")
                 self._connected = False
                 await self._safe_put(self._event_queue, {"type": "hangup", "cause": cause})
                 break

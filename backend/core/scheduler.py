@@ -136,7 +136,7 @@ class TaskScheduler:
             phones=phones,
             concurrent_limit=min(concurrent_limit, config.max_concurrent_calls),
             max_retries=max_retries,
-            caller_id=caller_id or config.freeswitch.__dict__.get("caller_id", "02100000000"),
+            caller_id=caller_id or config.freeswitch.__dict__.get("caller_id", "202603311547"),
         )
         self._tasks[task_id] = task
         self._pause_events[task_id] = asyncio.Event()
@@ -189,7 +189,8 @@ class TaskScheduler:
     def list_tasks(self) -> list[dict]:
         return [t.to_dict() for t in reversed(list(self._tasks.values()))]
 
-    def on_call_finished(self, task_id: str, phone: str, result: "CallResult"):
+    def on_call_finished(self, task_id: str, phone: str, result: "CallResult",
+                         dial_attempts: int = 0, hangup_cause: str = "", sip_code: int = 0):
         """
         由 CallAgent._cleanup() 调用，更新任务计数
         """
@@ -206,6 +207,11 @@ class TaskScheduler:
             task.connected_count += 1
         elif result in (CR.ERROR, CR.NOT_ANSWERED):
             task.failed_count += 1
+        if sip_code or hangup_cause:
+            logger.debug(
+                f"[{task_id}] {phone} 结果: {result.value} "
+                f"SIP={sip_code} cause={hangup_cause} attempts={dial_attempts}"
+            )
 
     # ── 内部执行逻辑 ──────────────────────────────────────────
 
@@ -240,12 +246,12 @@ class TaskScheduler:
                     await asyncio.sleep(min(wait, 60))
 
             # 检查拨号时间窗口
-            if not self._in_dial_window():
-                wait_secs = self._seconds_to_window_open()
-                logger.info(f"当前不在拨号时间窗口，等待 {wait_secs:.0f}s")
-                await asyncio.sleep(min(wait_secs, 300))
-                if not self._in_dial_window():
-                    continue
+            # if not self._in_dial_window():
+            #     wait_secs = self._seconds_to_window_open()
+            #     logger.info(f"当前不在拨号时间窗口，等待 {wait_secs:.0f}s")
+            #     await asyncio.sleep(min(wait_secs, 300))
+            #     if not self._in_dial_window():
+            #         continue
 
             # 黑名单检查
             if crm.is_blacklisted(pr.phone):
@@ -310,7 +316,7 @@ class TaskScheduler:
                 call_uuid=call_uuid,
                 task_id=task.task_id,
                 script_id=task.script_id,
-                caller_id=task.caller_id or "02100000000",
+                caller_id=task.caller_id or "202603311547",
                 originate_timeout=config.freeswitch.originate_timeout,
                 socket_host="127.0.0.1",
                 socket_port=config.freeswitch.socket_port,

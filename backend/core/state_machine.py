@@ -82,6 +82,11 @@ class CallContext:
     # 不满意/拒绝计数（连续拒绝超过阈值则结束）
     rejection_count: int = 0
 
+    # 外呼结果详情（SIP 层面的原始反馈）
+    sip_code: Optional[int] = None          # SIP 响应码：200/403/480 等
+    hangup_cause: Optional[str] = None      # FreeSWITCH 挂断原因：CALL_REJECTED / NO_ANSWER 等
+    dial_attempts: int = 0                  # 外呼尝试次数
+
     @property
     def duration_seconds(self) -> Optional[int]:
         if self.answered_at and self.ended_at:

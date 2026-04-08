@@ -20,7 +20,7 @@ _INTENTS: dict = {}        # 意向记录 {phone: {level, uuid, note}}
 
 # ── 示例客户数据（生产环境替换为 CRM API 调用） ──────────────
 _MOCK_CUSTOMERS: dict = {
-    "13800138000": {
+    "19042638084": {
         "name": "张三", "age": 35, "balance": 120000,
         "risk_level": "stable",
         "note": "曾咨询过定期理财，对收益率较敏感",

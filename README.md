@@ -209,7 +209,7 @@ curl -X POST http://localhost:8000/api/tasks \
     "script_id": "finance_product_a",
     "concurrent_limit": 10,
     "max_retries": 1,
-    "caller_id": "02100000000"
+    "caller_id": "202603311547"
   }'
 ```
 
@@ -233,7 +233,7 @@ ws.onmessage = (e) => {
 <X-PRE-PROCESS cmd="set" data="carrier_sip_server=sip.your-carrier.com"/>
 <X-PRE-PROCESS cmd="set" data="carrier_username=YOUR_SIP_USER"/>
 <X-PRE-PROCESS cmd="set" data="carrier_password=YOUR_SIP_PASSWORD"/>
-<X-PRE-PROCESS cmd="set" data="outbound_caller_id=02100000000"/>
+<X-PRE-PROCESS cmd="set" data="outbound_caller_id=202603311547"/>
 ```
 
 编辑 `freeswitch/conf/autoload_configs/sofia.conf.xml`，在 `carrier_trunk` gateway 中填写实际信息。

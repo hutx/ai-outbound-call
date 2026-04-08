@@ -375,7 +375,7 @@ class TestESLService:
         return (
             "Content-Type: command/reply\r\n"
             "Unique-ID: uuid_test_001\r\n"
-            "Caller-Destination-Number: 13800138000\r\n"
+            "Caller-Destination-Number: 19042638084\r\n"
             "variable_task_id: task_prod_001\r\n"
             "variable_script_id: finance_product_a\r\n"
             "variable_ai_agent: true\r\n"
@@ -507,7 +507,7 @@ class TestCRMService:
     @pytest.mark.asyncio
     async def test_query_known_customer(self):
         from backend.services.crm_service import crm
-        info = await crm.query_customer_info("13800138000")
+        info = await crm.query_customer_info("19042638084")
         assert info["found"] is True
         assert info["name"] == "张三"
         assert info["blacklisted"] is False
@@ -545,20 +545,20 @@ class TestCRMService:
     @pytest.mark.asyncio
     async def test_record_intent(self):
         from backend.services.crm_service import crm, _INTENTS
-        await crm.record_intent("13800138000", "high", "uuid-001")
-        assert _INTENTS["13800138000"]["level"] == "high"
+        await crm.record_intent("19042638084", "high", "uuid-001")
+        assert _INTENTS["19042638084"]["level"] == "high"
 
     @pytest.mark.asyncio
     async def test_schedule_callback_returns_success(self):
         from backend.services.crm_service import crm
-        result = await crm.schedule_callback("13800138000", "task_001", "2025-06-01 10:00", "测试")
+        result = await crm.schedule_callback("19042638084", "task_001", "2025-06-01 10:00", "测试")
         assert result["success"] is True
         assert "callback_time" in result
 
     @pytest.mark.asyncio
     async def test_send_sms_returns_true(self):
         from backend.services.crm_service import crm
-        result = await crm.send_sms("13800138000", "product_intro", {"product": "理财A"})
+        result = await crm.send_sms("19042638084", "product_intro", {"product": "理财A"})
         assert result is True
 
 

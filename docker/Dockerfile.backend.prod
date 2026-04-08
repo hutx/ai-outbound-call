@@ -14,8 +14,12 @@ RUN pip install --upgrade pip && \
     gcc g++ libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制项目文件
+# 复制完整项目文件（依赖安装需要 backend/ 目录存在）
 COPY pyproject.toml ./
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
+COPY demo_runner.py ./
+
 RUN pip install uv && \
     pip install --upgrade pip setuptools && \
     uv pip install --system --no-cache -- .

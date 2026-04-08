@@ -19,19 +19,20 @@ from backend.core.config import config
 from backend.core.state_machine import CallState, CallResult, CallContext, StateMachine
 from backend.services.asr_service import BaseASR, create_asr_client, ASRResult
 from backend.services.tts_service import BaseTTS, create_tts_client
-from backend.services.llm_service import LLMService, build_system_prompt, build_opening
+from backend.services.llm_service import LLMService
 from backend.services.esl_service import ESLSocketCallSession, ESLError
 from backend.services.crm_service import crm
 from backend.utils.db import save_call_record
+from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call
 
 logger = logging.getLogger(__name__)
 
 # 单路通话最长时长（秒），防止 LLM 循环或静音时挂死
 MAX_CALL_DURATION = int(config.__dict__.get("max_call_duration", 300))
 # 用户无响应后最大重问次数
-MAX_SILENCE_RETRIES = 1
+MAX_SILENCE_RETRIES = 5
 # LLM 超时（秒）
-LLM_TIMEOUT = 15.0
+LLM_TIMEOUT = 30.0
 # TTS 超时（秒）
 TTS_TIMEOUT = 10.0
 # ASR 单句最长等待（秒）
@@ -42,6 +43,10 @@ class AudioStreamAdapter:
     """
     将 FreeSWITCH 音频 Queue 转为 ASR 可消费的 AsyncGenerator
     支持 barge-in 检测：AI 播报期间检测到有声帧即触发打断
+
+    两段式 VAD：
+    - 首次等待超时（2s）：给用户提供时间开始说话
+    - 说话中 VAD（500ms）：用户说话后，停顿 500ms 即认为说完
     """
 
     def __init__(
@@ -54,6 +59,7 @@ class AudioStreamAdapter:
         self._vad_silence_ms = vad_silence_ms
         self._barge_in_event = barge_in_cb
         self._stopped = False
+        self._started_speaking = False  # 是否已经检测到用户开始说话
 
     def stop(self):
         self._stopped = True
@@ -65,7 +71,10 @@ class AudioStreamAdapter:
                 chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
             except asyncio.TimeoutError:
                 silence_ms = (time.time() - last_audio_ts) * 1000
-                if silence_ms >= self._vad_silence_ms:
+                # 首次等待：2 秒没音频说明用户没说话
+                # 说话中：500ms 停顿认为用户说完
+                threshold = 2000 if not self._started_speaking else self._vad_silence_ms
+                if silence_ms >= threshold:
                     break
                 continue
             if not chunk:
@@ -73,6 +82,8 @@ class AudioStreamAdapter:
             # 触发 barge-in（如果 AI 正在说话）
             if self._barge_in_event and not self._barge_in_event.is_set():
                 self._barge_in_event.set()
+            if not self._started_speaking:
+                self._started_speaking = True
             last_audio_ts = time.time()
             yield chunk
         yield b""  # ASR 结束信号
@@ -135,7 +146,7 @@ class CallAgent:
                 self.ctx.customer_info = await crm.query_customer_info(self.ctx.phone_number)
 
             # 4. 构建 System Prompt
-            self._system_prompt = build_system_prompt(
+            self._system_prompt = await get_system_prompt_for_call(
                 self.ctx.script_id, self.ctx.customer_info
             )
 
@@ -176,18 +187,23 @@ class CallAgent:
     async def _conversation_loop(self):
         """多轮对话主循环"""
         # 开场白
+        logger.info(f"[{self.ctx.uuid}] 🎙️ 播放开场白")
         await self._say_opening()
+        logger.info(f"[{self.ctx.uuid}] 🎙️ 开场白播放完毕，进入监听模式")
         silence_retries = 0
 
         while self.sm.should_continue() and self.session._connected:
             # 监听用户
+            logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             user_text = await self._listen_user()
+            logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r}")
 
             if not user_text:
                 silence_retries += 1
                 if silence_retries > MAX_SILENCE_RETRIES:
                     logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
                     break
+                logger.info(f"[{self.ctx.uuid}] 第 {silence_retries} 次无响应，追问")
                 await self._say("您好，请问您还在吗？")
                 continue
             silence_retries = 0
@@ -195,7 +211,9 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 👤 {user_text}")
 
             # LLM 推理
+            logger.info(f"[{self.ctx.uuid}] 🧠 开始调用 LLM...")
             reply_text, action = await self._think_and_reply(user_text)
+            logger.info(f"[{self.ctx.uuid}] 🧠 LLM 返回: reply={reply_text[:50]!r} action={action}")
 
             # 播报（transfer 时先播再转，end 时先说再挂）
             if reply_text and action not in ("transfer",):
@@ -209,7 +227,7 @@ class CallAgent:
     # ─────────────────────────────────────────────────────────
     async def _say_opening(self):
         self.sm.transition(CallState.AI_SPEAKING)
-        opening = build_opening(self.ctx.script_id, self.ctx.customer_info)
+        opening = await get_opening_for_call(self.ctx.script_id, self.ctx.customer_info)
         text = opening["reply"]
         self.ctx.messages.append({"role": "assistant", "content": text})
         self.ctx.ai_utterances += 1
@@ -221,13 +239,12 @@ class CallAgent:
     async def _listen_user(self) -> str:
         self.sm.transition(CallState.USER_SPEAKING)
         audio_queue = await self.session.start_audio_capture()
+        queue_size = audio_queue.qsize()
+        logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
 
-        # 清空上一轮残留音频
-        while not audio_queue.empty():
-            try:
-                audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        # 注意：不清空音频队列。在测试通话场景中，前端在 TTS 播放期间
+        # 已持续发送音频到队列，清空会导致丢失用户语音。
+        # 在真实 ESL 场景中，音频来自 FreeSWITCH 实时流，不会有残留问题。
 
         adapter = AudioStreamAdapter(
             audio_queue,
@@ -236,17 +253,25 @@ class CallAgent:
         )
 
         final_text = ""
+        asr_result_count = 0
         try:
             async for result in self._asr_with_retry(adapter.stream()):
+                asr_result_count += 1
+                logger.info(f"[{self.ctx.uuid}] ASR 中间结果 #{asr_result_count}: text={result.text!r} is_final={result.is_final} conf={result.confidence:.2f}")
                 if result.is_final and result.text:
                     final_text = result.text
-                    logger.debug(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} conf={result.confidence:.2f}")
+                    logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
+                    # 通话场景中，一句话即为一轮对话，拿到 is_final 后立即退出
+                    # 避免前端持续送音频导致 VAD 无法触发、ASR 无限识别多句
+                    break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
         except Exception as e:
             logger.error(f"[{self.ctx.uuid}] ASR 异常: {e}")
         finally:
             adapter.stop()
+
+        logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}, 共 {asr_result_count} 条结果")
 
         if final_text:
             self.ctx.user_utterances += 1
@@ -374,12 +399,28 @@ class CallAgent:
             or f"{config.freeswitch.recording_path}/{self.ctx.task_id}/{self.ctx.uuid}.wav"
         )
 
+        # 捕获挂断原因和 SIP 状态码
+        cv = self.session.channel_vars
+        if cv.get("sip_hangup_cause"):
+            self.ctx.hangup_cause = cv["sip_hangup_cause"]
+        if cv.get("sip_response_code"):
+            try:
+                self.ctx.sip_code = int(cv["sip_response_code"])
+            except (ValueError, TypeError):
+                pass
+        # 如果 channel_vars 中没有，尝试从 session 属性获取
+        if not self.ctx.hangup_cause and hasattr(self.session, "_hangup_cause"):
+            self.ctx.hangup_cause = self.session._hangup_cause
+        if not self.ctx.sip_code and hasattr(self.session, "_sip_code"):
+            self.ctx.sip_code = self.session._sip_code
+
         dur = self.ctx.duration_seconds or 0
         logger.info(
             f"[{self.ctx.uuid}] ✓ 结束 "
             f"result={self.ctx.result.value} "
             f"intent={self.ctx.intent.value} "
-            f"dur={dur}s turns={self.ctx.user_utterances}"
+            f"dur={dur}s turns={self.ctx.user_utterances} "
+            f"sip={self.ctx.sip_code} cause={self.ctx.hangup_cause}"
         )
 
         # 写 CDR

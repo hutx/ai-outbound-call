@@ -89,7 +89,7 @@ class MockESLSession:
         print(f"{'━'*62}\n")
         return {
             "Unique-ID":                    self._uuid,
-            "Caller-Destination-Number":    "13800138000",
+            "Caller-Destination-Number":    "19042638084",
             "variable_task_id":             self._channel_vars["task_id"],
             "variable_script_id":           self._channel_vars["script_id"],
         }
@@ -220,7 +220,7 @@ async def run_demo(
     ctx = CallContext(
         uuid=call_uuid,
         task_id="demo_task_001",
-        phone_number="13800138000",
+        phone_number="19042638084",
         script_id=script_id,
         customer_info=customer_info or {
             "name": "张先生",

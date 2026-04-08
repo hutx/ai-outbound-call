@@ -2,7 +2,18 @@
   "permissions": {
     "allow": [
       "Bash(docker restart:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(docker network:*)",
+      "Bash(kill -9 7392)",
+      "Bash(pkill -f \"uvicorn\")",
+      "Read(//Users/hutx/work/hvyogo/ai_work/ai-outbound-call-new/**)",
+      "Bash(xargs kill:*)",
+      "Bash(nohup ./run_backend.sh)",
+      "Bash(open http://localhost:8000)",
+      "Bash(bash run_backend.sh)",
+      "Bash(ls -la *.log)",
+      "Read(//Users/hvtux/work/hvyogo/ai_work/ai-outbound-call-new/backend/services/**)"
     ]
   }
 }

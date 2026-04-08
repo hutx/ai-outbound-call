@@ -34,6 +34,7 @@
   <!-- 运营商认证信息 -->
   <X-PRE-PROCESS cmd="set" data="carrier_username=202603311547"/>
   <X-PRE-PROCESS cmd="set" data="carrier_password=202603311547"/>
+  <X-PRE-PROCESS cmd="set" data="prefix=97776"/>
   <!-- 呼叫者ID设置 -->
   <X-PRE-PROCESS cmd="set" data="outbound_caller_id=202603311547"/>
   <X-PRE-PROCESS cmd="set" data="outbound_caller_name=AIOutbound"/>

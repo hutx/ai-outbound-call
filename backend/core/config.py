@@ -2,8 +2,13 @@
 配置管理模块
 所有配置从环境变量读取，支持 .env 文件
 """
+
 import os
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 
 def _env(key: str, default: str = "") -> str:
@@ -50,8 +55,8 @@ class FreeSwitchConfig:
 @dataclass
 class ASRConfig:
     """ASR 语音识别配置"""
-    # 支持: funasr_local | xunfei | ali | mock
-    provider: str = "funasr_local"
+    # 支持: funasr_local | xunfei | ali | bailian | mock
+    provider: str = "ali"
 
     # FunASR 本地服务地址
     funasr_host: str = "127.0.0.1"
@@ -85,6 +90,12 @@ class ASRConfig:
     # 热词 ID（在阿里云控制台配置，提升产品名/专有名词识别率）
     ali_vocabulary_id: str = ""
 
+    # ── 阿里云百炼平台 ASR ──────────────────────────────────
+    # 百炼 API Key（sk-xxx，控制台获取）
+    bailian_access_token: str = ""
+    # 百炼 ASR 模型（默认 fun-asr-realtime，SDK 支持的实时转写模型）
+    bailian_asr_model: str = "fun-asr-realtime"
+
     # 通用参数
     # 采样率（Hz），FreeSWITCH PCMU/PCMA 默认 8000Hz
     sample_rate: int = 8000
@@ -108,6 +119,9 @@ class ASRConfig:
         self.ali_enable_punctuation = _env_bool("ALI_ASR_PUNCTUATION", self.ali_enable_punctuation)
         self.ali_enable_itn = _env_bool("ALI_ASR_ITN", self.ali_enable_itn)
         self.ali_vocabulary_id = _env("ALI_ASR_VOCABULARY_ID", self.ali_vocabulary_id)
+        # 百炼 ASR
+        self.bailian_access_token = _env("BAILIAN_ACCESS_TOKEN", self.bailian_access_token)
+        self.bailian_asr_model = _env("BAILIAN_ASR_MODEL", self.bailian_asr_model)
         self.sample_rate = _env_int("ASR_SAMPLE_RATE", self.sample_rate)
         self.vad_silence_ms = _env_int("VAD_SILENCE_MS", self.vad_silence_ms)
 
@@ -115,7 +129,7 @@ class ASRConfig:
 @dataclass
 class TTSConfig:
     """TTS 语音合成配置"""
-    # 支持: cosyvoice_local | ali | xunfei | bytedance
+    # 支持: cosyvoice_local | ali | bailian | edge | mock
     provider: str = "ali"
     # 阿里云 TTS
     ali_appkey: str = ""
@@ -123,13 +137,19 @@ class TTSConfig:
     # CosyVoice 本地服务
     cosyvoice_url: str = "http://127.0.0.1:50000"
     # 发音人
-    voice: str = "zhilingxi"
+    voice: str = "longxiaochun_v3"
     # 语速 (0.5 ~ 2.0)
     speech_rate: float = 1.0
     # 音频格式
     audio_format: str = "wav"
     # 合成音频临时目录
     output_dir: str = "/tmp/tts_cache"
+
+    # ── 阿里云百炼平台 TTS ──────────────────────────────────
+    # 百炼 API Key（sk-xxx，控制台获取）
+    bailian_access_token: str = ""
+    # 百炼 TTS 模型（cosyvoice-v3-flash / cosyvoice-v3-plus 等）
+    bailian_tts_model: str = "cosyvoice-v3-flash"
 
     def __post_init__(self):
         self.provider = _env("TTS_PROVIDER", self.provider)
@@ -140,6 +160,9 @@ class TTSConfig:
         self.speech_rate = _env_float("TTS_SPEECH_RATE", self.speech_rate)
         self.output_dir = _env("TTS_OUTPUT_DIR", self.output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
+        # 百炼 TTS
+        self.bailian_access_token = _env("BAILIAN_ACCESS_TOKEN", self.bailian_access_token)
+        self.bailian_tts_model = _env("BAILIAN_TTS_MODEL", self.bailian_tts_model)
 
 
 @dataclass
@@ -147,7 +170,7 @@ class LLMConfig:
     """LLM 对话引擎配置"""
     anthropic_api_key: str = ""
     anthropic_base_url: str = ""
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "qwen3.5-plus"
     max_tokens: int = 500
     # 温度：外呼场景建议 0.3~0.5，保证话术稳定性
     temperature: float = 0.4
