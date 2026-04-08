@@ -12,12 +12,22 @@ import io
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Optional
 import websockets
-import dashscope
-from dashscope.audio.asr import Recognition, RecognitionResult
 
 from backend.core.config import config, ASRConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _load_dashscope_asr():
+    """按需加载百炼 ASR 依赖，避免 mock 模式在导入阶段失败。"""
+    try:
+        import dashscope
+        from dashscope.audio.asr import Recognition, RecognitionResult
+    except ImportError as exc:
+        raise RuntimeError(
+            "百炼 ASR 依赖未安装，请安装 `dashscope` 或切换 ASR_PROVIDER。"
+        ) from exc
+    return dashscope, Recognition, RecognitionResult
 
 
 class ASRResult:
@@ -705,6 +715,7 @@ class BailianASRClient(BaseASR):
     """
 
     def __init__(self, cfg: ASRConfig):
+        self._dashscope, self._Recognition, self._RecognitionResult = _load_dashscope_asr()
         self.model_name = cfg.bailian_asr_model or "paraformer-v2"
         self.sample_rate = cfg.sample_rate
         self.vad_silence_ms = cfg.vad_silence_ms
@@ -714,12 +725,12 @@ class BailianASRClient(BaseASR):
         logger.info(f"百炼 ASR: API Key → {api_key[:10]}****" if api_key else "百炼 ASR: API Key 为空")
         if not api_key:
             logger.error("百炼 ASR: BAILIAN_ACCESS_TOKEN 未配置")
-        dashscope.api_key = api_key
+        self._dashscope.api_key = api_key
 
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None]
     ) -> AsyncGenerator[ASRResult, None]:
-        if not dashscope.api_key:
+        if not self._dashscope.api_key:
             logger.error("百炼 ASR: API Key 为空")
             yield ASRResult(text="", is_final=True)
             return
@@ -747,7 +758,7 @@ class BailianASRClient(BaseASR):
                     if not sentence or not isinstance(sentence, dict):
                         return
                     text = sentence.get("text", "").strip()
-                    is_final = RecognitionResult.is_sentence_end(sentence)
+                    is_final = self._RecognitionResult.is_sentence_end(sentence)
                     if text:
                         final_text = text
                         with open("/tmp/asr_debug.log", "a") as f:
@@ -781,7 +792,7 @@ class BailianASRClient(BaseASR):
             with open("/tmp/asr_debug.log", "a") as f:
                 f.write(f"[{time.time():.3f}] Creating Recognition: model={self.model_name}, sample_rate={self.sample_rate}, format=pcm\n")
             logger.info(f"百炼 ASR: 创建 Recognition, model={self.model_name}, sample_rate={self.sample_rate}")
-            recognition = Recognition(
+            recognition = self._Recognition(
                 model=self.model_name,
                 callback=callback,
                 format="pcm",

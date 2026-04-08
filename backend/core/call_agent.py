@@ -23,6 +23,7 @@ from backend.services.llm_service import LLMService
 from backend.services.esl_service import ESLSocketCallSession, ESLError
 from backend.services.crm_service import crm
 from backend.utils.db import save_call_record
+from backend.utils.audio import SimpleVAD
 from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call, get_barge_in_config
 from backend.services.script_service import script_service
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 # 单路通话最长时长（秒），防止 LLM 循环或静音时挂死
 MAX_CALL_DURATION = int(config.__dict__.get("max_call_duration", 300))
 # 用户无响应后最大重问次数
-MAX_SILENCE_RETRIES = 5
+MAX_SILENCE_RETRIES = 3
 # LLM 超时（秒）
 LLM_TIMEOUT = 30.0
 # TTS 超时（秒）
@@ -76,41 +77,96 @@ class AudioStreamAdapter:
         self._protect_start_ms = protect_start_ms
         self._protect_end_ms = protect_end_ms
         self._play_start_time: Optional[float] = None  # 播放开始时间
+        self._listen_start_time: Optional[float] = None
+        self._silence_ms = 0.0
+        self._total_chunks = 0
+        self._speech_chunks = 0
+        self._speech_ms = 0.0
+        self._max_rms = 0
+        self._vad = SimpleVAD(
+            sample_rate=8000,
+            frame_ms=20,
+            energy_threshold=250,
+            speech_min_frames=1,
+            silence_min_frames=max(1, int(vad_silence_ms / 20)),
+        )
 
     def stop(self):
         self._stopped = True
 
+    def audio_stats(self) -> dict:
+        return {
+            "total_chunks": self._total_chunks,
+            "speech_chunks": self._speech_chunks,
+            "speech_ms": round(self._speech_ms, 1),
+            "max_rms": self._max_rms,
+            "speech_detected": self._speech_chunks > 0,
+        }
+
+    @staticmethod
+    def _chunk_duration_ms(chunk: bytes, sample_rate: int = 8000) -> float:
+        if not chunk:
+            return 0.0
+        sample_count = len(chunk) / 2.0
+        return (sample_count / sample_rate) * 1000.0
+
     async def stream(self) -> AsyncGenerator[bytes, None]:
         last_audio_ts = time.time()
         self._play_start_time = time.time()
+        self._listen_start_time = self._play_start_time
         while not self._stopped:
             try:
                 chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
             except asyncio.TimeoutError:
-                silence_ms = (time.time() - last_audio_ts) * 1000
-                # 首次等待：2 秒没音频说明用户没说话
-                # 说话中：500ms 停顿认为用户说完
-                threshold = 2000 if not self._started_speaking else self._vad_silence_ms
-                if silence_ms >= threshold:
+                elapsed_silence_ms = (time.time() - last_audio_ts) * 1000
+                initial_wait_ms = (
+                    (time.time() - self._listen_start_time) * 1000
+                    if self._listen_start_time is not None
+                    else 0
+                )
+                if self._started_speaking and elapsed_silence_ms >= self._vad_silence_ms:
+                    break
+                if not self._started_speaking and initial_wait_ms >= 2000:
                     break
                 continue
             if not chunk:
                 break
+
+            chunk_duration_ms = self._chunk_duration_ms(chunk)
+            rms = self._vad.frame_rms(chunk)
+            has_speech = rms > self._vad.energy_threshold
+            self._total_chunks += 1
+            self._max_rms = max(self._max_rms, rms)
+
+            if has_speech:
+                self._started_speaking = True
+                self._silence_ms = 0.0
+                last_audio_ts = time.time()
+                self._speech_chunks += 1
+                self._speech_ms += chunk_duration_ms
+            else:
+                self._silence_ms += chunk_duration_ms
+                if not self._started_speaking:
+                    if self._silence_ms >= 2000:
+                        break
+                    continue
+
             # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
             should_barge_in = False
-            if self._barge_in_enabled and self._play_start_time is not None:
+            if has_speech and self._barge_in_enabled and self._play_start_time is not None:
                 elapsed_ms = (time.time() - self._play_start_time) * 1000
-                remaining_ms = self._total_duration_ms - elapsed_ms
                 in_protect_start = elapsed_ms < self._protect_start_ms
-                in_protect_end = remaining_ms < self._protect_end_ms
+                in_protect_end = False
+                if self._total_duration_ms > 0:
+                    remaining_ms = self._total_duration_ms - elapsed_ms
+                    in_protect_end = remaining_ms < self._protect_end_ms
                 should_barge_in = not in_protect_start and not in_protect_end
 
             if should_barge_in and self._barge_in_event and not self._barge_in_event.is_set():
                 self._barge_in_event.set()
-            if not self._started_speaking:
-                self._started_speaking = True
-            last_audio_ts = time.time()
             yield chunk
+            if self._started_speaking and not has_speech and self._silence_ms >= self._vad_silence_ms:
+                break
         yield b""  # ASR 结束信号
 
 
@@ -145,6 +201,7 @@ class CallAgent:
         # 注册状态机动作
         self.sm.register_handler("transfer",  self._do_transfer)
         self.sm.register_handler("end",       self._do_hangup)
+        self.sm.register_handler("callback",  self._do_schedule_callback)
         self.sm.register_handler("send_sms",  self._do_send_sms)
         self.sm.register_handler("blacklist", self._do_blacklist)
 
@@ -196,9 +253,6 @@ class CallAgent:
             except asyncio.TimeoutError:
                 logger.warning(f"[{self.ctx.uuid}] 通话超过最大时长 {MAX_CALL_DURATION}s，强制结束")
                 await self._say("感谢您的耐心，通话时间已到，再见！", record=False)
-
-            if self.ctx.result == CallResult.NOT_ANSWERED:
-                self.ctx.result = CallResult.COMPLETED
 
             event_task.cancel()
             await asyncio.gather(event_task, return_exceptions=True)
@@ -281,9 +335,18 @@ class CallAgent:
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
 
-        # 注意：不清空音频队列。在测试通话场景中，前端在 TTS 播放期间
-        # 已持续发送音频到队列，清空会导致丢失用户语音。
-        # 在真实 ESL 场景中，音频来自 FreeSWITCH 实时流，不会有残留问题。
+        # 测试通话场景使用浏览器 WebSocket 收发音频，上一轮遗留的静音帧或
+        # audio_end 哨兵会污染下一轮 ASR；真实 ESL 实时流不做此清理。
+        if getattr(self.session, "ws_connection", None) is not None:
+            drained = 0
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            if drained:
+                logger.info(f"[{self.ctx.uuid}] 测试通话监听前已清理旧音频帧 {drained} 条")
 
         adapter = AudioStreamAdapter(
             audio_queue,
@@ -298,15 +361,16 @@ class CallAgent:
         final_text = ""
         asr_result_count = 0
         try:
-            async for result in self._asr_with_retry(adapter.stream()):
-                asr_result_count += 1
-                logger.info(f"[{self.ctx.uuid}] ASR 中间结果 #{asr_result_count}: text={result.text!r} is_final={result.is_final} conf={result.confidence:.2f}")
-                if result.is_final and result.text:
-                    final_text = result.text
-                    logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
-                    # 通话场景中，一句话即为一轮对话，拿到 is_final 后立即退出
-                    # 避免前端持续送音频导致 VAD 无法触发、ASR 无限识别多句
-                    break
+            async with asyncio.timeout(ASR_TIMEOUT):
+                async for result in self._asr_with_retry(adapter.stream()):
+                    asr_result_count += 1
+                    logger.info(f"[{self.ctx.uuid}] ASR 中间结果 #{asr_result_count}: text={result.text!r} is_final={result.is_final} conf={result.confidence:.2f}")
+                    if result.is_final and result.text:
+                        final_text = result.text
+                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
+                        # 通话场景中，一句话即为一轮对话，拿到 is_final 后立即退出
+                        # 避免前端持续送音频导致 VAD 无法触发、ASR 无限识别多句
+                        break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
         except Exception as e:
@@ -314,11 +378,45 @@ class CallAgent:
         finally:
             adapter.stop()
 
+        audio_stats = adapter.audio_stats()
+        logger.info(
+            f"[{self.ctx.uuid}] 音频检测: speech_detected={audio_stats['speech_detected']} "
+            f"total_chunks={audio_stats['total_chunks']} "
+            f"speech_chunks={audio_stats['speech_chunks']} "
+            f"speech_ms={audio_stats['speech_ms']} "
+            f"max_rms={audio_stats['max_rms']}"
+        )
+        if not audio_stats["speech_detected"]:
+            logger.warning(f"[{self.ctx.uuid}] 本轮进入 ASR 的音频未检测到有效人声")
+            await self._notify_test_call_ws(
+                {
+                    "type": "audio_debug",
+                    "speech_detected": False,
+                    "max_rms": audio_stats["max_rms"],
+                    "speech_ms": audio_stats["speech_ms"],
+                }
+            )
+        elif not final_text:
+            logger.warning(
+                f"[{self.ctx.uuid}] 已检测到人声，但 ASR 未产出最终文本 "
+                f"(speech_ms={audio_stats['speech_ms']}, max_rms={audio_stats['max_rms']})"
+            )
+            await self._notify_test_call_ws(
+                {
+                    "type": "audio_debug",
+                    "speech_detected": True,
+                    "max_rms": audio_stats["max_rms"],
+                    "speech_ms": audio_stats["speech_ms"],
+                    "asr_final_text": "",
+                }
+            )
+
         logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}, 共 {asr_result_count} 条结果")
 
         if final_text:
             self.ctx.user_utterances += 1
             self.ctx.messages.append({"role": "user", "content": final_text})
+            await self._notify_test_call_ws({"type": "user_speech", "text": final_text})
 
         return final_text
 
@@ -330,6 +428,31 @@ class CallAgent:
 
         async for result in self.asr.recognize_stream(_gen_with_timeout()):
             yield result
+
+    async def _tts_stream_with_timeout(self, text: str) -> AsyncGenerator[bytes, None]:
+        """限制单个 TTS chunk 的等待时间，避免卡在合成阶段。"""
+        audio_gen = self.tts.synthesize_stream(text)
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(audio_gen.__anext__(), timeout=TTS_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                yield chunk
+        finally:
+            aclose = getattr(audio_gen, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _notify_test_call_ws(self, payload: dict):
+        """测试通话模式下把关键事件推回前端，方便联调定位。"""
+        ws = getattr(self.session, "ws_connection", None)
+        if ws is None:
+            return
+        try:
+            await ws.send_json(payload)
+        except Exception as e:
+            logger.debug(f"[{self.ctx.uuid}] 推送测试通话消息失败: {e}")
 
     # ─────────────────────────────────────────────────────────
     # LLM 推理
@@ -398,7 +521,7 @@ class CallAgent:
         try:
             t0 = time.time()
             # 流式 TTS：边合成边播
-            audio_chunks = self.tts.synthesize_stream(text)
+            audio_chunks = self._tts_stream_with_timeout(text)
             logger.debug(f"[{self.ctx.uuid}] TTS 流式开始")
 
             # barge-in：如果用户已经开始说话则跳过播放
@@ -432,6 +555,8 @@ class CallAgent:
     async def _do_hangup(self, params: dict):
         farewell = params.get("farewell", "好的，感谢您的时间，祝您生活愉快，再见！")
         logger.info(f"[{self.ctx.uuid}] 主动挂断")
+        if self.ctx.result not in (CallResult.ERROR, CallResult.TRANSFERRED):
+            self.ctx.result = CallResult.COMPLETED
         await self._say(farewell, speech_type="closing")
         await asyncio.sleep(0.4)  # 让 TTS 播放完
         await self.session.hangup()
@@ -445,10 +570,31 @@ class CallAgent:
         except Exception as e:
             logger.error(f"[{self.ctx.uuid}] 短信发送失败: {e}")
 
+    async def _do_schedule_callback(self, params: dict):
+        callback_time = params.get("callback_time") or params.get("time")
+        note = params.get("note", "用户要求稍后回拨")
+        logger.info(
+            f"[{self.ctx.uuid}] 安排回拨: {self.ctx.phone_number} at {callback_time or 'default'}"
+        )
+        try:
+            await crm.schedule_callback(
+                self.ctx.phone_number,
+                task_id=self.ctx.task_id,
+                callback_time=callback_time,
+                note=note,
+            )
+            if self.ctx.result == CallResult.NOT_ANSWERED:
+                self.ctx.result = CallResult.COMPLETED
+        except Exception as e:
+            logger.error(f"[{self.ctx.uuid}] 安排回拨失败: {e}")
+        self.sm.transition(CallState.ENDING)
+
     async def _do_blacklist(self, params: dict):
         reason = params.get("reason", "用户拒绝")
         logger.info(f"[{self.ctx.uuid}] 加入黑名单: {self.ctx.phone_number}")
         await crm.add_to_blacklist(self.ctx.phone_number, reason)
+        self.ctx.result = CallResult.BLACKLISTED
+        self.sm.transition(CallState.ENDING)
 
     # ─────────────────────────────────────────────────────────
     # 清理

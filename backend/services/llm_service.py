@@ -11,11 +11,9 @@ LLM 对话服务 — 支持多模型（Anthropic Claude / 通义千问）
 import json
 import logging
 import asyncio
-import os
-from typing import Optional
 import anthropic
 
-from backend.core.config import config
+from backend.core.config import config, LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +24,39 @@ class LLMService:
     根据模型名称自动选择对应的提供商（Claude / 通义千问等）
     """
 
-    def __init__(self):
+    SUPPORTED_PROVIDERS = {
+        "auto",
+        "anthropic",
+        "dashscope_compatible",
+        "anthropic_compatible",
+    }
+
+    def __init__(self, cfg: LLMConfig | None = None):
+        self._cfg = cfg or config.llm
+        self.provider = self._resolve_provider(self._cfg)
+        self.transport = "anthropic_sdk"
         self.client = anthropic.AsyncAnthropic(
-            api_key=config.llm.anthropic_api_key,
-            base_url=config.llm.anthropic_base_url,
+            api_key=self._cfg.anthropic_api_key,
+            base_url=self._cfg.anthropic_base_url or None,
         )
-        # Determine provider based on model name
-        if "qwen" in config.llm.model.lower():
-            self.provider = "dashscope"
-        else:
-            self.provider = "anthropic"
+
+    @classmethod
+    def _resolve_provider(cls, cfg: LLMConfig) -> str:
+        explicit = (getattr(cfg, "provider", "auto") or "auto").strip().lower()
+        if explicit != "auto":
+            if explicit not in cls.SUPPORTED_PROVIDERS:
+                raise ValueError(f"不支持的 LLM_PROVIDER: {explicit}")
+            return explicit
+
+        base_url = (cfg.anthropic_base_url or "").lower()
+        model = (cfg.model or "").lower()
+        if "dashscope" in base_url or "qwen" in model:
+            return "dashscope_compatible"
+        if "claude" in model:
+            return "anthropic"
+        if base_url and "anthropic" not in base_url:
+            return "anthropic_compatible"
+        return "anthropic"
 
     async def chat(
         self,
@@ -45,33 +66,30 @@ class LLMService:
         """
         非流式对话，支持多模型提供商
         """
+        cfg = self._cfg
         trimmed = self._trim_history(messages)
         last_error = None
 
-        logger.info(f"LLM 调用 (provider={self.provider}, system_prompt={system_prompt}, messages={trimmed})")
+        logger.info(
+            "LLM 调用 "
+            f"(provider={self.provider}, transport={self.transport}, "
+            f"model={cfg.model}, messages={len(trimmed)})"
+        )
 
         for attempt in range(3):
             try:
-                # 通过 DashScope 兼容接口或原生 Anthropic API 调用
                 response = await self.client.messages.create(
-                    model=config.llm.model,
-                    max_tokens=config.llm.max_tokens,
-                    temperature=config.llm.temperature,
+                    model=cfg.model,
+                    max_tokens=cfg.max_tokens,
+                    temperature=cfg.temperature,
                     system=system_prompt,
                     messages=trimmed,
                     thinking={"type": "disabled"},
                 )
 
-                # 遍历 content 块，找到第一个 TextBlock（跳过 ThinkingBlock）
-                raw_text = ""
-                for block in response.content:
-                    if block.type == "text":
-                        raw_text = block.text.strip()
-                        break
-                    elif hasattr(block, "thinking"):
-                        continue
+                raw_text = self._extract_text_content(response)
                 logger.info(
-                    f"LLM 原始响应 (attempt={attempt+1}, provider={self.provider}, raw_text={raw_text[:120]}):"
+                    f"LLM 原始响应 (attempt={attempt+1}, provider={self.provider}, raw_text={raw_text[:120]})"
                 )
                 return self._parse_response(raw_text)
 
@@ -88,11 +106,20 @@ class LLMService:
 
     def _trim_history(self, messages: list) -> list:
         """裁剪对话历史，保留最近 N 轮"""
-        max_msgs = config.llm.max_history_turns * 2  # 每轮 = user + assistant
+        cfg = getattr(self, "_cfg", config.llm)
+        max_msgs = cfg.max_history_turns * 2  # 每轮 = user + assistant
         if len(messages) > max_msgs:
             # 永远保留第一条（通常是背景信息）
             return [messages[0]] + messages[-(max_msgs - 1) :]
         return messages
+
+    def _extract_text_content(self, response) -> str:
+        """兼容 Anthropic 风格 content block，提取第一个文本块。"""
+        for block in getattr(response, "content", []):
+            block_type = getattr(block, "type", "")
+            if block_type == "text":
+                return getattr(block, "text", "").strip()
+        return ""
 
     def _parse_response(self, text: str) -> dict:
         """解析 LLM 返回的 JSON"""

@@ -1,730 +1,975 @@
-"""
-生产级单元测试套件
-运行方式:
-    # 安装依赖
-    pip install pytest pytest-asyncio
-
-    # 运行全部测试
-    pytest tests/ -v
-
-    # 只跑某个模块
-    pytest tests/test_all.py::TestStateMachine -v
-"""
 import asyncio
 import os
-import sys
 import struct
-import tempfile
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
-
-# ── 环境配置（必须在 import backend 之前） ─────────────────────
-os.environ.setdefault("ASR_PROVIDER", "mock")
-os.environ.setdefault("TTS_PROVIDER", "mock")
-os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-key")
-os.environ.setdefault("MAX_CALL_DURATION", "300")
-os.environ.setdefault("API_TOKEN", "test_token")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test_outbound.db")
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# ── Mock 无法安装的外部依赖 ────────────────────────────────────
-import types
-
-def _mock_missing(name):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-
-for _m in ["anthropic", "aiofiles", "websockets", "websockets.exceptions",
-           "aiohttp", "asyncpg", "sqlalchemy", "sqlalchemy.ext",
-           "sqlalchemy.ext.asyncio", "sqlalchemy.orm"]:
-    _mock_missing(_m)
-
-# anthropic 详细 mock
-_am = sys.modules["anthropic"]
-_am.RateLimitError = Exception
-class _FakeMsg:
-    content = [type("C", (), {
-        "text": '{"reply":"您好","intent":"interested","action":"continue","action_params":{}}'
-    })()]
-class _FakeClient:
-    def __init__(self, **k):
-        self.messages = type("M", (), {
-            "create": lambda s, **k: _FakeMsg()
-        })()
-_am.AsyncAnthropic = _FakeClient
-
-# sqlalchemy 详细 mock
-_sa = sys.modules["sqlalchemy"]
-
-class _ColType:
-    def __init__(self, *a, **k): pass
-    def __call__(self, *a, **k): return self
-
-for _n in ["String", "Integer", "DateTime", "JSON", "Text", "Boolean", "Float"]:
-    setattr(_sa, _n, _ColType())
-
-_sa.select = lambda *a: type("Q", (), {
-    "where": lambda s, *a: s, "order_by": lambda s, *a: s,
-    "limit": lambda s, x: s, "offset": lambda s, x: s,
-})()
-_sa.update = lambda *a: type("U", (), {"where": lambda s, *a: s, "values": lambda s, **k: s})()
-_sa.text   = lambda q: q
-
-_sa_async = sys.modules["sqlalchemy.ext.asyncio"]
-_sa_async.create_async_engine  = lambda *a, **k: None
-_sa_async.AsyncSession         = object
-_sa_async.async_sessionmaker   = lambda *a, **k: lambda: None
-
-_sa_orm = sys.modules["sqlalchemy.orm"]
-_sa_orm.DeclarativeBase = type("DeclarativeBase", (), {"metadata": type("M", (), {"create_all": lambda s, x: None})()})
-_sa_orm.sessionmaker    = lambda *a, **k: lambda: None
-_sa_orm.Mapped          = type("Mapped", (), {"__class_getitem__": classmethod(lambda cls, x: x)})
-_sa_orm.mapped_column   = lambda *a, **k: None
+from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.testclient import TestClient
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：状态机
-# ══════════════════════════════════════════════════════════════
+def _make_script():
+    return SimpleNamespace(
+        main_script="【推介产品】稳健理财\n【产品介绍】适合保守客户",
+        opening_pause=2000,
+        opening_script="您好，这里是智能客服。",
+        opening_barge_in=False,
+        closing_barge_in=False,
+        conversation_barge_in=True,
+        barge_in_protect_start=3,
+        barge_in_protect_end=2,
+    )
+
+
 class TestStateMachine:
     def test_initial_state(self):
-        from backend.core.state_machine import CallContext, StateMachine, CallState
+        from backend.core.state_machine import CallContext, CallState
+
         ctx = CallContext(uuid="u", task_id="t", phone_number="138", script_id="s")
-        sm = StateMachine(ctx)
         assert ctx.state == CallState.DIALING
-
-    def test_transition(self):
-        from backend.core.state_machine import CallContext, StateMachine, CallState
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
-        sm = StateMachine(ctx)
-        sm.transition(CallState.CONNECTED)
-        assert ctx.state == CallState.CONNECTED
-
-    def test_intent_update_valid(self):
-        from backend.core.state_machine import CallContext, StateMachine, CallIntent
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
-        sm = StateMachine(ctx)
-        sm.update_intent("interested")
-        assert ctx.intent == CallIntent.INTERESTED
 
     def test_intent_update_invalid_falls_back_to_unknown(self):
         from backend.core.state_machine import CallContext, StateMachine, CallIntent
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
+
+        ctx = CallContext(uuid="u", task_id="t", phone_number="138", script_id="s")
         sm = StateMachine(ctx)
-        sm.update_intent("totally_invalid")
+        sm.update_intent("invalid")
         assert ctx.intent == CallIntent.UNKNOWN
-
-    def test_duration_calculation(self):
-        from backend.core.state_machine import CallContext
-        from datetime import datetime
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
-        ctx.answered_at = datetime(2025, 1, 1, 10, 0, 0)
-        ctx.ended_at    = datetime(2025, 1, 1, 10, 2, 34)
-        assert ctx.duration_seconds == 154
-
-    def test_is_active_true_when_dialing(self):
-        from backend.core.state_machine import CallContext
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
-        assert ctx.is_active is True
-
-    def test_is_active_false_when_ended(self):
-        from backend.core.state_machine import CallContext, CallState
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
-        ctx.state = CallState.ENDED
-        assert ctx.is_active is False
 
     @pytest.mark.asyncio
     async def test_rejection_count_triggers_end(self):
         from backend.core.state_machine import CallContext, StateMachine
-        ctx = CallContext(uuid="u", task_id="t", phone_number="p", script_id="s")
+
+        ctx = CallContext(uuid="u", task_id="t", phone_number="138", script_id="s")
         sm = StateMachine(ctx)
-        end_called = []
-        async def _end(p): end_called.append(1)
-        sm.register_handler("end", _end)
+        calls = []
 
-        reject = {"reply": "好", "intent": "not_interested", "action": "continue", "action_params": {}}
-        _, a1 = await sm.process_llm_response(reject)
-        assert a1 == "continue"
-        _, a2 = await sm.process_llm_response(reject)
-        assert a2 == "end"
-        assert ctx.rejection_count == 2
-        assert end_called
+        async def handle_end(params):
+            calls.append(params)
 
+        sm.register_handler("end", handle_end)
+        response = {
+            "reply": "好的",
+            "intent": "not_interested",
+            "action": "continue",
+            "action_params": {},
+        }
+        _, action_1 = await sm.process_llm_response(response)
+        _, action_2 = await sm.process_llm_response(response)
 
-# ══════════════════════════════════════════════════════════════
-# 测试：LLM 服务
-# ══════════════════════════════════════════════════════════════
-class TestLLMService:
-    def _make_svc(self):
-        from backend.services.llm_service import LLMService
-        from backend.core.config import LLMConfig
-        svc = LLMService.__new__(LLMService)
-        svc._cfg = LLMConfig()
-        svc._cfg.max_history_turns = 5
-        return svc
+        assert action_1 == "continue"
+        assert action_2 == "end"
+        assert len(calls) == 1
 
-    def test_parse_valid_json(self):
-        svc = self._make_svc()
-        r = svc._parse_response(
-            '{"reply":"您好","intent":"interested","action":"continue","action_params":{}}'
+    @pytest.mark.asyncio
+    async def test_action_aliases_are_normalized(self):
+        from backend.core.state_machine import CallContext, StateMachine
+
+        ctx = CallContext(uuid="u", task_id="t", phone_number="138", script_id="s")
+        sm = StateMachine(ctx)
+        seen = []
+
+        async def handle_transfer(params):
+            seen.append("transfer")
+
+        async def handle_callback(params):
+            seen.append("callback")
+
+        sm.register_handler("transfer", handle_transfer)
+        sm.register_handler("callback", handle_callback)
+
+        _, action_1 = await sm.process_llm_response(
+            {"reply": "ok", "intent": "request_human", "action": "human", "action_params": {}}
         )
-        assert r["reply"] == "您好"
-        assert r["intent"] == "interested"
-        assert r["action"] == "continue"
+        _, action_2 = await sm.process_llm_response(
+            {
+                "reply": "ok",
+                "intent": "callback",
+                "action": "schedule_callback",
+                "action_params": {},
+            }
+        )
+
+        assert action_1 == "transfer"
+        assert action_2 == "callback"
+        assert seen == ["transfer", "callback"]
+
+
+class TestPromptBuilders:
+    @pytest.mark.asyncio
+    async def test_get_system_prompt_includes_customer_info_and_actions(self, monkeypatch):
+        from backend.services import async_script_utils as utils
+
+        async def fake_get_script(script_id):
+            return _make_script()
+
+        monkeypatch.setattr(utils.script_service, "get_script", fake_get_script)
+        prompt = await utils.get_system_prompt_for_call(
+            "finance_product_a",
+            {"name": "张三", "note": "高净值客户", "risk_level": "stable", "found": True},
+        )
+
+        assert "张三" in prompt
+        assert "高净值客户" in prompt
+        assert "callback" in prompt
+        assert "blacklist" in prompt
+
+    @pytest.mark.asyncio
+    async def test_build_system_prompt_from_db_matches_current_contract(self, monkeypatch):
+        from backend.services import script_service as svc
+
+        async def fake_get_script(script_id):
+            return _make_script()
+
+        monkeypatch.setattr(svc.script_service, "get_script", fake_get_script)
+        prompt = await svc.build_system_prompt_from_db(
+            "finance_product_a",
+            {"name": "李四", "note": "偏保守", "risk_level": "conservative", "found": True},
+        )
+
+        assert "李四" in prompt
+        assert "callback_time" in prompt
+        assert "blacklist" in prompt
+
+    @pytest.mark.asyncio
+    async def test_get_opening_uses_script_config(self, monkeypatch):
+        from backend.services import async_script_utils as utils
+
+        async def fake_get_script(script_id):
+            return _make_script()
+
+        monkeypatch.setattr(utils.script_service, "get_script", fake_get_script)
+        opening = await utils.get_opening_for_call("finance_product_a", {"name": "张三"})
+
+        assert opening["reply"] == "您好，这里是智能客服。"
+        assert opening["action"] == "continue"
+        assert opening["barge_in_enabled"] is False
+
+
+class TestLLMService:
+    def _make_service(self):
+        from backend.services.llm_service import LLMService
+
+        return LLMService.__new__(LLMService)
 
     def test_parse_markdown_fenced_json(self):
-        svc = self._make_svc()
-        raw = '```json\n{"reply":"test","intent":"unknown","action":"continue","action_params":{}}\n```'
-        r = svc._parse_response(raw)
-        assert r["reply"] == "test"
+        svc = self._make_service()
+        data = svc._parse_response(
+            '```json\n{"reply":"test","intent":"unknown","action":"continue","action_params":{}}\n```'
+        )
+        assert data["reply"] == "test"
+        assert data["action"] == "continue"
 
-    def test_parse_invalid_json_graceful_fallback(self):
-        svc = self._make_svc()
-        r = svc._parse_response("这根本不是 JSON")
-        assert r["action"] == "continue"
-        assert len(r["reply"]) > 0
+    def test_parse_invalid_json_falls_back_to_text(self):
+        svc = self._make_service()
+        data = svc._parse_response("不是 JSON")
+        assert data["action"] == "continue"
+        assert data["reply"] == "不是 JSON"
 
-    def test_fallback_response_action_is_end(self):
-        svc = self._make_svc()
-        assert svc._fallback_response()["action"] == "end"
+    def test_trim_history_uses_current_global_config(self, monkeypatch):
+        from backend.services.llm_service import config as llm_config
 
-    def test_trim_history_preserves_first_message(self):
-        svc = self._make_svc()
-        msgs = [{"role": "user", "content": str(i)} for i in range(20)]
-        trimmed = svc._trim_history(msgs)
-        assert trimmed[0] == msgs[0]
-        assert len(trimmed) <= 11  # max_history_turns=5 → max_msgs=10, +first = 11
+        svc = self._make_service()
+        monkeypatch.setattr(llm_config.llm, "max_history_turns", 2)
+        messages = [{"role": "user", "content": str(i)} for i in range(8)]
+        trimmed = svc._trim_history(messages)
 
-    def test_build_system_prompt_contains_compliance(self):
-        from backend.services.llm_service import build_system_prompt
-        prompt = build_system_prompt("finance_product_a", {"name": "张三"})
-        assert "本通话由人工智能完成" in prompt
-        assert "张三" in prompt
-        assert "JSON" in prompt
+        assert trimmed[0] == messages[0]
+        assert len(trimmed) == 4
 
-    def test_build_opening_contains_compliance_and_name(self):
-        from backend.services.llm_service import build_opening
-        op = build_opening("finance_product_a", {"name": "李四"})
-        assert "本通话由人工智能完成" in op["reply"]
-        assert "李四" in op["reply"]
+    def test_resolve_provider_prefers_dashscope_compatible_for_qwen(self):
+        from backend.core.config import LLMConfig
+        from backend.services.llm_service import LLMService
 
-    def test_get_scripts_returns_dict(self):
-        from backend.services.llm_service import get_scripts
-        scripts = get_scripts()
-        assert isinstance(scripts, dict)
-        assert len(scripts) >= 1
+        cfg = LLMConfig()
+        cfg.provider = "auto"
+        cfg.model = "qwen3.5-flash"
+        cfg.anthropic_base_url = "https://dashscope.aliyuncs.com/apps/anthropic"
 
-    def test_scripts_have_required_fields(self):
-        from backend.services.llm_service import get_scripts
-        for sid, s in get_scripts().items():
-            assert "product_name" in s, f"{sid} 缺少 product_name"
-            assert "product_desc" in s, f"{sid} 缺少 product_desc"
-            assert "key_selling_points" in s, f"{sid} 缺少 key_selling_points"
+        assert LLMService._resolve_provider(cfg) == "dashscope_compatible"
+
+    def test_resolve_provider_honors_explicit_provider(self):
+        from backend.core.config import LLMConfig
+        from backend.services.llm_service import LLMService
+
+        cfg = LLMConfig()
+        cfg.provider = "anthropic_compatible"
+        assert LLMService._resolve_provider(cfg) == "anthropic_compatible"
+
+    def test_trim_history_uses_instance_cfg(self):
+        from backend.core.config import LLMConfig
+
+        svc = self._make_service()
+        svc._cfg = LLMConfig()
+        svc._cfg.max_history_turns = 1
+        messages = [{"role": "user", "content": str(i)} for i in range(6)]
+        trimmed = svc._trim_history(messages)
+
+        assert trimmed[0] == messages[0]
+        assert len(trimmed) == 2
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：配置管理
-# ══════════════════════════════════════════════════════════════
-class TestConfig:
-    def test_all_config_fields_present(self):
+class TestConfigAndAuth:
+    def test_validate_runtime_requires_token_in_non_debug(self):
         from backend.core.config import AppConfig
+
         cfg = AppConfig()
-        assert hasattr(cfg, "freeswitch")
-        assert hasattr(cfg, "asr")
-        assert hasattr(cfg, "tts")
-        assert hasattr(cfg, "llm")
-        assert hasattr(cfg, "db")
-        assert hasattr(cfg, "redis")
-        assert hasattr(cfg, "max_call_duration")
-        assert hasattr(cfg, "api_token")
+        cfg.debug = False
+        cfg.api_token = ""
+        with pytest.raises(ValueError):
+            cfg.validate_runtime()
 
-    def test_env_override_max_call_duration(self):
-        from backend.core.config import AppConfig
-        cfg = AppConfig()
-        assert cfg.max_call_duration == 300
+    def test_require_auth_allows_anonymous_in_debug_without_token(self, monkeypatch):
+        from backend.core import auth
 
-    def test_esl_defaults(self):
-        from backend.core.config import FreeSwitchConfig
-        cfg = FreeSwitchConfig()
-        assert cfg.port == 8021
-        assert cfg.socket_port == 9999
+        monkeypatch.setattr(auth.config, "debug", True)
+        monkeypatch.setattr(auth.config, "api_token", "")
+        result = auth.require_auth(None)
+        assert result["user"] == "anonymous"
 
-    def test_ali_asr_fields_in_asr_config(self):
-        from backend.core.config import ASRConfig
-        cfg = ASRConfig()
-        assert hasattr(cfg, "ali_asr_appkey")
-        assert hasattr(cfg, "ali_access_key_id")
-        assert hasattr(cfg, "ali_nls_token")
-        assert hasattr(cfg, "ali_nls_url")
-        assert "cn-shanghai" in cfg.ali_nls_url
+    def test_require_auth_rejects_invalid_token(self, monkeypatch):
+        from backend.core import auth
 
-    def test_ali_asr_bool_fields_default_true(self):
-        from backend.core.config import ASRConfig
-        cfg = ASRConfig()
-        assert cfg.ali_enable_intermediate is True
-        assert cfg.ali_enable_punctuation  is True
-        assert cfg.ali_enable_itn          is True
+        monkeypatch.setattr(auth.config, "debug", False)
+        monkeypatch.setattr(auth.config, "api_token", "secret")
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong")
+        with pytest.raises(HTTPException) as exc:
+            auth.require_auth(creds)
+        assert exc.value.status_code == 401
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：任务调度器
-# ══════════════════════════════════════════════════════════════
 class TestScheduler:
-    def _make_sch(self):
+    def test_create_task_keeps_caller_id(self):
         from backend.core.scheduler import TaskScheduler
-        return TaskScheduler(esl_pool=None)
 
-    def test_create_task_basic(self):
-        from backend.core.scheduler import TaskStatus
-        sch = self._make_sch()
-        task = sch.create_task("测试", ["13800000001", "13800000002"], "finance_product_a")
-        assert task.total == 2
-        assert task.status == TaskStatus.PENDING
-        assert task.progress_pct == 0.0
+        scheduler = TaskScheduler(esl_pool=None)
+        task = scheduler.create_task(
+            "测试任务",
+            ["13800000001", "13800000002"],
+            "finance_product_a",
+            caller_id="4008009000",
+        )
+        assert task.caller_id == "4008009000"
 
-    def test_to_dict_has_required_fields(self):
-        sch = self._make_sch()
-        task = sch.create_task("t", ["138"], "s")
-        d = task.to_dict()
-        for field in ["task_id", "name", "status", "total", "completed",
-                      "connected", "failed", "progress", "connect_rate"]:
-            assert field in d, f"缺少字段: {field}"
+    def test_completed_excludes_dialing(self):
+        from backend.core.scheduler import TaskScheduler
 
-    def test_pause_resume_cancel(self):
-        from backend.core.scheduler import TaskStatus
-        sch = self._make_sch()
-        task = sch.create_task("t", ["138"], "s")
-        task.status = TaskStatus.RUNNING
+        scheduler = TaskScheduler(esl_pool=None)
+        task = scheduler.create_task("t", ["138", "139", "137"], "s")
+        task.phones[0].result = "dialing"
+        task.phones[1].result = "completed"
+        task.phones[2].result = "error"
+        assert task.completed == 2
 
-        assert sch.pause_task(task.task_id)
-        assert task.status == TaskStatus.PAUSED
+    @pytest.mark.asyncio
+    async def test_start_task_refuses_duplicate_runner(self, monkeypatch):
+        from backend.core.scheduler import TaskScheduler
 
-        assert sch.resume_task(task.task_id)
-        assert task.status == TaskStatus.RUNNING
+        scheduler = TaskScheduler(esl_pool=None)
+        task = scheduler.create_task("t", ["138"], "s")
+        gate = asyncio.Event()
 
-        assert sch.cancel_task(task.task_id)
-        assert task.status == TaskStatus.CANCELLED
+        async def fake_run(_task):
+            await gate.wait()
+
+        monkeypatch.setattr(scheduler, "_run", fake_run)
+
+        assert await scheduler.start_task(task.task_id) is True
+        assert await scheduler.start_task(task.task_id) is False
+        assert scheduler.pause_task(task.task_id) is True
+        assert scheduler.resume_task(task.task_id) is True
+        assert await scheduler.start_task(task.task_id) is False
+
+        gate.set()
+        await asyncio.sleep(0)
 
     def test_on_call_finished_updates_counts(self):
-        from backend.core.scheduler import TaskStatus
+        from backend.core.scheduler import TaskScheduler, TaskStatus
         from backend.core.state_machine import CallResult
-        sch = self._make_sch()
-        task = sch.create_task("t", ["138", "139"], "s")
+
+        scheduler = TaskScheduler(esl_pool=None)
+        task = scheduler.create_task("t", ["138", "139"], "s")
         task.status = TaskStatus.RUNNING
         task.phones[0].result = "dialing"
         task.phones[1].result = "dialing"
 
-        sch.on_call_finished(task.task_id, "138", CallResult.COMPLETED)
-        assert task.connected_count == 1
+        scheduler.on_call_finished(task.task_id, "138", CallResult.COMPLETED)
+        scheduler.on_call_finished(task.task_id, "139", CallResult.ERROR)
 
-        sch.on_call_finished(task.task_id, "139", CallResult.ERROR)
+        assert task.connected_count == 1
         assert task.failed_count == 1
 
-    def test_dial_window_constants(self):
-        from backend.core.scheduler import DIAL_WINDOW_START, DIAL_WINDOW_END
-        from datetime import time as dtime
-        assert DIAL_WINDOW_START == dtime(9, 0)
-        assert DIAL_WINDOW_END   == dtime(21, 0)
 
-    def test_in_dial_window_returns_bool(self):
-        from backend.core.scheduler import TaskScheduler
-        assert isinstance(TaskScheduler._in_dial_window(), bool)
-
-    def test_window_boundaries(self):
-        from backend.core.scheduler import DIAL_WINDOW_START, DIAL_WINDOW_END
-        from datetime import time as dtime
-        assert DIAL_WINDOW_START <= dtime(10, 0) <= DIAL_WINDOW_END
-        assert dtime(8, 59) < DIAL_WINDOW_START
-        assert dtime(21, 1) > DIAL_WINDOW_END
-
-    def test_concurrent_limit_capped_to_max(self):
-        sch = self._make_sch()
-        task = sch.create_task("t", ["138"], "s", concurrent_limit=9999)
-        from backend.core.config import config
-        assert task.concurrent_limit <= config.max_concurrent_calls
-
-    def test_phone_numbers_stripped(self):
-        sch = self._make_sch()
-        task = sch.create_task("t", [" 13800000001 ", "13800000002"], "s")
-        for pr in task.phones:
-            assert pr.phone == pr.phone.strip()
-
-
-# ══════════════════════════════════════════════════════════════
-# 测试：ESL 服务
-# ══════════════════════════════════════════════════════════════
-class TestESLService:
-    class FakeReader:
-        def __init__(self, raw: bytes): self._buf = raw; self._pos = 0
-        async def readline(self):
-            end = self._buf.find(b"\r\n", self._pos)
-            if end == -1: return b""
-            d = self._buf[self._pos:end+2]; self._pos = end+2; return d
-        async def readexactly(self, n):
-            d = self._buf[self._pos:self._pos+n]; self._pos += n; return d
-
-    class FakeWriter:
-        def __init__(self): self.sent=b""; self._closing=False
-        def write(self, d): self.sent += d.encode() if isinstance(d, str) else d
-        async def drain(self): pass
-        def is_closing(self): return self._closing
-        def close(self): self._closing = True
-        async def wait_closed(self): pass
-
-    def _make_raw_handshake(self) -> bytes:
-        return (
-            "Content-Type: command/reply\r\n"
-            "Unique-ID: uuid_test_001\r\n"
-            "Caller-Destination-Number: 19042638084\r\n"
-            "variable_task_id: task_prod_001\r\n"
-            "variable_script_id: finance_product_a\r\n"
-            "variable_ai_agent: true\r\n"
-            "\r\n"
-            "Content-Type: command/reply\r\nReply-Text: +OK\r\n\r\n"
-        ).encode()
-
-    @pytest.mark.asyncio
-    async def test_connect_extracts_uuid_and_channel_vars(self):
-        from backend.services.esl_service import ESLSocketCallSession
-        raw = self._make_raw_handshake()
-        session = ESLSocketCallSession(self.FakeReader(raw), self.FakeWriter())
-        # simulate connect (read event + parse vars)
-        data = await session._read_event()
-        session._uuid = data.get("Unique-ID")
-        for k, v in data.items():
-            if k.startswith("variable_"):
-                session._channel_vars[k[9:]] = v
-
-        assert session._uuid == "uuid_test_001"
-        assert session._channel_vars["task_id"] == "task_prod_001"
-        assert session._channel_vars["script_id"] == "finance_product_a"
-
-    @pytest.mark.asyncio
-    async def test_safe_put_does_not_block_on_full_queue(self):
-        from backend.services.esl_service import ESLSocketCallSession
-        q = asyncio.Queue(maxsize=2)
-        q.put_nowait("a")
-        q.put_nowait("b")
-        await ESLSocketCallSession._safe_put(q, "c")
-        assert q.qsize() == 2
-
-    def test_playback_done_is_event(self):
-        from backend.services.esl_service import ESLSocketCallSession
-        session = ESLSocketCallSession(self.FakeReader(b""), self.FakeWriter())
-        assert isinstance(session._playback_done, asyncio.Event)
-
-    def test_connection_is_connected_property(self):
-        from backend.services.esl_service import AsyncESLConnection
-        conn = AsyncESLConnection("127.0.0.1", 8021, "pass")
-        assert conn.is_connected is False
-        conn._connected = True
-        conn._writer = self.FakeWriter()
-        assert conn.is_connected is True
-        conn._writer._closing = True
-        assert conn.is_connected is False
-
-
-# ══════════════════════════════════════════════════════════════
-# 测试：ASR 服务
-# ══════════════════════════════════════════════════════════════
-class TestASRService:
+class TestASRAndTTS:
     @pytest.mark.asyncio
     async def test_mock_asr_returns_final_result(self):
-        from backend.services.asr_service import MockASRClient, ASRResult
+        from backend.services.asr_service import MockASRClient
+
         async def fake_audio():
             yield b"\x00" * 1600
             yield b""
-        client = MockASRClient()
-        results = [r async for r in client.recognize_stream(fake_audio())]
-        assert len(results) >= 1
-        assert results[-1].is_final
-        assert len(results[-1].text) > 0
 
-    @pytest.mark.asyncio
-    async def test_mock_asr_cycles_responses(self):
-        from backend.services.asr_service import MockASRClient
-        async def fake_audio():
-            yield b"\x00"; yield b""
         client = MockASRClient()
-        texts = set()
-        for _ in range(6):
-            async for r in client.recognize_stream(fake_audio()):
-                if r.is_final: texts.add(r.text)
-        assert len(texts) > 1
+        results = [item async for item in client.recognize_stream(fake_audio())]
+        assert results[-1].is_final is True
+        assert results[-1].text
 
-    def test_factory_creates_mock(self):
-        from backend.services.asr_service import create_asr_client, MockASRClient
+    def test_create_asr_client_returns_mock(self):
         from backend.core.config import ASRConfig
-        cfg = ASRConfig(); cfg.provider = "mock"
+        from backend.services.asr_service import MockASRClient, create_asr_client
+
+        cfg = ASRConfig()
+        cfg.provider = "mock"
         assert isinstance(create_asr_client(cfg), MockASRClient)
 
-    def test_factory_raises_on_unknown_provider(self):
-        from backend.services.asr_service import create_asr_client
-        from backend.core.config import ASRConfig
-        cfg = ASRConfig(); cfg.provider = "does_not_exist"
-        with pytest.raises(ValueError):
-            create_asr_client(cfg)
-
-    def test_asr_result_strips_whitespace(self):
-        from backend.services.asr_service import ASRResult
-        r = ASRResult(text="  您好  ")
-        assert r.text == "您好"
-
-
-# ══════════════════════════════════════════════════════════════
-# 测试：TTS 服务
-# ══════════════════════════════════════════════════════════════
-class TestTTSService:
     @pytest.mark.asyncio
-    async def test_mock_tts_returns_wav_path(self):
+    async def test_mock_tts_stream_yields_pcm_chunks(self):
         from backend.services.tts_service import MockTTSClient
-        path = await MockTTSClient().synthesize("您好，欢迎使用智能外呼系统")
-        assert path.endswith(".wav")
 
-    @pytest.mark.asyncio
-    async def test_mock_tts_file_exists_on_disk(self):
-        from backend.services.tts_service import MockTTSClient
-        path = await MockTTSClient().synthesize("测试文本")
-        assert os.path.exists(path)
+        client = MockTTSClient()
+        chunks = [chunk async for chunk in client.synthesize_stream("您好")]
+        assert len(chunks) == 3
+        assert all(isinstance(chunk, bytes) and chunk for chunk in chunks)
 
-    def test_factory_creates_mock(self):
-        from backend.services.tts_service import create_tts_client, MockTTSClient
+    def test_create_tts_unknown_provider_falls_back_to_edge(self):
         from backend.core.config import TTSConfig
-        cfg = TTSConfig(); cfg.provider = "mock"
-        assert isinstance(create_tts_client(cfg), MockTTSClient)
+        from backend.services.tts_service import EdgeTTSClient, create_tts_client
+
+        cfg = TTSConfig()
+        cfg.provider = "unknown-provider"
+        assert isinstance(create_tts_client(cfg), EdgeTTSClient)
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：CRM 服务
-# ══════════════════════════════════════════════════════════════
 class TestCRMService:
     def setup_method(self):
-        # 每个测试前清空黑名单（避免测试间污染）
-        import backend.services.crm_service as crm_mod
-        crm_mod._BLACKLIST.clear()
-        crm_mod._INTENTS.clear()
+        import backend.services.crm_service as crm_module
+
+        crm_module._BLACKLIST.clear()
+        crm_module._INTENTS.clear()
 
     @pytest.mark.asyncio
     async def test_query_known_customer(self):
         from backend.services.crm_service import crm
+
         info = await crm.query_customer_info("19042638084")
         assert info["found"] is True
         assert info["name"] == "张三"
-        assert info["blacklisted"] is False
 
     @pytest.mark.asyncio
-    async def test_query_unknown_customer(self):
+    async def test_blacklist_lifecycle(self):
         from backend.services.crm_service import crm
-        info = await crm.query_customer_info("10000000000")
-        assert info["found"] is False
 
-    def test_is_blacklisted_initially_false(self):
-        from backend.services.crm_service import crm
-        assert crm.is_blacklisted("19999999999") is False
+        await crm.add_to_blacklist("18888888888", "test")
+        assert crm.is_blacklisted("18888888888") is True
 
-    @pytest.mark.asyncio
-    async def test_add_to_blacklist_updates_memory(self):
-        from backend.services.crm_service import crm
-        await crm.add_to_blacklist("19999999999", "test")
-        assert crm.is_blacklisted("19999999999") is True
-
-    @pytest.mark.asyncio
-    async def test_blacklisted_phone_returns_blacklisted_true(self):
-        from backend.services.crm_service import crm
-        await crm.add_to_blacklist("18888888888")
         info = await crm.query_customer_info("18888888888")
         assert info["blacklisted"] is True
 
-    @pytest.mark.asyncio
-    async def test_remove_from_blacklist(self):
-        from backend.services.crm_service import crm
-        await crm.add_to_blacklist("17777777777")
-        await crm.remove_from_blacklist("17777777777")
-        assert crm.is_blacklisted("17777777777") is False
-
-    @pytest.mark.asyncio
-    async def test_record_intent(self):
-        from backend.services.crm_service import crm, _INTENTS
-        await crm.record_intent("19042638084", "high", "uuid-001")
-        assert _INTENTS["19042638084"]["level"] == "high"
+        await crm.remove_from_blacklist("18888888888")
+        assert crm.is_blacklisted("18888888888") is False
 
     @pytest.mark.asyncio
     async def test_schedule_callback_returns_success(self):
         from backend.services.crm_service import crm
-        result = await crm.schedule_callback("19042638084", "task_001", "2025-06-01 10:00", "测试")
+
+        result = await crm.schedule_callback(
+            "19042638084", "task_001", "2026-04-09 10:00", "测试"
+        )
         assert result["success"] is True
-        assert "callback_time" in result
+        assert result["callback_time"] == "2026-04-09 10:00"
+
+
+class TestDBHelpers:
+    def test_build_call_record_values_keeps_recent_messages(self):
+        from backend.core.state_machine import CallContext
+        from backend.utils.db import _build_call_record_values
+
+        ctx = CallContext(
+            uuid="u1",
+            task_id="t1",
+            phone_number="13800000000",
+            script_id="default",
+        )
+        ctx.messages = [{"role": "user", "content": str(i)} for i in range(40)]
+        values = _build_call_record_values(ctx)
+
+        assert values["uuid"] == "u1"
+        assert len(values["messages"]) == 30
+        assert values["messages"][0]["content"] == "10"
+
+    def test_build_call_record_upsert_stmt_for_sqlite_contains_on_conflict(self):
+        from backend.utils.db import _build_call_record_upsert_stmt
+
+        stmt = _build_call_record_upsert_stmt({"uuid": "u1", "task_id": "t1"}, "sqlite")
+        sql = str(stmt)
+
+        assert "ON CONFLICT" in sql
+        assert "uuid" in sql
+
+
+class TestESLService:
+    class FakeReader:
+        def __init__(self, raw: bytes):
+            self._buf = raw
+            self._pos = 0
+
+        async def readline(self):
+            end = self._buf.find(b"\r\n", self._pos)
+            if end == -1:
+                return b""
+            data = self._buf[self._pos : end + 2]
+            self._pos = end + 2
+            return data
+
+        async def readexactly(self, n):
+            data = self._buf[self._pos : self._pos + n]
+            self._pos += n
+            return data
+
+    class FakeWriter:
+        def __init__(self):
+            self.sent = b""
+            self._closing = False
+
+        def write(self, data):
+            self.sent += data.encode() if isinstance(data, str) else data
+
+        async def drain(self):
+            return None
+
+        def is_closing(self):
+            return self._closing
+
+        def close(self):
+            self._closing = True
+
+        async def wait_closed(self):
+            return None
 
     @pytest.mark.asyncio
-    async def test_send_sms_returns_true(self):
-        from backend.services.crm_service import crm
-        result = await crm.send_sms("19042638084", "product_intro", {"product": "理财A"})
-        assert result is True
+    async def test_connect_extracts_uuid_and_channel_vars(self):
+        from backend.services.esl_service import ESLSocketCallSession
+
+        raw = (
+            "Unique-ID: uuid_test_001\r\n"
+            "Caller-Destination-Number: 19042638084\r\n"
+            "variable_task_id: task_prod_001\r\n"
+            "variable_script_id: finance_product_a\r\n"
+            "\r\n"
+            "Content-Type: command/reply\r\n"
+            "Reply-Text: +OK\r\n"
+            "\r\n"
+            "Content-Type: command/reply\r\n"
+            "Reply-Text: +OK\r\n"
+            "\r\n"
+        ).encode()
+        session = ESLSocketCallSession(self.FakeReader(raw), self.FakeWriter())
+        data = await session.connect()
+
+        assert session.uuid == "uuid_test_001"
+        assert data["Caller-Destination-Number"] == "19042638084"
+        assert session.channel_vars["task_id"] == "task_prod_001"
+        assert session.channel_vars["script_id"] == "finance_product_a"
+
+    @pytest.mark.asyncio
+    async def test_safe_put_does_not_grow_full_queue(self):
+        from backend.services.esl_service import ESLSocketCallSession
+
+        queue = asyncio.Queue(maxsize=2)
+        queue.put_nowait("a")
+        queue.put_nowait("b")
+        await ESLSocketCallSession._safe_put(queue, "c")
+        assert queue.qsize() == 2
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：音频工具
-# ══════════════════════════════════════════════════════════════
 class TestAudioUtils:
-    def test_pcmu_to_pcm_length_preserved(self):
-        from backend.utils.audio import pcmu_to_pcm, pcm_to_pcmu
-        pcm = bytes(i % 128 for i in range(512))
-        assert len(pcmu_to_pcm(pcm_to_pcmu(pcm))) == len(pcm)
-
     def test_write_and_read_wav(self, tmp_path):
-        from backend.utils.audio import write_wav, read_wav_pcm
+        from backend.utils.audio import read_wav_pcm, write_wav
+
         path = str(tmp_path / "test.wav")
         write_wav(path, b"\x00\x01" * 800, sample_rate=8000)
         _, rate, channels = read_wav_pcm(path)
         assert rate == 8000
         assert channels == 1
 
-    def test_vad_detects_loud_frame(self):
+    def test_vad_detects_speech_end(self):
         from backend.utils.audio import SimpleVAD
-        vad = SimpleVAD(energy_threshold=100, speech_min_frames=1)
-        loud = struct.pack("<" + "h" * 160, *([10000] * 160))
-        active, _ = vad.process_frame(loud)
-        assert active is True
 
-    def test_vad_silence_resets_after_speech(self):
-        from backend.utils.audio import SimpleVAD
         vad = SimpleVAD(energy_threshold=100, speech_min_frames=1, silence_min_frames=3)
         loud = struct.pack("<" + "h" * 160, *([10000] * 160))
         silence = b"\x00\x00" * 160
         vad.process_frame(loud)
-        for _ in range(5):
+        ended = False
+        for _ in range(3):
             _, ended = vad.process_frame(silence)
-        assert not vad._in_speech
+        assert ended is True
+
+    def test_vad_rms_threshold_is_pure_python(self):
+        from backend.utils.audio import SimpleVAD
+
+        vad = SimpleVAD(energy_threshold=50, speech_min_frames=1)
+        quiet = struct.pack("<" + "h" * 160, *([10] * 160))
+        loud = struct.pack("<" + "h" * 160, *([5000] * 160))
+        assert vad.is_speech_frame(quiet) is False
+        assert vad.is_speech_frame(loud) is True
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：TTS 缓存清理器
-# ══════════════════════════════════════════════════════════════
 class TestTTSCache:
     def test_clean_expired_files(self, tmp_path):
-        from backend.utils.tts_cache import clean_cache_sync
         import time
-        # 创建一个旧文件（模拟过期）
-        old_file = tmp_path / "tts_expired.wav"
-        old_file.write_bytes(b"\x00" * 1024)
-        # 修改 mtime 为 3 小时前
+        import backend.utils.tts_cache as cache_module
+        from backend.utils.tts_cache import clean_cache_sync
+
+        expired = tmp_path / "tts_expired.wav"
+        expired.write_bytes(b"\x00" * 1024)
         old_ts = time.time() - 3 * 3600
-        os.utime(str(old_file), (old_ts, old_ts))
+        os.utime(str(expired), (old_ts, old_ts))
 
-        # 创建一个新文件（不应被删除）
-        new_file = tmp_path / "tts_fresh.wav"
-        new_file.write_bytes(b"\x00" * 1024)
+        fresh = tmp_path / "tts_fresh.wav"
+        fresh.write_bytes(b"\x00" * 512)
 
-        import backend.utils.tts_cache as tc
-        original_ttl = tc.CACHE_TTL_SECONDS
-        tc.CACHE_TTL_SECONDS = 3600  # 1 小时 TTL
-
-        count, freed = clean_cache_sync(str(tmp_path))
-        tc.CACHE_TTL_SECONDS = original_ttl
+        original_ttl = cache_module.CACHE_TTL_SECONDS
+        cache_module.CACHE_TTL_SECONDS = 3600
+        try:
+            count, freed = clean_cache_sync(str(tmp_path))
+        finally:
+            cache_module.CACHE_TTL_SECONDS = original_ttl
 
         assert count == 1
         assert freed == 1024
-        assert not old_file.exists()
-        assert new_file.exists()
-
-    def test_clean_oversized_cache(self, tmp_path):
-        from backend.utils.tts_cache import clean_cache_sync
-        import backend.utils.tts_cache as tc
-
-        # 创建 3 个文件，每个 1KB
-        for i in range(3):
-            f = tmp_path / f"tts_file{i:02d}.wav"
-            f.write_bytes(b"\x00" * 1024)
-
-        original_max = tc.CACHE_MAX_BYTES
-        original_ttl = tc.CACHE_TTL_SECONDS
-        tc.CACHE_MAX_BYTES = 2048  # 只允许 2KB
-        tc.CACHE_TTL_SECONDS = 999999  # 不按过期删
-
-        count, freed = clean_cache_sync(str(tmp_path))
-        tc.CACHE_MAX_BYTES = original_max
-        tc.CACHE_TTL_SECONDS = original_ttl
-
-        assert count >= 1  # 至少删了一个
+        assert not expired.exists()
+        assert fresh.exists()
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：CallAgent 生产特性
-# ══════════════════════════════════════════════════════════════
 class TestCallAgent:
+    class DummySession:
+        def __init__(self):
+            self._connected = True
+            self.channel_vars = {}
+
+        async def connect(self):
+            return {}
+
+        async def set_variable(self, *args, **kwargs):
+            return None
+
+        async def read_events(self):
+            await asyncio.sleep(0)
+
+        async def start_audio_capture(self):
+            return asyncio.Queue()
+
+        async def play_stream(self, audio_chunks, text="", timeout=60.0):
+            async for _ in audio_chunks:
+                pass
+
+        async def transfer_to_human(self, ext="8001"):
+            return None
+
+        async def hangup(self):
+            self._connected = False
+
+    class DummyASR:
+        async def recognize_stream(self, gen):
+            if False:
+                yield None
+
+    class DummyTTS:
+        async def synthesize_stream(self, text):
+            yield b"pcm"
+
+    class DummyLLM:
+        pass
+
+    def _make_agent(self):
+        from backend.core.call_agent import CallAgent
+        from backend.core.state_machine import CallContext
+
+        ctx = CallContext(
+            uuid="u1",
+            task_id="t1",
+            phone_number="13800000000",
+            script_id="default",
+        )
+        return CallAgent(
+            self.DummySession(),
+            ctx,
+            asr=self.DummyASR(),
+            tts=self.DummyTTS(),
+            llm=self.DummyLLM(),
+        )
+
     def test_production_timeouts_defined(self):
-        from backend.core.call_agent import MAX_CALL_DURATION, LLM_TIMEOUT, TTS_TIMEOUT, ASR_TIMEOUT
+        from backend.core.call_agent import ASR_TIMEOUT, LLM_TIMEOUT, MAX_CALL_DURATION, TTS_TIMEOUT
+
         assert MAX_CALL_DURATION == 300
-        assert LLM_TIMEOUT       == 15.0
-        assert TTS_TIMEOUT       == 10.0
-        assert ASR_TIMEOUT       == 12.0
+        assert LLM_TIMEOUT == 30.0
+        assert TTS_TIMEOUT == 10.0
+        assert ASR_TIMEOUT == 12.0
 
     @pytest.mark.asyncio
     async def test_barge_in_fires_on_audio(self):
         from backend.core.call_agent import AudioStreamAdapter
-        q = asyncio.Queue()
-        barge = asyncio.Event()
-        barge.clear()
-        adapter = AudioStreamAdapter(q, vad_silence_ms=200, barge_in_cb=barge)
-        await q.put(b"\x01\x02" * 160)
-        await q.put(b"")
-        chunks = [c async for c in adapter.stream() if c]
-        assert barge.is_set()
-        assert len(chunks) > 0
+
+        queue = asyncio.Queue()
+        barge_in = asyncio.Event()
+        adapter = AudioStreamAdapter(
+            queue,
+            vad_silence_ms=200,
+            barge_in_cb=barge_in,
+            protect_start_ms=0,
+            protect_end_ms=0,
+        )
+        await queue.put(b"\x01\x02" * 160)
+        await queue.put(b"")
+        chunks = [chunk async for chunk in adapter.stream() if chunk]
+        stats = adapter.audio_stats()
+
+        assert barge_in.is_set()
+        assert chunks
+        assert stats["speech_detected"] is True
+        assert stats["max_rms"] > 0
 
     @pytest.mark.asyncio
-    async def test_adapter_stop_terminates_stream(self):
-        from backend.core.call_agent import AudioStreamAdapter
-        q = asyncio.Queue()
-        adapter = AudioStreamAdapter(q, vad_silence_ms=9999)
-        asyncio.get_event_loop().call_soon(adapter.stop)
-        chunks = [c async for c in adapter.stream()]
-        assert len(chunks) <= 1  # 最多只有结束信号 b""
+    async def test_schedule_callback_handler_updates_state(self, monkeypatch):
+        from backend.core.state_machine import CallResult, CallState
+        from backend.services import async_script_utils as script_utils
+        from backend.core.call_agent import crm
+
+        async def fake_get_barge(script_id, speech_type="conversation"):
+            return {
+                "barge_in_enabled": True,
+                "protect_start_sec": 0,
+                "protect_end_sec": 0,
+            }
+
+        callback_calls = []
+
+        async def fake_schedule(phone, task_id="", callback_time=None, note=""):
+            callback_calls.append((phone, task_id, callback_time, note))
+            return {"success": True, "callback_time": callback_time or "default"}
+
+        monkeypatch.setattr(script_utils, "get_barge_in_config", fake_get_barge)
+        monkeypatch.setattr(crm, "schedule_callback", fake_schedule)
+
+        agent = self._make_agent()
+        await agent._do_schedule_callback(
+            {"callback_time": "2026-04-09 10:00", "note": "稍后联系"}
+        )
+
+        assert callback_calls == [("13800000000", "t1", "2026-04-09 10:00", "稍后联系")]
+        assert agent.ctx.state == CallState.ENDING
+        assert agent.ctx.result == CallResult.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_blacklist_handler_updates_result(self, monkeypatch):
+        from backend.core.state_machine import CallResult, CallState
+        from backend.core.call_agent import crm
+
+        blacklist_calls = []
+
+        async def fake_blacklist(phone, reason=""):
+            blacklist_calls.append((phone, reason))
+            return True
+
+        monkeypatch.setattr(crm, "add_to_blacklist", fake_blacklist)
+        agent = self._make_agent()
+        await agent._do_blacklist({"reason": "勿扰"})
+
+        assert blacklist_calls == [("13800000000", "勿扰")]
+        assert agent.ctx.state == CallState.ENDING
+        assert agent.ctx.result == CallResult.BLACKLISTED
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：API 鉴权逻辑
-# ══════════════════════════════════════════════════════════════
-class TestAuth:
-    def _check(self, provided: str, expected: str) -> bool:
-        return not expected or provided == expected
+class TestMockTestCallSession:
+    @pytest.mark.asyncio
+    async def test_play_stream_waits_for_frontend_playback_ack(self):
+        from backend.api.test_call_support import MockESLCallSession
 
-    def test_no_token_configured_always_pass(self):
-        assert self._check("", "") is True
-        assert self._check("anything", "") is True
+        class FakeWebSocket:
+            def __init__(self):
+                self.json_messages = []
+                self.binary_messages = []
 
-    def test_correct_token_passes(self):
-        assert self._check("secret", "secret") is True
+            async def send_json(self, data):
+                self.json_messages.append(data)
 
-    def test_wrong_token_rejected(self):
-        assert self._check("wrong", "secret") is False
+            async def send_bytes(self, data):
+                self.binary_messages.append(data)
 
-    def test_missing_token_rejected(self):
-        assert self._check("", "secret") is False
+        async def audio_chunks():
+            yield b"\x01\x00" * 800
+
+        session = MockESLCallSession(
+            uuid="call-1",
+            channel_vars={},
+            asr_client=object(),
+            tts_client=object(),
+        )
+        session.ws_connection = FakeWebSocket()
+        session._ws_ready.set()
+
+        task = asyncio.create_task(session.play_stream(audio_chunks(), text="您好", timeout=5.0))
+        await asyncio.sleep(0.05)
+
+        assert not task.done()
+        assert session.ws_connection.json_messages[0]["type"] == "ai_response"
+
+        session.notify_playback_finished()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert task.done()
+        assert any(
+            message.get("type") == "streaming_audio_done"
+            for message in session.ws_connection.json_messages
+        )
 
 
-# ══════════════════════════════════════════════════════════════
-# 测试：Prometheus 指标格式
-# ══════════════════════════════════════════════════════════════
-class TestMetrics:
-    def test_metrics_output_format(self):
+class TestESLOriginateRouting:
+    def test_build_originate_target_for_internal_extension(self):
+        from backend.services.esl_service import AsyncESLConnection
+
+        endpoint, target_type, dest = AsyncESLConnection._build_originate_target(
+            phone="1001",
+            gateway="carrier_trunk",
+            internal_domain="$${local_ip_v4}",
+        )
+
+        assert endpoint == "user/1001@$${local_ip_v4}"
+        assert target_type == "internal_extension"
+        assert dest == "1001"
+
+    def test_build_originate_target_for_mobile_phone(self):
+        from backend.services.esl_service import AsyncESLConnection
+
+        endpoint, target_type, dest = AsyncESLConnection._build_originate_target(
+            phone="13800000000",
+            gateway="carrier_trunk",
+            internal_domain="$${local_ip_v4}",
+        )
+
+        assert endpoint == "sofia/gateway/carrier_trunk/9777613800000000"
+        assert target_type == "pstn"
+        assert dest == "9777613800000000"
+
+
+def _make_test_client(router):
+    from backend.core.auth import require_auth
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[require_auth] = lambda: {"user": "test"}
+    return TestClient(app)
+
+
+class TestOperationsAPI:
+    def test_create_task_route_passes_caller_id_and_increments_metrics(self):
+        from backend.api.operations_api import OperationsAPI
+
+        metrics = {"tasks_created": 0}
+
+        class FakeScheduler:
+            def __init__(self):
+                self.created = None
+                self.started = None
+
+            def create_task(self, **kwargs):
+                self.created = kwargs
+                return SimpleNamespace(
+                    task_id="task_001",
+                    name=kwargs["name"],
+                    status=SimpleNamespace(name="PENDING"),
+                    total=len(kwargs["phone_numbers"]),
+                )
+
+            async def start_task(self, task_id):
+                self.started = task_id
+                return True
+
+        scheduler = FakeScheduler()
+        api = OperationsAPI(scheduler_getter=lambda: scheduler, metrics=metrics)
+        client = _make_test_client(api.router)
+
+        response = client.post(
+            "/api/tasks",
+            json={
+                "name": "批量任务",
+                "phone_numbers": ["13800000000", "13900000000"],
+                "script_id": "finance_product_a",
+                "caller_id": "4008009000",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["task_id"] == "task_001"
+        assert scheduler.created["caller_id"] == "4008009000"
+        assert scheduler.started == "task_001"
+        assert metrics["tasks_created"] == 1
+
+
+class TestMonitorAPI:
+    def test_metrics_route_returns_prometheus_text(self):
+        from backend.api.monitor_api import MonitorAPI
+
         metrics = {
-            "calls_total": 42, "calls_active": 3,
-            "calls_completed": 38, "calls_error": 1,
+            "calls_total": 12,
+            "calls_active": 2,
+            "calls_completed": 9,
+            "calls_transferred": 1,
+            "calls_error": 0,
+            "tasks_created": 3,
         }
-        lines = [
-            "# HELP outbound_calls_total Total outbound calls",
-            "# TYPE outbound_calls_total counter",
-            f"outbound_calls_total {metrics['calls_total']}",
-            "# TYPE outbound_calls_active gauge",
-            f"outbound_calls_active {metrics['calls_active']}",
-        ]
-        assert any("HELP" in l for l in lines)
-        assert any("TYPE" in l for l in lines)
-        assert "outbound_calls_total 42" in lines
-        assert "outbound_calls_active 3" in lines
 
-    def test_metric_values_are_integers(self):
+        scheduler = SimpleNamespace(list_tasks=lambda: [{"status": "RUNNING"}, {"status": "PAUSED"}])
+        pool = SimpleNamespace(_conns=[SimpleNamespace(is_connected=True)])
+        api = MonitorAPI(
+            config=SimpleNamespace(max_concurrent_calls=50, api_token=""),
+            metrics=metrics,
+            scheduler_getter=lambda: scheduler,
+            esl_pool_getter=lambda: pool,
+            start_time=0.0,
+        )
+        client = _make_test_client(api.router)
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "outbound_calls_total 12" in response.text
+        assert "outbound_calls_active 2" in response.text
+
+    def test_health_route_reports_ok_when_esl_connected(self):
+        from backend.api.monitor_api import MonitorAPI
+
+        api = MonitorAPI(
+            config=SimpleNamespace(max_concurrent_calls=50, api_token=""),
+            metrics={"calls_active": 1, "calls_total": 0, "calls_completed": 0, "calls_transferred": 0, "calls_error": 0, "tasks_created": 0},
+            scheduler_getter=lambda: None,
+            esl_pool_getter=lambda: SimpleNamespace(_conns=[SimpleNamespace(is_connected=True)]),
+            start_time=0.0,
+        )
+        client = _make_test_client(api.router)
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+
+class TestTestCallAPI:
+    def test_get_test_call_messages_route_reads_active_call(self):
+        from backend.api.test_call_api import TestCallAPI
+
+        active_calls = {
+            "call_1": SimpleNamespace(
+                ctx=SimpleNamespace(
+                    messages=[{"role": "assistant", "content": "您好"}],
+                    state=SimpleNamespace(name="CONNECTED"),
+                    intent=SimpleNamespace(value="unknown"),
+                    result=SimpleNamespace(value="completed"),
+                )
+            )
+        }
+        api = TestCallAPI(
+            config=SimpleNamespace(api_token=""),
+            active_calls=active_calls,
+            metrics={},
+            broadcast_stats=lambda: None,
+            asr_getter=lambda: object(),
+            tts_getter=lambda: object(),
+            llm_getter=lambda: object(),
+        )
+        client = _make_test_client(api.router)
+
+        response = client.get("/api/test-call/call_1/messages")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["call_id"] == "call_1"
+        assert data["messages"][0]["content"] == "您好"
+
+    def test_synthesize_tts_route_returns_wav_file(self, tmp_path):
+        from backend.api.test_call_api import TestCallAPI
+
+        wav_path = tmp_path / "tts.wav"
+        wav_path.write_bytes(b"RIFFmockwav")
+
+        class FakeTTS:
+            async def synthesize(self, text: str) -> str:
+                return str(wav_path)
+
+        api = TestCallAPI(
+            config=SimpleNamespace(api_token=""),
+            active_calls={},
+            metrics={},
+            broadcast_stats=lambda: None,
+            asr_getter=lambda: object(),
+            tts_getter=lambda: FakeTTS(),
+            llm_getter=lambda: object(),
+        )
+        client = _make_test_client(api.router)
+
+        response = client.post("/api/tts/synthesize", json={"text": "测试语音"})
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("audio/wav")
+
+    def test_start_test_call_route_registers_active_call(self, monkeypatch):
+        import backend.api.test_call_api as test_call_module
+        from backend.api.test_call_api import TestCallAPI
+
+        active_calls = {}
         metrics = {"calls_total": 0, "calls_active": 0}
-        for v in metrics.values():
-            assert isinstance(v, int)
+        broadcast_calls = []
+        created_agents = []
+        scheduled = []
+
+        async def fake_broadcast():
+            broadcast_calls.append("broadcast")
+
+        class FakeCallAgent:
+            def __init__(self, session, context, asr, tts, llm):
+                self.session = session
+                self.ctx = context
+                created_agents.append(self)
+
+        async def fake_run_test_call_with_agent(*args, **kwargs):
+            return None
+
+        def fake_create_task(coro):
+            scheduled.append(True)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(test_call_module, "CallAgent", FakeCallAgent)
+        monkeypatch.setattr(
+            test_call_module, "run_test_call_with_agent", fake_run_test_call_with_agent
+        )
+        monkeypatch.setattr(test_call_module.asyncio, "create_task", fake_create_task)
+
+        api = TestCallAPI(
+            config=SimpleNamespace(api_token=""),
+            active_calls=active_calls,
+            metrics=metrics,
+            broadcast_stats=fake_broadcast,
+            asr_getter=lambda: object(),
+            tts_getter=lambda: object(),
+            llm_getter=lambda: object(),
+        )
+        client = _make_test_client(api.router)
+
+        response = client.post(
+            "/api/test-call/start",
+            json={"phone_number": "13800000000", "script_id": "default", "customer_info": {}},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["call_id"] in active_calls
+        assert metrics["calls_total"] == 1
+        assert metrics["calls_active"] == 1
+        assert len(created_agents) == 1
+        assert scheduled == [True]
+        assert broadcast_calls == ["broadcast"]

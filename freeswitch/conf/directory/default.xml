@@ -20,7 +20,7 @@
 <include>
   <!--the
   domain or ip (the right hand side of the @ in the addr-->
-  <domain name="$${local_ip_v4}">
+  <domain name="$${sip_domain}">
     <params>
       <param name="dial-string"
         value="{^^:sip_invite_domain=${dialed_domain}:presence_id=${dialed_user}@${dialed_domain}}${sofia_contact(*/${dialed_user}@${dialed_domain})},${verto_contact(${dialed_user}@${dialed_domain})}" />
@@ -54,7 +54,7 @@
           <!-- 坐席 1 -->
           <user id="1001">
             <params>
-              <param name="password" value="agent_pass_1001" />
+              <param name="password" value="1001" />
               <param name="vm-password" value="1001" />
             </params>
             <variables>
@@ -71,7 +71,7 @@
           <!-- 坐席 2 -->
           <user id="1002">
             <params>
-              <param name="password" value="agent_pass_1002" />
+              <param name="password" value="1002" />
               <param name="vm-password" value="1002" />
             </params>
             <variables>
@@ -87,7 +87,7 @@
           <!-- 管理员/督导 -->
           <user id="9000">
             <params>
-              <param name="password" value="admin_password_9000" />
+              <param name="password" value="9000" />
             </params>
             <variables>
               <variable name="user_context" value="internal" />

@@ -1,19 +1,12 @@
 """
 音频处理工具
 主要功能：
-  - PCM / WAV / MP3 格式互转（通过 ffmpeg）
+  - PCM / WAV 文件读写
   - 简单 VAD（静音能量检测）
-  - 音频片段拼接
 """
-import asyncio
-import audioop
-import logging
-import os
+import math
 import struct
 import wave
-from typing import AsyncGenerator
-
-logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -41,41 +34,17 @@ def read_wav_pcm(path: str) -> tuple[bytes, int, int]:
     return pcm, sample_rate, channels
 
 
-async def convert_to_wav_8k(input_path: str, output_path: str) -> bool:
-    """
-    使用 ffmpeg 将任意音频转为 FreeSWITCH 兼容格式
-    输出：8000Hz, 16bit, 单声道 WAV
-    """
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-ar", "8000",
-        "-ac", "1",
-        "-acodec", "pcm_s16le",
-        output_path,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        logger.error(f"ffmpeg 转换失败: {stderr.decode()}")
-        return False
-    return True
-
-
-async def pcm_to_wav_file(
-    pcm_gen: AsyncGenerator[bytes, None],
-    output_path: str,
-    sample_rate: int = 8000,
-) -> str:
-    """收集流式 PCM，写为 WAV 文件"""
-    chunks = []
-    async for chunk in pcm_gen:
-        if chunk:
-            chunks.append(chunk)
-    pcm_data = b"".join(chunks)
-    write_wav(output_path, pcm_data, sample_rate=sample_rate)
-    return output_path
+def _pcm16_rms(frame: bytes) -> int:
+    """计算 16bit little-endian PCM 的 RMS 能量。"""
+    if len(frame) < 2:
+        return 0
+    sample_count = len(frame) // 2
+    energy_sum = 0
+    for (sample,) in struct.iter_unpack("<h", frame[: sample_count * 2]):
+        energy_sum += sample * sample
+    if sample_count == 0:
+        return 0
+    return math.isqrt(energy_sum // sample_count)
 
 
 # ============================================================
@@ -110,10 +79,12 @@ class SimpleVAD:
 
     def is_speech_frame(self, frame: bytes) -> bool:
         """判断单帧是否有语音"""
-        if len(frame) < 2:
-            return False
-        rms = audioop.rms(frame, 2)  # 计算 RMS 能量
+        rms = self.frame_rms(frame)
         return rms > self.energy_threshold
+
+    def frame_rms(self, frame: bytes) -> int:
+        """返回单帧 RMS，便于上层记录音量/是否有人声。"""
+        return _pcm16_rms(frame)
 
     def process_frame(self, frame: bytes) -> tuple[bool, bool]:
         """
@@ -143,64 +114,3 @@ class SimpleVAD:
         self._speech_frames = 0
         self._silence_frames = 0
         self._in_speech = False
-
-
-async def vad_segment_audio(
-    audio_gen: AsyncGenerator[bytes, None],
-    vad: SimpleVAD,
-) -> AsyncGenerator[bytes, None]:
-    """
-    用 VAD 切割音频流，只输出有声音的片段
-    适合在发送给 ASR 前过滤静音，降低 ASR 费用
-    """
-    buffer = b""
-    speech_buffer = b""
-
-    async for chunk in audio_gen:
-        buffer += chunk
-        frame_size = vad.frame_size
-
-        while len(buffer) >= frame_size:
-            frame = buffer[:frame_size]
-            buffer = buffer[frame_size:]
-
-            is_active, speech_ended = vad.process_frame(frame)
-
-            if is_active:
-                speech_buffer += frame
-            elif speech_ended and speech_buffer:
-                # 语音段结束，输出并清空缓冲
-                yield speech_buffer
-                speech_buffer = b""
-
-    # 流结束时输出剩余
-    if speech_buffer:
-        yield speech_buffer
-
-
-# ============================================================
-# PCMU (G.711 μ-law) ↔ PCM 转换
-# FreeSWITCH 默认编解码器是 PCMU，ASR 需要 PCM（线性 PCM）
-# ============================================================
-
-def pcmu_to_pcm(pcmu_data: bytes) -> bytes:
-    """PCMU（G.711 μ-law） → 16bit 线性 PCM"""
-    return audioop.ulaw2lin(pcmu_data, 2)
-
-
-def pcm_to_pcmu(pcm_data: bytes) -> bytes:
-    """16bit 线性 PCM → PCMU（G.711 μ-law）"""
-    return audioop.lin2ulaw(pcm_data, 2)
-
-
-def pcma_to_pcm(pcma_data: bytes) -> bytes:
-    """PCMA（G.711 A-law） → 16bit 线性 PCM"""
-    return audioop.alaw2lin(pcma_data, 2)
-
-
-def resample_pcm(pcm_data: bytes, from_rate: int, to_rate: int) -> bytes:
-    """重采样 PCM（如 8000Hz → 16000Hz）"""
-    if from_rate == to_rate:
-        return pcm_data
-    resampled, _ = audioop.ratecv(pcm_data, 2, 1, from_rate, to_rate, None)
-    return resampled

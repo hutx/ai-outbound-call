@@ -8,11 +8,16 @@ Outbound ESL : FS 接通后主动连后端:9999，每路通话独立 session
 import asyncio
 import base64
 import logging
+import os
+import re
+import tempfile
 import time
 import uuid
 from typing import Callable, Awaitable, Optional
 
 logger = logging.getLogger(__name__)
+
+INTERNAL_EXTENSION_RE = re.compile(r"^\d{3,6}$")
 
 
 class ESLError(Exception):
@@ -90,29 +95,48 @@ class AsyncESLConnection:
         originate_timeout: int = 30,
         socket_host: str = "127.0.0.1",
         socket_port: int = 9999,
+        internal_domain: str = "$${local_ip_v4}",
     ) -> str:
         """
         发起外呼。所有业务参数作为 channel 变量传入，
         CallAgent 通过 ESL channel_vars 读取。
         """
-        # 运营商要求加前缀 97776（在拨号前拼接）
-        dest = f"97776{phone}"
+        endpoint, target_type, dest = self._build_originate_target(
+            phone=phone,
+            gateway=gateway,
+            internal_domain=internal_domain,
+        )
         cmd = (
             f"originate {{"
             f"origination_uuid={call_uuid},"
             f"task_id={task_id},"
             f"script_id={script_id},"
+            f"call_target_type={target_type},"
+            f"original_destination={phone},"
             f"ai_agent=true,"
             f"origination_caller_id_number={caller_id},"
             f"originate_timeout={originate_timeout},"
             f"ignore_early_media=true,"
             f"hangup_after_bridge=false"
             f"}}"
-            f"sofia/gateway/{gateway}/{dest} "
+            f"{endpoint} "
             f"&socket({socket_host}:{socket_port} async full)"
         )
-        logger.info(f"ESL originate → {phone} (uuid={call_uuid[:8]}, task={task_id}, dest={dest})")
+        logger.info(
+            f"ESL originate → {phone} "
+            f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
+        )
         return await self.bgapi(cmd, job_uuid=call_uuid)
+
+    @staticmethod
+    def _build_originate_target(phone: str, gateway: str, internal_domain: str) -> tuple[str, str, str]:
+        normalized = (phone or "").strip()
+        if INTERNAL_EXTENSION_RE.fullmatch(normalized):
+            domain = (internal_domain or "$${local_ip_v4}").strip()
+            return f"user/{normalized}@{domain}", "internal_extension", normalized
+
+        dest = f"97776{normalized}"
+        return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
 
     async def close(self):
         self._connected = False
@@ -336,6 +360,36 @@ class ESLSocketCallSession:
         except asyncio.TimeoutError:
             logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
             await self.stop_playback()
+
+    async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
+        """
+        兼容流式 TTS：先收集 PCM，再写临时 WAV 文件播放。
+        这不是严格的实时流式，但能保证真实 FreeSWITCH 路径可运行。
+        """
+        pcm_parts = []
+        async for chunk in audio_chunks:
+            if chunk:
+                pcm_parts.append(chunk)
+
+        if not pcm_parts:
+            logger.warning(f"[{self._uuid}] TTS 流式播放收到空音频")
+            return
+
+        from backend.utils.audio import write_wav
+
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f"tts_{self._uuid or 'call'}_",
+            suffix=".wav",
+        )
+        os.close(fd)
+        try:
+            write_wav(temp_path, b"".join(pcm_parts), sample_rate=8000)
+            await self.play(temp_path, timeout=timeout)
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     async def stop_playback(self):
         """打断当前播放（barge-in）"""

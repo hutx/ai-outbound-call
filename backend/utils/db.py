@@ -13,7 +13,9 @@ from datetime import datetime
 from typing import Optional, List
 import urllib.parse
 
-from sqlalchemy import String, Integer, DateTime, JSON, text, select, update
+from sqlalchemy import String, Integer, DateTime, JSON, text, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -171,56 +173,72 @@ async def save_call_record(ctx) -> None:
     """
     from backend.utils.session_manager import session_manager
 
+    values = _build_call_record_values(ctx)
+
     try:
         async with session_manager.get_session() as session:
-            # 检查是否已存在
-            existing = (await session.execute(
-                select(CallRecord).where(CallRecord.uuid == ctx.uuid)
-            )).scalar_one_or_none()
-
-            if existing:
-                # 更新（通话结束时补充完整信息）
-                existing.state            = ctx.state.name
-                existing.intent           = ctx.intent.value
-                existing.result           = ctx.result.value
-                existing.ended_at         = ctx.ended_at
-                existing.duration_seconds = ctx.duration_seconds
-                existing.user_utterances  = ctx.user_utterances
-                existing.ai_utterances    = ctx.ai_utterances
-                existing.recording_path   = ctx.recording_path
-                existing.messages         = ctx.messages[-30:] if ctx.messages else []
-                existing.sip_code         = ctx.sip_code
-                existing.hangup_cause     = ctx.hangup_cause
-                existing.dial_attempts    = ctx.dial_attempts
+            stmt = _build_call_record_upsert_stmt(values, session.get_bind().dialect.name)
+            if stmt is not None:
+                await session.execute(stmt)
             else:
-                record = CallRecord(
-                    uuid             = ctx.uuid,
-                    task_id          = ctx.task_id,
-                    phone_number     = ctx.phone_number,
-                    script_id        = ctx.script_id,
-                    state            = ctx.state.name,
-                    intent           = ctx.intent.value,
-                    result           = ctx.result.value,
-                    created_at       = ctx.created_at,
-                    answered_at      = ctx.answered_at,
-                    ended_at         = ctx.ended_at,
-                    duration_seconds = ctx.duration_seconds,
-                    user_utterances  = ctx.user_utterances,
-                    ai_utterances    = ctx.ai_utterances,
-                    recording_path   = ctx.recording_path,
-                    messages         = ctx.messages[-30:] if ctx.messages else [],
-                    customer_info    = ctx.customer_info or {},
-                    sip_code         = ctx.sip_code,
-                    hangup_cause     = ctx.hangup_cause,
-                    dial_attempts    = ctx.dial_attempts,
-                )
-                session.add(record)
+                existing = (
+                    await session.execute(
+                        select(CallRecord).where(CallRecord.uuid == ctx.uuid)
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    for key, value in values.items():
+                        setattr(existing, key, value)
+                else:
+                    session.add(CallRecord(**values))
 
             await session.commit()
             logger.debug(f"CDR 已写入: {ctx.uuid} result={ctx.result.value}")
     except Exception as e:
         logger.error(f"保存通话记录失败: {e}")
         # 仅记录错误，不要影响通话流程
+
+
+def _build_call_record_values(ctx) -> dict:
+    return {
+        "uuid": ctx.uuid,
+        "task_id": ctx.task_id,
+        "phone_number": ctx.phone_number,
+        "script_id": ctx.script_id,
+        "state": ctx.state.name,
+        "intent": ctx.intent.value,
+        "result": ctx.result.value,
+        "created_at": ctx.created_at,
+        "answered_at": ctx.answered_at,
+        "ended_at": ctx.ended_at,
+        "duration_seconds": ctx.duration_seconds,
+        "user_utterances": ctx.user_utterances,
+        "ai_utterances": ctx.ai_utterances,
+        "recording_path": ctx.recording_path,
+        "messages": ctx.messages[-30:] if ctx.messages else [],
+        "customer_info": ctx.customer_info or {},
+        "sip_code": ctx.sip_code,
+        "hangup_cause": ctx.hangup_cause,
+        "dial_attempts": ctx.dial_attempts,
+    }
+
+
+def _build_call_record_upsert_stmt(values: dict, dialect_name: str):
+    update_values = {k: v for k, v in values.items() if k != "uuid"}
+
+    if dialect_name == "sqlite":
+        return sqlite_insert(CallRecord).values(**values).on_conflict_do_update(
+            index_elements=[CallRecord.uuid],
+            set_=update_values,
+        )
+
+    if dialect_name == "postgresql":
+        return pg_insert(CallRecord).values(**values).on_conflict_do_update(
+            index_elements=[CallRecord.uuid],
+            set_=update_values,
+        )
+
+    return None
 
 
 # ── 通话记录查询 ─────────────────────────────────────────────
@@ -270,7 +288,7 @@ async def get_call_stats(task_id: Optional[str] = None) -> dict:
 
     try:
         async with session_manager.get_session() as session:
-            where = f"WHERE task_id = '{task_id}'" if task_id else ""
+            where = "WHERE task_id = :task_id" if task_id else ""
             sql = text(f"""
                 SELECT
                     COUNT(*) AS total,
@@ -280,7 +298,8 @@ async def get_call_stats(task_id: Optional[str] = None) -> dict:
                     AVG(CASE WHEN duration_seconds > 0 THEN duration_seconds END) AS avg_duration
                 FROM call_records {where}
             """)
-            row = (await session.execute(sql)).fetchone()
+            params = {"task_id": task_id} if task_id else {}
+            row = (await session.execute(sql, params)).fetchone()
             if not row or row[0] == 0:
                 return {"total": 0, "connected": 0, "intent": 0, "transferred": 0, "avg_duration": 0,
                         "connect_rate": 0.0, "intent_rate": 0.0}

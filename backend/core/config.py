@@ -37,6 +37,8 @@ class FreeSwitchConfig:
     socket_port: int = 9999
     # SIP Gateway 名称（sofia.conf.xml 中配置的 gateway name）
     gateway: str = "carrier_trunk"
+    # 内部分机呼叫时使用的目录域
+    internal_domain: str = "$${local_ip_v4}"
     # 外呼超时秒数（30s 无人接听则放弃）
     originate_timeout: int = 30
     # 录音存储路径
@@ -48,6 +50,7 @@ class FreeSwitchConfig:
         self.password = _env("FS_ESL_PASSWORD", self.password)
         self.socket_port = _env_int("FS_SOCKET_PORT", self.socket_port)
         self.gateway = _env("FS_GATEWAY", self.gateway)
+        self.internal_domain = _env("FS_INTERNAL_DOMAIN", self.internal_domain)
         self.originate_timeout = _env_int("FS_ORIGINATE_TIMEOUT", self.originate_timeout)
         self.recording_path = _env("FS_RECORDING_PATH", self.recording_path)
 
@@ -168,6 +171,8 @@ class TTSConfig:
 @dataclass
 class LLMConfig:
     """LLM 对话引擎配置"""
+    # 支持: auto | anthropic | dashscope_compatible | anthropic_compatible
+    provider: str = "auto"
     anthropic_api_key: str = ""
     anthropic_base_url: str = ""
     model: str = "qwen3.5-plus"
@@ -179,6 +184,7 @@ class LLMConfig:
     stream: bool = True
 
     def __post_init__(self):
+        self.provider = _env("LLM_PROVIDER", self.provider)
         self.anthropic_api_key = _env("ANTHROPIC_API_KEY", self.anthropic_api_key)
         self.anthropic_base_url = _env("ANTHROPIC_BASE_URL", self.anthropic_base_url)
         self.model = _env("LLM_MODEL", self.model)
@@ -226,6 +232,11 @@ class AppConfig:
         self.llm = LLMConfig()
         self.db = DatabaseConfig()
         self.redis = RedisConfig()
+
+    def validate_runtime(self):
+        """启动时校验关键运行配置。"""
+        if not self.debug and not self.api_token.strip():
+            raise ValueError("生产模式必须配置 API_TOKEN（当前 DEBUG=false）。")
 
 
 # 全局单例

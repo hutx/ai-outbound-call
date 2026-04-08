@@ -15,7 +15,12 @@ _bearer = HTTPBearer(auto_error=False)
 def require_auth(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)):
     """API 鉴权（Bearer Token）"""
     token = config.api_token.strip()
-    if not token:  # 未设置 token 则开放访问（仅限开发）
+    if not token:
+        if not config.debug:
+            raise HTTPException(
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="服务端未配置 API Token",
+            )
         return {"user": "anonymous"}
 
     if not creds or creds.credentials != token:

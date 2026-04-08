@@ -24,10 +24,10 @@
     <extension name="auto_prefix_outbound">
       <condition field="destination_number" expression="^(\d{11})$">
 
-        <action application="set" data="effective_caller_id_number=202603311547"/>
+        <action application="set" data="effective_caller_id_number=$${outbound_caller_id}"/>
 
         <!-- Route through carrier trunk with provider-required prefix 97776 -->
-        <action application="bridge" data="sofia/gateway/carrier_trunk/97776$1"/>
+        <action application="bridge" data="sofia/gateway/carrier_trunk/$${provider_prefix}$1"/>
 
       </condition>
     </extension>
@@ -140,7 +140,7 @@
         <action application="set"    data="effective_caller_id_number=$${outbound_caller_id}"/>
         <action application="set"    data="effective_caller_id_name=$${outbound_caller_name}"/>
         <!-- Add the required prefix for SIP provider (97776) -->
-        <action application="bridge" data="sofia/gateway/$${carrier_gateway}/97776$1"/>
+        <action application="bridge" data="sofia/gateway/$${carrier_gateway}/$${provider_prefix}$1"/>
       </condition>
     </extension>
 

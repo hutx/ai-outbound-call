@@ -30,7 +30,7 @@
         <action application="set" data="ai_agent=true"/>
         <action application="set" data="task_id=test_ai_call"/>
         <action application="set" data="script_id=default"/>
-        <action application="socket" data="backend:9999 async full"/>
+        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
       </condition>
     </extension>
 
@@ -48,7 +48,7 @@
         <action application="set" data="ai_agent=true"/>
         <action application="set" data="task_id=inbound_ai_test"/>
         <action application="set" data="script_id=default"/>
-        <action application="socket" data="backend:9999 async full"/>
+        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
       </condition>
     </extension>
 

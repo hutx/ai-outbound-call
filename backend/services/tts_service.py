@@ -12,12 +12,22 @@ from pathlib import Path
 from typing import Optional, AsyncGenerator
 import aiohttp
 import aiofiles
-import dashscope
-from dashscope.audio.tts_v2 import SpeechSynthesizer, AudioFormat
 
 from backend.core.config import config, TTSConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _load_dashscope_tts():
+    """按需加载百炼 TTS 依赖，避免非百炼模式导入失败。"""
+    try:
+        import dashscope
+        from dashscope.audio.tts_v2 import AudioFormat, ResultCallback, SpeechSynthesizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "百炼 TTS 依赖未安装，请安装 `dashscope` 或切换 TTS_PROVIDER。"
+        ) from exc
+    return dashscope, SpeechSynthesizer, AudioFormat, ResultCallback
 
 
 class BaseTTS(ABC):
@@ -342,10 +352,14 @@ class BailianCosyVoiceClient(BaseTTS):
     文档：https://help.aliyun.com/zh/model-studio/cosyvoice-python-sdk
     """
 
-    # FreeSWITCH 需要 WAV 8000Hz 16bit mono
-    AUDIO_FORMAT = AudioFormat.WAV_8000HZ_MONO_16BIT
-
     def __init__(self, cfg: TTSConfig):
+        (
+            self._dashscope,
+            self._SpeechSynthesizer,
+            audio_format_cls,
+            self._ResultCallback,
+        ) = _load_dashscope_tts()
+        self._audio_format = audio_format_cls.WAV_8000HZ_MONO_16BIT
         self.model_name = cfg.bailian_tts_model or "cosyvoice-v3-flash"
         self.voice = cfg.voice or "longyingxiao_v3"
         # speech_rate: [0.5, 2.0], 默认 1.0
@@ -358,15 +372,15 @@ class BailianCosyVoiceClient(BaseTTS):
         logger.info(f"百炼 TTS: API Key → {api_key[:10]}****" if api_key else "百炼 TTS: API Key 为空")
         if not api_key:
             logger.error("百炼 TTS: BAILIAN_ACCESS_TOKEN 未配置")
-        dashscope.api_key = api_key
+        self._dashscope.api_key = api_key
 
     async def synthesize(self, text: str) -> str:
-        logger.info(f"百炼 TTS: API Key → {dashscope.api_key}")
+        logger.info(f"百炼 TTS: API Key → {self._dashscope.api_key}")
         cache_path = self._get_cache_path(f"bailian_{text}")
         if os.path.exists(cache_path):
             return cache_path
 
-        if not dashscope.api_key:
+        if not self._dashscope.api_key:
             logger.error("百炼 TTS: API Key 为空，降级 Edge TTS")
             return await EdgeTTSClient().synthesize(text)
 
@@ -391,10 +405,10 @@ class BailianCosyVoiceClient(BaseTTS):
 
     def _sync_call(self, text: str) -> bytes:
         """在线程池中同步调用 dashscope TTS SDK"""
-        synth = SpeechSynthesizer(
+        synth = self._SpeechSynthesizer(
             model=self.model_name,
             voice=self.voice,
-            format=self.AUDIO_FORMAT,
+            format=self._audio_format,
             volume=50,
             speech_rate=self.speech_rate,
             pitch_rate=1.0,
@@ -407,17 +421,16 @@ class BailianCosyVoiceClient(BaseTTS):
         注意：百炼 TTS 输出 WAV 格式（含 44 字节头），需要剥离头部
         只发送裸 PCM 数据给前端
         """
-        if not dashscope.api_key:
+        if not self._dashscope.api_key:
             logger.error("百炼 TTS: API Key 为空")
             return
 
         import queue as _queue
-        from dashscope.audio.tts_v2 import ResultCallback
 
         q = _queue.Queue(maxsize=200)
         error_ref = {"value": None}
 
-        class _StreamCallback(ResultCallback):
+        class _StreamCallback(self._ResultCallback):
             def on_open(self):
                 pass
 
@@ -448,10 +461,10 @@ class BailianCosyVoiceClient(BaseTTS):
                 pass
 
         callback = _StreamCallback()
-        synth = SpeechSynthesizer(
+        synth = self._SpeechSynthesizer(
             model=self.model_name,
             voice=self.voice,
-            format=self.AUDIO_FORMAT,
+            format=self._audio_format,
             volume=50,
             speech_rate=self.speech_rate,
             pitch_rate=1.0,
@@ -524,7 +537,3 @@ def create_tts_client(cfg: Optional[TTSConfig] = None) -> BaseTTS:
     else:
         logger.warning(f"未知 TTS 提供商 {cfg.provider}，使用 Edge TTS")
         return EdgeTTSClient()
-
-
-# 全局单例
-tts = create_tts_client()

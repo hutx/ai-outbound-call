@@ -7,69 +7,71 @@
 -->
 <include>
 
-  <!-- ============================================================
+     <!-- ============================================================
        网络配置
        ============================================================ -->
-  <!-- 本机内网 IP（FreeSWITCH 自动探测，也可硬编码） -->
-  <X-PRE-PROCESS cmd="set" data="local_ip_v4=auto"/>
-  <!-- 公网 IP（NAT 环境必填，云服务器填弹性公网 IP） -->
-  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=219.143.45.154"/>
-  <X-PRE-PROCESS cmd="set" data="external_sip_ip=219.143.45.154"/>
-  <!-- SIP 监听端口 -->
-  <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060"/>
-  <X-PRE-PROCESS cmd="set" data="internal_tls_port=5061"/>
-  <!-- RTP 端口范围（每路通话占用 2 个端口：RTP + RTCP） -->
-  <X-PRE-PROCESS cmd="set" data="rtp_start_port=16384"/>
-  <X-PRE-PROCESS cmd="set" data="rtp_end_port=32768"/>
+     <!-- 本机内网 IP（FreeSWITCH 自动探测，也可硬编码） -->
+     <X-PRE-PROCESS cmd="set" data="local_ip_v4=172.26.0.4" />
+     <!-- SIP 域名称（用于用户注册和查找，NAT 环境下使用公网/宿主机 IP） -->
+     <X-PRE-PROCESS cmd="set" data="sip_domain=192.168.2.5" />
+     <!-- 公网 IP（NAT 环境必填，云服务器填弹性公网 IP） -->
+     <X-PRE-PROCESS cmd="set" data="external_rtp_ip=219.143.45.154" />
+     <X-PRE-PROCESS cmd="set" data="external_sip_ip=219.143.45.154" />
+     <!-- SIP 监听端口 -->
+     <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060" />
+     <X-PRE-PROCESS cmd="set" data="internal_tls_port=5061" />
+     <!-- RTP 端口范围（每路通话占用 2 个端口：RTP + RTCP） -->
+     <X-PRE-PROCESS cmd="set" data="rtp_start_port=16384" />
+     <X-PRE-PROCESS cmd="set" data="rtp_end_port=32768" />
 
-  <!-- ============================================================
+     <!-- ============================================================
        运营商 SIP 网关配置（关键！替换为实际运营商信息）
        支持的运营商：移动、联通、电信 SIP 中继，或 VoIP 服务商
        ============================================================ -->
-  <!-- 网关名称（与 sofia.conf.xml 中的 gateway name 一致） -->
-  <X-PRE-PROCESS cmd="set" data="carrier_gateway=carrier_trunk"/>
-  <!-- 实际运营商接入信息 -->
-  <X-PRE-PROCESS cmd="set" data="carrier_sip_server=59.110.91.40"/>
-  <X-PRE-PROCESS cmd="set" data="carrier_sip_proxy=59.110.91.40"/>
-  <!-- 运营商认证信息 -->
-  <X-PRE-PROCESS cmd="set" data="carrier_username=202603311547"/>
-  <X-PRE-PROCESS cmd="set" data="carrier_password=202603311547"/>
-  <X-PRE-PROCESS cmd="set" data="prefix=97776"/>
-  <!-- 呼叫者ID设置 -->
-  <X-PRE-PROCESS cmd="set" data="outbound_caller_id=202603311547"/>
-  <X-PRE-PROCESS cmd="set" data="outbound_caller_name=AIOutbound"/>
+     <!-- 网关名称（与 sofia.conf.xml 中的 gateway name 一致） -->
+     <X-PRE-PROCESS cmd="set" data="carrier_gateway=carrier_trunk" />
+     <!-- 实际运营商接入信息 -->
+     <X-PRE-PROCESS cmd="set" data="carrier_sip_server=59.110.91.40" />
+     <X-PRE-PROCESS cmd="set" data="carrier_sip_proxy=59.110.91.40" />
+     <!-- 运营商认证信息 -->
+     <X-PRE-PROCESS cmd="set" data="carrier_username=202603311547" />
+     <X-PRE-PROCESS cmd="set" data="carrier_password=202603311547" />
+     <X-PRE-PROCESS cmd="set" data="provider_prefix=97776" />
+     <!-- 呼叫者ID设置 -->
+     <X-PRE-PROCESS cmd="set" data="outbound_caller_id=202603311547" />
+     <X-PRE-PROCESS cmd="set" data="outbound_caller_name=AIOutbound" />
 
-  <!-- ============================================================
+     <!-- ============================================================
        后端 ESL Socket 服务器配置
        FreeSWITCH 在通话接通后会主动连接此地址
        ============================================================ -->
-  <X-PRE-PROCESS cmd="set" data="backend_socket_host=backend"/>
-  <X-PRE-PROCESS cmd="set" data="backend_socket_port=9999"/>
+     <X-PRE-PROCESS cmd="set" data="backend_socket_host=backend" />
+     <X-PRE-PROCESS cmd="set" data="backend_socket_port=9999" />
 
-  <!-- ============================================================
+     <!-- ============================================================
        媒体配置
        ============================================================ -->
-  <!-- 默认编解码器（PCMU=G.711 μ-law，延迟最低，与 ASR 兼容最好） -->
-  <X-PRE-PROCESS cmd="set" data="global_codec_prefs=PCMU,PCMA,G729"/>
-  <!-- 默认采样率（8000Hz 为标准电话音质，也可用 16000Hz 提升 ASR 精度） -->
-  <X-PRE-PROCESS cmd="set" data="rtp_sampling_rate=8000"/>
-  <!-- 录音存储根目录 -->
-  <X-PRE-PROCESS cmd="set" data="recording_base_dir=/recordings"/>
-  <!-- 音频提示音目录 -->
-  <X-PRE-PROCESS cmd="set" data="sounds_dir=/usr/share/freeswitch/sounds/zh/cn/sinmei"/>
-  <!-- 默认 MOH（等待音乐）文件 -->
-  <X-PRE-PROCESS cmd="set" data="hold_music=local_stream://moh"/>
+     <!-- 默认编解码器（PCMU=G.711 μ-law，延迟最低，与 ASR 兼容最好） -->
+     <X-PRE-PROCESS cmd="set" data="global_codec_prefs=PCMU,PCMA,G729" />
+     <!-- 默认采样率（8000Hz 为标准电话音质，也可用 16000Hz 提升 ASR 精度） -->
+     <X-PRE-PROCESS cmd="set" data="rtp_sampling_rate=8000" />
+     <!-- 录音存储根目录 -->
+     <X-PRE-PROCESS cmd="set" data="recording_base_dir=/recordings" />
+     <!-- 音频提示音目录 -->
+     <X-PRE-PROCESS cmd="set" data="sounds_dir=/usr/share/freeswitch/sounds/zh/cn/sinmei" />
+     <!-- 默认 MOH（等待音乐）文件 -->
+     <X-PRE-PROCESS cmd="set" data="hold_music=local_stream://moh" />
 
-  <!-- ============================================================
+     <!-- ============================================================
        ESL 认证密码
        ============================================================ -->
-  <X-PRE-PROCESS cmd="set" data="default_password=ClueCon"/>
+     <X-PRE-PROCESS cmd="set" data="default_password=ClueCon" />
 
-  <!-- ============================================================
+     <!-- ============================================================
        日志与调试
        ============================================================ -->
-  <X-PRE-PROCESS cmd="set" data="log_base=/var/log/freeswitch"/>
-  <!-- 是否开启 SIP 信令 DEBUG（生产关闭，排查问题时开启） -->
-  <X-PRE-PROCESS cmd="set" data="sip_trace=false"/>
+     <X-PRE-PROCESS cmd="set" data="log_base=/var/log/freeswitch" />
+     <!-- 是否开启 SIP 信令 DEBUG（生产关闭，排查问题时开启） -->
+     <X-PRE-PROCESS cmd="set" data="sip_trace=false" />
 
 </include>
