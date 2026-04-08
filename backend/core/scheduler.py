@@ -10,6 +10,7 @@
 """
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 # 拨号时间窗口：仅在此时间段内拨号（合规要求）
 DIAL_WINDOW_START = dtime(9, 0)   # 09:00
 DIAL_WINDOW_END   = dtime(21, 0)  # 21:00
+ACTIVE_PHONE_RESULTS = {"pending", "retrying", "dialing"}
 
 
 class TaskStatus(Enum):
@@ -76,7 +78,7 @@ class OutboundTask:
 
     @property
     def completed(self) -> int:
-        return sum(1 for p in self.phones if p.result not in ("pending", "retrying"))
+        return sum(1 for p in self.phones if p.result not in ACTIVE_PHONE_RESULTS)
 
     @property
     def progress_pct(self) -> float:
@@ -113,6 +115,7 @@ class TaskScheduler:
         self._tasks: dict[str, OutboundTask] = {}
         self._pause_events: dict[str, asyncio.Event] = {}
         self._cancel_flags: dict[str, bool] = {}
+        self._runner_tasks: dict[str, asyncio.Task] = {}
         # 全局并发信号量（跨任务限制）
         self._global_sem = asyncio.Semaphore(config.max_concurrent_calls)
 
@@ -147,11 +150,17 @@ class TaskScheduler:
 
     async def start_task(self, task_id: str) -> bool:
         task = self._tasks.get(task_id)
-        if not task or task.status not in (TaskStatus.PENDING, TaskStatus.PAUSED):
+        if not task or task.status != TaskStatus.PENDING:
+            return False
+        runner = self._runner_tasks.get(task_id)
+        if runner and not runner.done():
+            logger.warning(f"任务 {task_id} 已有运行中的调度协程，忽略重复启动")
             return False
         task.status = TaskStatus.RUNNING
         task.started_at = task.started_at or datetime.now()
-        asyncio.create_task(self._run(task), name=f"task-{task_id}")
+        runner = asyncio.create_task(self._run(task), name=f"task-{task_id}")
+        self._runner_tasks[task_id] = runner
+        runner.add_done_callback(lambda _: self._runner_tasks.pop(task_id, None))
         logger.info(f"任务 {task_id} 开始执行")
         return True
 
@@ -289,6 +298,29 @@ class TaskScheduler:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
 
         if not self._cancel_flags.get(task.task_id):
+            finalize_deadline = (
+                time.time()
+                + config.max_call_duration
+                + config.freeswitch.originate_timeout
+                + 10
+            )
+            while any(pr.result == "dialing" for pr in task.phones):
+                if self._cancel_flags.get(task.task_id):
+                    break
+                if time.time() >= finalize_deadline:
+                    lingering = [pr.phone for pr in task.phones if pr.result == "dialing"]
+                    for pr in task.phones:
+                        if pr.result == "dialing":
+                            pr.result = "error"
+                            task.failed_count += 1
+                    logger.warning(
+                        f"任务 {task.task_id} 等待通话结果超时，"
+                        f"将 {len(lingering)} 个号码标记为 error"
+                    )
+                    break
+                await asyncio.sleep(0.5)
+
+        if not self._cancel_flags.get(task.task_id):
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.now()
             logger.info(
@@ -318,8 +350,9 @@ class TaskScheduler:
                 script_id=task.script_id,
                 caller_id=task.caller_id or "202603311547",
                 originate_timeout=config.freeswitch.originate_timeout,
-                socket_host="127.0.0.1",
+                socket_host=os.environ.get("FS_BACKEND_SOCKET_HOST", "127.0.0.1"),
                 socket_port=config.freeswitch.socket_port,
+                internal_domain=config.freeswitch.internal_domain,
             )
             logger.info(
                 f"[{task.task_id}] 拨出 {pr.phone} "

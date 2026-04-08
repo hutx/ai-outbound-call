@@ -178,8 +178,11 @@ services:
       FS_ESL_PASSWORD:       ${FS_ESL_PASSWORD:-ClueCon}
       FS_SOCKET_PORT:        9999
       FS_GATEWAY:            ${FS_GATEWAY:-carrier_trunk}
+      FS_INTERNAL_DOMAIN:    ${FS_INTERNAL_DOMAIN:-192.168.2.5}
       FS_RECORDING_PATH:     /recordings
       FS_ORIGINATE_TIMEOUT:  ${FS_ORIGINATE_TIMEOUT:-30}
+      # FreeSWITCH 反连后端的 socket 地址（容器内使用服务名）
+      FS_BACKEND_SOCKET_HOST: backend
       # ── ASR ──────────────────────────────────────────────────
       ASR_PROVIDER:          ${ASR_PROVIDER:-bailian}
       FUNASR_HOST:           funasr
@@ -222,7 +225,7 @@ services:
       MAX_CALL_DURATION:     ${MAX_CALL_DURATION:-300}
       API_TOKEN:             ""
       API_PORT:              8000
-      DEBUG:                 ${DEBUG:-false}
+      DEBUG:                 ${DEBUG:-true}
       SCRIPTS_PATH:          ${SCRIPTS_PATH:-}
       TZ:                    Asia/Shanghai
     volumes:

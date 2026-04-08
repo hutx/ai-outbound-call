@@ -11,6 +11,52 @@ from backend.services.script_service import script_service
 logger = logging.getLogger(__name__)
 
 
+ALLOWED_INTENTS = (
+    "interested|need_more_info|not_interested|busy|request_human|callback|unknown"
+)
+ALLOWED_ACTIONS = "continue|transfer|callback|send_sms|blacklist|end"
+
+
+def _build_customer_profile(customer_info: dict) -> str:
+    customer_name = customer_info.get("name", "未知")
+    customer_note = customer_info.get("note", "") or "无"
+    risk_level = customer_info.get("risk_level", "unknown")
+    found = "是" if customer_info.get("found") else "否"
+    return (
+        "【客户信息】\n"
+        f"- 姓名：{customer_name}\n"
+        f"- 是否命中客户资料：{found}\n"
+        f"- 风险等级：{risk_level}\n"
+        f"- 备注：{customer_note}\n"
+    )
+
+
+def _build_output_contract() -> str:
+    return f"""【输出格式 - 严格遵守】
+你必须返回合法的 JSON，格式如下：
+{{
+  "reply": "你要说的话（纯文字，不含 markdown）",
+  "intent": "用户意图：{ALLOWED_INTENTS}",
+  "action": "下一步动作：{ALLOWED_ACTIONS}",
+  "action_params": {{
+    "extension": "转人工分机，可选",
+    "callback_time": "回拨时间，可选，格式 YYYY-MM-DD HH:MM",
+    "note": "回拨或黑名单备注，可选",
+    "template_id": "短信模板，可选",
+    "vars": {{}},
+    "farewell": "结束通话时的告别语，可选",
+    "reason": "加入黑名单原因，可选"
+  }}
+}}
+
+规则：
+1. 用户要求人工客服时，intent 用 request_human，action 用 transfer。
+2. 用户要求稍后再联系时，intent 用 callback，action 用 callback。
+3. 用户明确要求不要再联系时，action 优先用 blacklist。
+4. 只有明确要结束通话时才使用 end。
+5. 不要在 JSON 外面加任何文字或 markdown 代码块。"""
+
+
 async def get_system_prompt_for_call(script_id: str, customer_info: dict) -> str:
     """
     为通话获取系统提示
@@ -22,29 +68,17 @@ async def get_system_prompt_for_call(script_id: str, customer_info: dict) -> str
         main_script_text = (
             "【推介产品】默认产品\n【产品介绍】默认产品描述\n【目标客群】默认客户"
         )
-        opening_pause = 2000
     else:
         main_script_text = script_config.main_script
-        opening_pause = script_config.opening_pause
-
-    customer_name = customer_info.get("name", "您")
-    customer_note = customer_info.get("note", "")
-
-    opening_pause_desc = f"（停顿{opening_pause}毫秒后继续）"
+    customer_profile = _build_customer_profile(customer_info)
+    output_contract = _build_output_contract()
 
     return f"""
 {main_script_text}
 
-【输出格式 - 严格遵守】
-你必须返回合法的 JSON，格式如下：
-{{
-  "reply": "你要说的话（纯文字，不含标点以外的 special 字符）",
-  "intent": "用户意图：interested|need_more_info|not_interested|busy|request_human|callback|unknown",
-  "action": "下一步动作：continue|transfer|end|send_sms",
-  "action_params": {{}}
-}}
+{customer_profile}
 
-不要在 JSON 外面加任何文字或 markdown 代码块。"""
+{output_contract}"""
 
 
 async def get_opening_for_call(script_id: str, customer_info: dict) -> dict:

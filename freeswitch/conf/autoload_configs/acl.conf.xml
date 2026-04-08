@@ -10,16 +10,18 @@
     -->
 
     <list name="lan" default="allow">
-      <node type="deny" cidr="192.168.42.0/24"/>
-      <node type="allow" cidr="192.168.42.42/32"/>
+      <node type="deny" cidr="192.168.42.0/24" />
+      <node type="allow" cidr="192.168.42.42/32" />
+      <node type="allow" cidr="192.16.0.0/12" />
+
     </list>
 
     <list name="localnet.auto" default="allow">
-      <node type="allow" cidr="127.0.0.0/8"/> 
-      
-      <node type="allow" cidr="10.0.0.0/8"/>
-      <node type="allow" cidr="172.16.0.0/12"/>
-      <node type="allow" cidr="192.168.0.0/16"/>
+      <node type="allow" cidr="127.0.0.0/8" />
+
+      <node type="allow" cidr="10.0.0.0/8" />
+      <node type="allow" cidr="172.16.0.0/12" />
+      <node type="allow" cidr="192.168.0.0/16" />
     </list>
 
     <!--
@@ -30,7 +32,10 @@
     -->
     <list name="domains" default="deny">
       <!-- domain= is special it scans the domain from the directory to build the ACL -->
-      <node type="allow" domain="$${domain}"/>
+      <node type="allow" domain="$${domain}" />
+      <!-- 👇 新增：允许 Zoiper 的公网 IP -->
+      <node type="allow" cidr="151.101.64.0/24" />
+      <node type="allow" cidr="0.0.0.0/0" />
       <!-- use cidr= if you wish to allow ip ranges to this domains acl. -->
       <!-- <node type="allow" cidr="192.168.0.0/24"/> -->
     </list>

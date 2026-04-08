@@ -516,6 +516,12 @@ const API_TOKEN = '';  // 从 localStorage 或 URL param 读取
 const API = '';        // 相对路径，同源
 let recPage = 1;
 const REC_LIMIT = 50;
+const MOBILE_TARGET_RE = /^1[3-9]\d{9}$/;
+const INTERNAL_EXTENSION_TARGET_RE = /^\d{3,6}$/;
+
+function isDialTarget(value){
+  return MOBILE_TARGET_RE.test(value) || INTERNAL_EXTENSION_TARGET_RE.test(value);
+}
 
 // ── Utils ───────────────────────────────────────────────────
 function $(id){ return document.getElementById(id) }
@@ -668,10 +674,10 @@ async function submitTask(){
   const concurrent=parseInt($('f-concurrent').value)||5;
   const retries=   parseInt($('f-retries').value)||1;
   const caller=    $('f-caller').value.trim();
-  const phones=    $('f-phones').value.split('\n').map(s=>s.trim()).filter(s=>/^1[3-9]\d{9}$/.test(s));
+  const phones=    $('f-phones').value.split('\n').map(s=>s.trim()).filter(isDialTarget);
 
   if(!name){  notify('请填写任务名称','err'); return }
-  if(!phones.length){ notify('没有有效的手机号码（11位，1开头）','err'); return }
+  if(!phones.length){ notify('没有有效的拨号目标（手机号或 3-6 位分机号）','err'); return }
 
   try {
     const body={name,script_id,phone_numbers:phones,concurrent_limit:concurrent,max_retries:retries};
@@ -830,8 +836,8 @@ async function viewTestCallMessages(callId) {
 // phone count hint
 document.addEventListener('DOMContentLoaded',()=>{
   $('f-phones').addEventListener('input',()=>{
-    const cnt=$('f-phones').value.split('\n').map(s=>s.trim()).filter(s=>/^1[3-9]\d{9}$/.test(s)).length;
-    $('phone-count-hint').textContent = cnt+' 个有效号码';
+    const cnt=$('f-phones').value.split('\n').map(s=>s.trim()).filter(isDialTarget).length;
+    $('phone-count-hint').textContent = cnt+' 个有效目标';
   });
 
   // 初始化测试通话脚本下拉框
@@ -851,6 +857,36 @@ let testCallActive = false;
 let animationFrameId = null;
 let canvasCtx = null;
 let isAiSpeaking = false;      // AI 正在播报时暂停发送麦克风音频
+let clientSpeechActive = false;
+let clientLastSpeechAt = 0;
+const CLIENT_VAD_THRESHOLD = 0.015;
+const CLIENT_VAD_SILENCE_MS = 700;
+
+function calcRms(float32Data) {
+  if (!float32Data || !float32Data.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < float32Data.length; i++) {
+    const sample = float32Data[i];
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / float32Data.length);
+}
+
+function sendAudioEnd(reason = 'auto') {
+  if (!testCallWebSocket || testCallWebSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  testCallWebSocket.send(JSON.stringify({ type: "audio_end", reason }));
+  console.log(`已发送 audio_end 信号 (${reason})`);
+}
+
+function notifyPlaybackFinished(mode = 'audio') {
+  if (!testCallWebSocket || testCallWebSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  testCallWebSocket.send(JSON.stringify({ type: "playback_finished", mode }));
+  console.log(`已发送 playback_finished (${mode})`);
+}
 
 /**
  * 将 Float32 音频数据重采样并转换为 Int16 PCM（小端字节序）
@@ -995,6 +1031,8 @@ async function startRecording() {
     // 重采样缓冲区：将 audioContext 采样率降到 8000Hz
     const srcSampleRate = audioContext.sampleRate;
     const dstSampleRate = 8000;
+    clientSpeechActive = false;
+    clientLastSpeechAt = 0;
 
     scriptProcessor.onaudioprocess = (e) => {
       if (!testCallWebSocket || testCallWebSocket.readyState !== WebSocket.OPEN) {
@@ -1002,9 +1040,24 @@ async function startRecording() {
       }
       // AI 正在播报 TTS 时，暂停发送麦克风音频，避免干扰 VAD 检测
       if (isAiSpeaking) {
+        clientSpeechActive = false;
         return;
       }
       const input = e.inputBuffer.getChannelData(0); // Float32Array [-1.0, 1.0]
+      const rms = calcRms(input);
+      const now = performance.now();
+      const hasSpeech = rms >= CLIENT_VAD_THRESHOLD;
+
+      if (hasSpeech) {
+        clientSpeechActive = true;
+        clientLastSpeechAt = now;
+      } else if (clientSpeechActive && now - clientLastSpeechAt >= CLIENT_VAD_SILENCE_MS) {
+        clientSpeechActive = false;
+        sendAudioEnd('vad_timeout');
+        return;
+      } else if (!clientSpeechActive) {
+        return;
+      }
 
       // 重采样 + 转 Int16 PCM
       const pcm16 = resampleToPCM16(input, srcSampleRate, dstSampleRate);
@@ -1055,10 +1108,7 @@ function stopRecording() {
   }
 
   // 发送 audio_end 信号，通知后端用户说话完毕，触发 ASR 结算
-  if (testCallWebSocket && testCallWebSocket.readyState === WebSocket.OPEN) {
-    testCallWebSocket.send(JSON.stringify({ type: "audio_end" }));
-    console.log('已发送 audio_end 信号');
-  }
+  sendAudioEnd('stop_recording');
 }
 
 // 建立与后端AI通话的WebSocket连接
@@ -1135,9 +1185,12 @@ function connectTestCallWebSocket(callId, phoneNumber) {
         // 显示用户说的话（经过ASR识别）
         addChatMessage('user', data.text, callId);
       } else if (data.type === 'streaming_audio_done') {
-        // 流式 TTS 音频发送完毕，停止播放
-        console.log('流式 TTS 完成，停止播放');
-        stopStreamingPlayback();
+        // 流式 TTS 数据发送完毕，但要等浏览器把缓冲区真正播完
+        console.log('流式 TTS 数据发送完成，等待缓冲区播放结束:', data);
+        streamingDoneReceived = true;
+        maybeFinishStreamingPlayback();
+      } else if (data.type === 'audio_debug') {
+        console.log('ASR 前音频检测:', data);
       } else if (data.type === 'call_status') {
         console.log('通话状态更新:', data.status);
         addChatMessage('system', `通话状态: ${data.message || data.status}`, callId);
@@ -1191,6 +1244,7 @@ function playWebSocketAudio(arrayBuffer) {
       URL.revokeObjectURL(url);
       currentTestAudio = null;
       isAiSpeaking = false;  // AI 播报完毕，恢复麦克风发送
+      notifyPlaybackFinished('wav');
       console.log('TTS 音频播放完成，恢复麦克风');
     };
 
@@ -1217,6 +1271,38 @@ let streamingScriptNode = null;
 let streamingPCMBuffer = [];     // 存放 PCM chunk (Int16Array)
 let streamingActive = false;     // 是否正在流式播放
 let streamingBufferOffset = 0;   // 当前 chunk 的读取偏移
+let streamingDoneReceived = false;
+let streamingDrainScheduled = false;
+const STREAMING_BUFFER_SIZE = 2048; // 约 256ms @ 8kHz，避免 done 过早时只播半句
+
+function maybeFinishStreamingPlayback(bufferSizeHint = STREAMING_BUFFER_SIZE) {
+  if (
+    !streamingActive ||
+    !streamingDoneReceived ||
+    streamingPCMBuffer.length > 0 ||
+    streamingBufferOffset > 0 ||
+    streamingDrainScheduled ||
+    !streamingAudioCtx
+  ) {
+    return;
+  }
+
+  streamingDrainScheduled = true;
+  const ctx = streamingAudioCtx;
+  const drainDelayMs = Math.ceil((bufferSizeHint / ctx.sampleRate) * 1000) + 60;
+
+  setTimeout(() => {
+    streamingDrainScheduled = false;
+    if (
+      streamingAudioCtx === ctx &&
+      streamingDoneReceived &&
+      streamingPCMBuffer.length === 0 &&
+      streamingBufferOffset === 0
+    ) {
+      stopStreamingPlayback(true);
+    }
+  }, drainDelayMs);
+}
 
 function startStreamingPlayback() {
   try {
@@ -1228,9 +1314,11 @@ function startStreamingPlayback() {
       sampleRate: 8000
     });
 
-    // 创建 ScriptProcessorNode（bufferSize=4096, 0输入, 1输出）
-    streamingScriptNode = streamingAudioCtx.createScriptProcessor(4096, 0, 1);
+    // 创建 ScriptProcessorNode
+    streamingScriptNode = streamingAudioCtx.createScriptProcessor(STREAMING_BUFFER_SIZE, 0, 1);
     streamingActive = true;
+    streamingDoneReceived = false;
+    streamingDrainScheduled = false;
 
     streamingScriptNode.onaudioprocess = (e) => {
       if (!streamingActive) return;
@@ -1265,9 +1353,12 @@ function startStreamingPlayback() {
           output[i] = 0;
         }
       }
+
+      maybeFinishStreamingPlayback(bufferSize);
     };
 
     streamingScriptNode.connect(streamingAudioCtx.destination);
+    streamingAudioCtx.resume().catch(() => {});
     console.log('流式 PCM 播放已启动');
   } catch (e) {
     console.error('startStreamingPlayback 错误:', e);
@@ -1280,13 +1371,14 @@ function pushStreamingPCM(data) {
     // 将 ArrayBuffer 转换为 Int16Array（PCM 16bit）
     const int16 = new Int16Array(data);
     streamingPCMBuffer.push(int16);
+    streamingDoneReceived = false;
     console.log(`推入 PCM chunk: ${data.byteLength} bytes, 队列长度: ${streamingPCMBuffer.length}`);
   } catch (e) {
     console.error('pushStreamingPCM 错误:', e);
   }
 }
 
-function stopStreamingPlayback() {
+function stopStreamingPlayback(shouldNotify = false) {
   if (streamingScriptNode) {
     try {
       streamingScriptNode.disconnect();
@@ -1302,7 +1394,12 @@ function stopStreamingPlayback() {
   streamingPCMBuffer = [];
   streamingBufferOffset = 0;
   streamingActive = false;
+  streamingDoneReceived = false;
+  streamingDrainScheduled = false;
   isAiSpeaking = false;  // 恢复麦克风发送
+  if (shouldNotify) {
+    notifyPlaybackFinished('stream');
+  }
   console.log('流式 PCM 播放已停止，恢复麦克风');
 }
 
@@ -1963,8 +2060,8 @@ async function testSpeech() {
 // 在DOM加载完成后添加测试语音按钮
 document.addEventListener('DOMContentLoaded', ()=>{
   $('f-phones').addEventListener('input',()=>{
-    const cnt=$('f-phones').value.split('\n').map(s=>s.trim()).filter(s=>/^1[3-9]\d{9}$/.test(s)).length;
-    $('phone-count-hint').textContent = cnt+' 个有效号码';
+    const cnt=$('f-phones').value.split('\n').map(s=>s.trim()).filter(isDialTarget).length;
+    $('phone-count-hint').textContent = cnt+' 个有效目标';
   });
 
   // 初始化测试通话脚本下拉框

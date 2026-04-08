@@ -1,5 +1,5 @@
 # ============================================================
-# 智能外呼后端 — 生产级 Dockerfile (使用 uv 管理依赖)
+# 智能外呼后端 — 生产级 Dockerfile (简化版)
 # 多阶段构建：builder 安装依赖，runtime 运行
 # ============================================================
 
@@ -8,53 +8,55 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# 配置国内 PyPI 镜像源（pip + uv），解决网络超时问题
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
-ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 安装 uv 和构建依赖（配置国内 Debian 镜像源 + PyPI 镜像源）
-RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
-    sed -i 's|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+# 安装构建依赖
+RUN pip install --upgrade pip && \
     apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libpq-dev curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/* && \
-    pip install --upgrade pip && \
-    pip install uv
+    gcc g++ libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# 复制项目文件
-COPY pyproject.toml uv.lock ./
+# 复制完整项目文件（依赖安装需要 backend/ 目录存在）
+COPY pyproject.toml ./
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
+COPY demo_runner.py ./
 
-# 使用 uv 安装依赖
-RUN uv sync --locked --no-dev
+RUN pip install uv && \
+    pip install --upgrade pip setuptools && \
+    uv pip install --system --no-cache -- .
+
+# ── 阶段 2: 运行时环境 ───────────────────────────────────────
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash app \
+    && mkdir -p /recordings /tmp/tts_cache /var/log/outbound \
+    && chown -R app:app /app /recordings /tmp/tts_cache /var/log/outbound
+
+# 从构建器复制所有Python包
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 
 # 复制应用代码
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 COPY demo_runner.py ./
 
-# 创建运行时目录
-RUN mkdir -p /recordings /tmp/tts_cache /var/log/outbound
-
-# 创建非 root 用户
-RUN groupadd -r appuser && useradd -r -g appuser -u 1001 appuser \
-    && chown -R appuser:appuser /build /recordings /tmp/tts_cache /var/log/outbound
-
-USER appuser
+# 切换到非 root 用户
+USER app
 
 # 暴露端口
-# 8000: FastAPI HTTP API
-# 9999: ESL Socket Server（接受 FreeSWITCH 连接）
 EXPOSE 8000 9999
 
-# ── 健康检查 ─────────────────────────────────────────────────
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# ── 启动命令 ─────────────────────────────────────────────────
-# workers=1: asyncio 应用必须单 worker（多 worker 会导致 ESL 连接池冲突）
-# --log-config: 使用自定义日志格式
-CMD ["python", "-m", "uv", "run", "uvicorn", "backend.api.main:app", \
+# 启动命令
+CMD ["python", "-m", "uvicorn", "backend.api.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
      "--workers", "1", \

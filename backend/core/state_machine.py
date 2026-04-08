@@ -104,12 +104,24 @@ class StateMachine:
     根据 LLM 返回的意图和动作，决定下一步行为
     """
 
-    # 意图 → 动作映射
+    # 动作别名归一化
+    ACTION_ALIASES = {
+        "request_human": "transfer",
+        "human": "transfer",
+        "transfer_to_human": "transfer",
+        "hangup": "end",
+        "terminate": "end",
+        "sms": "send_sms",
+        "call_back": "callback",
+        "schedule_callback": "callback",
+        "add_blacklist": "blacklist",
+        "block": "blacklist",
+    }
+
+    # 当 action 缺失或无效时，按意图兜底
     INTENT_ACTIONS = {
-        CallIntent.NOT_INTERESTED: "_handle_rejection",
-        CallIntent.BUSY:           "_handle_busy",
-        CallIntent.REQUEST_HUMAN:  "_handle_transfer",
-        CallIntent.CALLBACK:       "_handle_callback",
+        CallIntent.REQUEST_HUMAN: "transfer",
+        CallIntent.CALLBACK: "callback",
     }
 
     # 连续拒绝几次后挂断
@@ -137,6 +149,10 @@ class StateMachine:
             self.ctx.intent = CallIntent.UNKNOWN
         logger.info(f"[{self.ctx.uuid}] 意图识别: {self.ctx.intent.name}")
 
+    def _normalize_action(self, action: str) -> str:
+        normalized = (action or "continue").strip().lower()
+        return self.ACTION_ALIASES.get(normalized, normalized)
+
     async def process_llm_response(self, response: dict) -> tuple[str, str]:
         """
         处理 LLM 返回的结构化响应
@@ -150,12 +166,23 @@ class StateMachine:
         返回: (reply_text, action)
         """
         reply = response.get("reply", "")
-        action = response.get("action", "continue")
+        action = self._normalize_action(response.get("action", "continue"))
         intent_str = response.get("intent", "unknown")
         params = response.get("action_params", {})
 
         # 更新意图
         self.update_intent(intent_str)
+
+        if action not in self._action_handlers and action != "continue":
+            fallback_action = self.INTENT_ACTIONS.get(self.ctx.intent)
+            if fallback_action:
+                logger.warning(
+                    f"[{self.ctx.uuid}] 未识别动作 {action!r}，按意图 {self.ctx.intent.value!r} 回退到 {fallback_action!r}"
+                )
+                action = fallback_action
+            else:
+                logger.warning(f"[{self.ctx.uuid}] 未识别动作 {action!r}，回退为 continue")
+                action = "continue"
 
         # 拒绝计数
         if self.ctx.intent == CallIntent.NOT_INTERESTED:

@@ -17,6 +17,20 @@ from backend.models.call_script import CallScript
 logger = logging.getLogger(__name__)
 
 
+def _format_customer_profile(customer_info: dict) -> str:
+    customer_name = customer_info.get("name", "未知")
+    customer_note = customer_info.get("note", "") or "无"
+    risk_level = customer_info.get("risk_level", "unknown")
+    found = "是" if customer_info.get("found") else "否"
+    return (
+        "【客户信息】\n"
+        f"- 姓名：{customer_name}\n"
+        f"- 是否命中客户资料：{found}\n"
+        f"- 风险等级：{risk_level}\n"
+        f"- 备注：{customer_note}\n"
+    )
+
+
 @dataclass
 class ScriptConfig:
     """话术配置项"""
@@ -228,28 +242,31 @@ async def build_system_prompt_from_db(script_id: str, customer_info: dict) -> st
         logger.warning(f"话术脚本未找到: {script_id}，使用默认话术")
         # 返回默认话术
         main_script_text = "【推介产品】默认产品\n【产品介绍】默认产品描述\n【目标客群】默认客户"
-        opening_pause = 2000
     else:
         main_script_text = script_config.main_script
-        opening_pause = script_config.opening_pause
-
-    customer_name = customer_info.get("name", "您")
-    customer_note = customer_info.get("note", "")
-
-    # 使用从数据库获取的停顿时长
-    # opening_pause_desc = f"（停顿{opening_pause}毫秒后继续）"
+    customer_profile = _format_customer_profile(customer_info)
 
     return f"""
 
 {main_script_text}
 
+{customer_profile}
+
 【输出格式 - 严格遵守】
 你必须返回合法的 JSON，格式如下：
 {{
-  "reply": "你要说的话（纯文字，不含标点以外的 special 字符）",
+  "reply": "你要说的话（纯文字，不含 markdown）",
   "intent": "用户意图：interested|need_more_info|not_interested|busy|request_human|callback|unknown",
-  "action": "下一步动作：continue|transfer|end|send_sms",
-  "action_params": {{}}
+  "action": "下一步动作：continue|transfer|callback|send_sms|blacklist|end",
+  "action_params": {{
+    "extension": "转人工分机，可选",
+    "callback_time": "回拨时间，可选，格式 YYYY-MM-DD HH:MM",
+    "note": "回拨或黑名单备注，可选",
+    "template_id": "短信模板，可选",
+    "vars": {{}},
+    "farewell": "结束通话时的告别语，可选",
+    "reason": "加入黑名单原因，可选"
+  }}
 }}
 
 不要在 JSON 外面加任何文字或 markdown 代码块。"""
