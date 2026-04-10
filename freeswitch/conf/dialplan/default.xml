@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <include>
   <context name="default">
+
+    <!-- 通用 park 扩展，用于 originate 后保持 A-leg -->
+    <extension name="park">
+      <condition field="destination_number" expression="^park$">
+        <action application="park"/>
+      </condition>
+    </extension>
+
     <!-- AI Agent Test Extensions -->
     <extension name="AI_Agent_Test">
       <condition field="destination_number" expression="^2000$">
@@ -41,6 +49,20 @@
         <!-- Route through carrier trunk with provider-required prefix 97776 -->
         <action application="bridge" data="sofia/gateway/carrier_trunk/$${provider_prefix}$1"/>
 
+      </condition>
+    </extension>
+
+    <!-- AI 外呼 A-leg 处理 -->
+    <extension name="ai_call_handler">
+      <condition field="destination_number" expression="^AI_CALL$">
+        <condition field="${ai_agent}" expression="^true$">
+          <action application="answer"/>
+          <action application="set" data="RECORD_STEREO=false"/>
+          <action application="set" data="media_bug_answer_req=true"/>
+          <action application="set" data="record_file=/recordings/${uuid}.wav"/>
+          <action application="record_session" data="/recordings/${uuid}.wav"/>
+          <action application="socket" data="backend:9999 async full"/>
+        </condition>
       </condition>
     </extension>
 

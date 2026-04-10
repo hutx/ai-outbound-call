@@ -114,19 +114,23 @@ class AudioStreamAdapter:
         last_audio_ts = time.time()
         self._play_start_time = time.time()
         self._listen_start_time = self._play_start_time
+        timeout_count = 0
         while not self._stopped:
             try:
                 chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
             except asyncio.TimeoutError:
+                timeout_count += 1
                 elapsed_silence_ms = (time.time() - last_audio_ts) * 1000
                 initial_wait_ms = (
                     (time.time() - self._listen_start_time) * 1000
                     if self._listen_start_time is not None
                     else 0
                 )
+                if timeout_count % 50 == 0:
+                    logger.debug(f"[adapter] 等待音频: {initial_wait_ms/1000:.1f}s, 超时次数={timeout_count}, 队列大小={self._queue.qsize()}")
                 if self._started_speaking and elapsed_silence_ms >= self._vad_silence_ms:
                     break
-                if not self._started_speaking and initial_wait_ms >= 2000:
+                if not self._started_speaking and initial_wait_ms >= 15000:
                     break
                 continue
             if not chunk:
@@ -180,6 +184,7 @@ class CallAgent:
         asr: Optional[BaseASR] = None,
         tts: Optional[BaseTTS] = None,
         llm: Optional[LLMService] = None,
+        esl_pool=None,
     ):
         self.session = session
         self.ctx = context
@@ -188,6 +193,7 @@ class CallAgent:
         self.asr = asr or create_asr_client()
         self.tts = tts or create_tts_client()
         self.llm = llm or LLMService()
+        self.esl_pool = esl_pool
 
         self._system_prompt: str = ""  # 在 connect() 后从 channel vars 构建
         self._script_config = None  # 话术脚本配置，用于获取打断策略
@@ -335,19 +341,6 @@ class CallAgent:
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
 
-        # 测试通话场景使用浏览器 WebSocket 收发音频，上一轮遗留的静音帧或
-        # audio_end 哨兵会污染下一轮 ASR；真实 ESL 实时流不做此清理。
-        if getattr(self.session, "ws_connection", None) is not None:
-            drained = 0
-            while True:
-                try:
-                    audio_queue.get_nowait()
-                    drained += 1
-                except asyncio.QueueEmpty:
-                    break
-            if drained:
-                logger.info(f"[{self.ctx.uuid}] 测试通话监听前已清理旧音频帧 {drained} 条")
-
         adapter = AudioStreamAdapter(
             audio_queue,
             vad_silence_ms=config.asr.vad_silence_ms,
@@ -388,27 +381,10 @@ class CallAgent:
         )
         if not audio_stats["speech_detected"]:
             logger.warning(f"[{self.ctx.uuid}] 本轮进入 ASR 的音频未检测到有效人声")
-            await self._notify_test_call_ws(
-                {
-                    "type": "audio_debug",
-                    "speech_detected": False,
-                    "max_rms": audio_stats["max_rms"],
-                    "speech_ms": audio_stats["speech_ms"],
-                }
-            )
         elif not final_text:
             logger.warning(
                 f"[{self.ctx.uuid}] 已检测到人声，但 ASR 未产出最终文本 "
                 f"(speech_ms={audio_stats['speech_ms']}, max_rms={audio_stats['max_rms']})"
-            )
-            await self._notify_test_call_ws(
-                {
-                    "type": "audio_debug",
-                    "speech_detected": True,
-                    "max_rms": audio_stats["max_rms"],
-                    "speech_ms": audio_stats["speech_ms"],
-                    "asr_final_text": "",
-                }
             )
 
         logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}, 共 {asr_result_count} 条结果")
@@ -416,7 +392,6 @@ class CallAgent:
         if final_text:
             self.ctx.user_utterances += 1
             self.ctx.messages.append({"role": "user", "content": final_text})
-            await self._notify_test_call_ws({"type": "user_speech", "text": final_text})
 
         return final_text
 
@@ -443,16 +418,6 @@ class CallAgent:
             aclose = getattr(audio_gen, "aclose", None)
             if aclose is not None:
                 await aclose()
-
-    async def _notify_test_call_ws(self, payload: dict):
-        """测试通话模式下把关键事件推回前端，方便联调定位。"""
-        ws = getattr(self.session, "ws_connection", None)
-        if ws is None:
-            return
-        try:
-            await ws.send_json(payload)
-        except Exception as e:
-            logger.debug(f"[{self.ctx.uuid}] 推送测试通话消息失败: {e}")
 
     # ─────────────────────────────────────────────────────────
     # LLM 推理
@@ -529,12 +494,50 @@ class CallAgent:
                 logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，跳过播放")
                 return
 
-            await self.session.play_stream(audio_chunks, text=text)
-            logger.debug(f"[{self.ctx.uuid}] TTS 流式播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
+            # 收集 TTS 音频
+            pcm_parts = []
+            total_bytes = 0
+            async for chunk in audio_chunks:
+                if chunk:
+                    pcm_parts.append(chunk)
+                    total_bytes += len(chunk)
+
+            if not pcm_parts:
+                logger.warning(f"[{self.ctx.uuid}] TTS 流式播放收到空音频")
+                return
+
+            from backend.utils.audio import write_wav
+            import os
+            import tempfile
+
+            shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
+            os.makedirs(shared_dir, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f"tts_{self.ctx.uuid or 'call'}_",
+                suffix=".wav",
+                dir=shared_dir,
+            )
+            os.close(fd)
+
+            pcm_data = b"".join(pcm_parts)
+            write_wav(temp_path, pcm_data, sample_rate=8000)
+            file_size = os.path.getsize(temp_path)
+            # 估算播放时长（8000Hz 16bit mono = 16000 bytes/sec）
+            estimated_duration = len(pcm_data) / 16000.0
+
+            logger.info(
+                f"[{self.ctx.uuid}] TTS WAV: {temp_path} "
+                f"({file_size} bytes, ~{estimated_duration:.1f}s)"
+            )
+
+            # 通过 outbound session 直接执行 playback（sendmsg execute）
+            await self.session.play(temp_path, timeout=60.0)
+
+            logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
         except asyncio.TimeoutError:
             logger.error(f"[{self.ctx.uuid}] TTS 超时")
         except Exception as e:
-            logger.error(f"[{self.ctx.uuid}] TTS/播放失败: {e}")
+            logger.error(f"[{self.ctx.uuid}] TTS/播放失败: {e}", exc_info=True)
         finally:
             self._barge_in.set()  # 播放结束，允许新一轮录音
 

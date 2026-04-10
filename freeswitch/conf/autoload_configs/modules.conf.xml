@@ -126,6 +126,9 @@
     <!-- <load module="mod_java"/> -->
     <load module="mod_lua"/>
 
+    <!-- Audio Streaming (AI Voice) -->
+    <load module="mod_audio_stream"/>
+
     <!-- ASR /TTS -->
     <!-- <load module="mod_flite"/> -->
     <!-- <load module="mod_pocketsphinx"/> -->

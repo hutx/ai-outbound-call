@@ -65,7 +65,10 @@ services:
     # ★ 推荐镜像：drachtio/freeswitch-modules（含常用模块，开箱即用）
     #   备选：signalwire/freeswitch:1.10.10（官方，更新，但部分模块需手动安装）
     #
-    image: safarov/freeswitch:latest
+    image: docker.io/library/freeswitch-sudio:latest  
+    # image: safarov/freeswitch:latest
+    # image: rocketchat/freeswitch:latest
+    # image: ghcr.io/patrickbaus/freeswitch-docker:master
     # image: ccr.ccs.tencentyun.com/xswitch/xswitch-free:latest
     container_name: outbound_freeswitch
     restart: unless-stopped
@@ -105,12 +108,13 @@ services:
       - ../freeswitch/conf/sip_profiles:/etc/freeswitch/sip_profiles:ro
       - ../freeswitch/conf/dialplan/outbound.xml:/etc/freeswitch/dialplan/outbound.xml:ro
       - ../freeswitch/conf/dialplan/internal.xml:/etc/freeswitch/dialplan/internal.xml:ro
+      - ../freeswitch/conf/dialplan/default.xml:/etc/freeswitch/dialplan/default.xml:ro
       - ../freeswitch/conf/directory/default.xml:/etc/freeswitch/directory/default.xml:ro
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
-      # - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
+      - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
       - ./docker/recordings:/recordings
-      - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds
+      # - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds  # 使用镜像内置声音文件
       # 日志
       - ./logs/freeswitch:/var/log/freeswitch
       - /usr/share/alsa:/usr/share/alsa:ro
@@ -229,7 +233,7 @@ services:
       SCRIPTS_PATH:          ${SCRIPTS_PATH:-}
       TZ:                    Asia/Shanghai
     volumes:
-      - recordings:/recordings
+      - ./docker/recordings:/recordings
       - tts_cache:/tmp/tts_cache
       - ./logs/backend:/var/log/backend
     ports:
