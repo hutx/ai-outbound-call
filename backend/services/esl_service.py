@@ -101,18 +101,48 @@ class AsyncESLConnection:
         发起外呼。所有业务参数作为 channel 变量传入，
         CallAgent 通过 ESL channel_vars 读取。
 
-        内部分机模式：A-leg &park 保持，接通后转移至 AI_CALL 连接后端。
-        PSTN 模式：通过 dialplan 的 ai_outbound_answered 扩展处理。
+        内部分机模式：同步 originate 等 B-leg 接听，然后转移 A-leg 到 AI_CALL。
+        PSTN 模式：通过 bgapi + dialplan 的 ai_outbound_answered 扩展处理。
         """
         endpoint, target_type, dest = self._build_originate_target(
             phone=phone,
             gateway=gateway,
             internal_domain=internal_domain,
         )
+
+        if target_type == "internal_extension":
+            # 内部分机：同步 originate，等 B-leg 接听后再转移 A-leg
+            cmd = (
+                f"originate {{"
+                f"origination_uuid={call_uuid},"
+                f"ai_agent=true,"
+                f"export:ai_agent=true,"
+                f"export:task_id={task_id},"
+                f"export:script_id={script_id},"
+                f"export:call_target_type={target_type},"
+                f"export:original_destination={phone},"
+                f"origination_caller_id_number={caller_id},"
+                f"originate_timeout={originate_timeout}"
+                f"}}"
+                f"{endpoint} &park"
+            )
+            logger.info(
+                f"ESL originate → {phone} "
+                f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
+            )
+            # 使用同步 api originate，阻塞直到 B-leg 接听
+            result = await self.api(cmd)
+
+            if "+OK" in result or call_uuid in result:
+                # B-leg 已接听，立即转移 A-leg 到 AI handler
+                asyncio.create_task(self._transfer_to_ai_handler(call_uuid))
+                return f"answered:{call_uuid}"
+            return result
+
+        # PSTN 外呼：使用 bgapi + dialplan 处理
         cmd = (
             f"originate {{"
             f"origination_uuid={call_uuid},"
-            f"ai_agent=true,"
             f"export:ai_agent=true,"
             f"export:task_id={task_id},"
             f"export:script_id={script_id},"
@@ -128,16 +158,10 @@ class AsyncESLConnection:
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
         )
         result = await self.bgapi(cmd, job_uuid=call_uuid)
-
-        # 内部分机：A-leg 接通后需转移至 AI_CALL 才能连接后端 socket
-        if target_type == "internal_extension":
-            asyncio.create_task(self._transfer_to_ai_handler(call_uuid))
-
         return result
 
     async def _transfer_to_ai_handler(self, call_uuid: str):
         """内部分机接通后，将 A-leg 转接到 AI_CALL 扩展以连接后端 socket"""
-        await asyncio.sleep(2)
         try:
             result = await self.api(f"uuid_transfer {call_uuid} AI_CALL XML default")
             logger.info(f"[{call_uuid[:8]}] uuid_transfer AI_CALL: {result.strip()[:100]}")
