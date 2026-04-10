@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FreeSWITCH 语音路由配置示例
+  针对 AI 外呼系统与 Zoiper 软电话的集成
+-->
+
+<document type="freeswitch/xml">
+  <section name="dialplan">
+    <context name="internal">
+      
+      <!-- 内部分机之间通话 -->
+      <extension name="internal_to_internal">
+        <condition field="destination_number" expression="^(\d{4})$">
+          <action application="export" data="sip_auto_answer=true"/>
+          <action application="set" data="call_timeout=30"/>
+          <action application="answer"/>
+          <action application="bridge" data="user/$1@${domain_name}"/>
+        </condition>
+      </extension>
+      
+      <!-- 内线拨打外线（通过运营商网关） -->
+      <extension name="internal_to_external">
+        <condition field="destination_number" expression="^9(\d{11})$">
+          <action application="set" data="effective_caller_id_number=${caller_id_number}"/>
+          <action application="set" data="effective_caller_id_name=${caller_id_name}"/>
+          <action application="bridge" data="sofia/gateway/carrier_trunk/$${provider_prefix}$1"/>
+        </condition>
+      </extension>
+      
+      <!-- 呼叫转移到 Zoiper 坐席 -->
+      <extension name="transfer_to_zoiper_agent">
+        <condition field="destination_number" expression="^agent_(\d{4})$">
+          <action application="set" data="effective_caller_id_number=$${outbound_caller_id}"/>
+          <action application="set" data="effective_caller_id_name=AI_Call_Transfer"/>
+          <action application="export" data="sip_invite_domain=${domain_name}"/>
+          <action application="bridge" data="user/$1@${domain_name}"/>
+        </condition>
+      </extension>
+      
+    </context>
+    
+    <!-- AI 外呼专用上下文 -->
+    <context name="ai_outbound">
+      
+      <!-- AI 外呼通话处理 -->
+      <extension name="ai_outbound_processing">
+        <condition field="${direction}" expression="^outbound$" break="never"/>
+        <condition field="${ai_agent}" expression="^true$" break="on-true">
+          
+          <!-- 应答通话 -->
+          <action application="answer"/>
+          
+          <!-- 媒体设置 -->
+          <action application="set" data="media_bug_answer_req=true"/>
+          <action application="set" data="RECORD_STEREO=false"/>
+          <action application="set" data="record_file=$${recording_base_dir}/${task_id}/${uuid}_${caller_id_number}_${callee_number}.wav"/>
+          
+          <!-- 开始录音 -->
+          <action application="record_session" data="${record_file}"/>
+          
+          <!-- 实时音频流推送到后端 ASR -->
+          <action application="audio_stream" data="ws://backend:$${audio_stream_port} 8000 read 20"/>
+          
+          <!-- 连接到后端 CallAgent -->
+          <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
+          
+          <!-- 挂断处理 -->
+          <action application="hangup" data="NORMAL_CLEARING"/>
+        </condition>
+      </extension>
+      
+      <!-- 转人工坐席 -->
+      <extension name="transfer_to_human_agent">
+        <condition field="destination_number" expression="^human_agent_(\d+)$" break="on-true">
+          <action application="set" data="effective_caller_id_name=AI_Call_Transfer"/>
+          <action application="set" data="effective_caller_id_number=$${outbound_caller_id}"/>
+          <action application="set" data="transfer_source=ai_system"/>
+          <action application="set" data="original_task_id=${task_id}"/>
+          <action application="bridge" data="user/$1@${domain_name}"/>
+        </condition>
+      </extension>
+      
+      <!-- 外呼失败处理 -->
+      <extension name="outbound_failure_handling">
+        <condition field="${direction}" expression="^outbound$" break="never"/>
+        <condition field="${ai_agent}" expression="^true$" break="never"/>
+        <condition field="${hangup_cause}" expression="^(NO_ANSWER|USER_BUSY|CALL_REJECTED|UNALLOCATED_NUMBER)$" break="on-true">
+          <action application="set" data="call_result=failed_${hangup_cause}"/>
+          <action application="set" data="failure_reason=${hangup_cause}"/>
+          <action application="log" data="WARNING AI外呼失败 [${destination_number}] 原因: ${hangup_cause} 任务ID: ${task_id}"/>
+        </condition>
+      </extension>
+      
+    </context>
+    
+    <!-- 坐席上下文 -->
+    <context name="agents">
+      
+      <!-- 坐席接听 AI 转接的通话 -->
+      <extension name="handle_ai_transfer">
+        <condition field="destination_number" expression="^(\d{4})$">
+          <condition field="${transfer_source}" expression="^ai_system$" break="on-true">
+            <action application="answer"/>
+            <action application="set" data="agent_extension=$1"/>
+            <action application="set" data="call_source=ai_transfer"/>
+            <action application="set" data="original_task_id=${original_task_id}"/>
+            <action application="set" data="ai_summary=${ai_summary}"/>
+            <action application="playback" data="tone_stream://%(200,0,440);loops=1"/>
+            <action application="log" data="INFO 坐席 $1 接听 AI 转接通话，原任务ID: ${original_task_id}"/>
+          </condition>
+        </condition>
+      </extension>
+      
+    </context>
+    
+  </section>
+  
+  <section name="configuration">
+    <configuration name="sofia.conf" description="Sofia Configuration">
+      
+      <global_settings>
+        <param name="log-level" value="0"/>
+        <param name="debug-presence" value="0"/>
+      </global_settings>
+      
+      <profiles>
+        
+        <!-- 内部分机 Profile -->
+        <profile name="internal">
+          <gateways/>
+          <domains>
+            <domain name="all" alias="true" parse="false"/>
+          </domains>
+          <settings>
+            <param name="sip-port" value="$${internal_sip_port}"/>
+            <param name="sip-ip" value="$${local_ip_v4}"/>
+            <param name="rtp-ip" value="$${local_ip_v4}"/>
+            <param name="ext-sip-ip" value="$${internal_ext_sip_ip}"/>
+            <param name="ext-rtp-ip" value="$${internal_ext_rtp_ip}"/>
+            <param name="local-network-acl" value="docker_only"/>
+            <param name="aggressive-nat-detection" value="false"/>
+            <param name="apply-nat-acl" value="lan_only"/>
+            <param name="apply-inbound-acl" value="domains"/>
+            <param name="apply-register-acl" value="domains"/>
+            <param name="auth-calls" value="true"/>
+            <param name="auth-all-packets" value="false"/>
+            <param name="inbound-codec-prefs" value="PCMU,PCMA,G729"/>
+            <param name="outbound-codec-prefs" value="PCMU,PCMA,G729"/>
+            <param name="inbound-late-negotiation" value="true"/>
+            <param name="inbound-zrtp-passthru" value="true"/>
+            <param name="media-option" value="resume-media-on-hold"/>
+            <param name="dtmf-type" value="rfc2833"/>
+            <param name="session-timeout" value="1800"/>
+            <param name="context" value="internal"/>
+            <param name="hold-music" value="$${hold_music}"/>
+            <param name="user-agent-string" value="AI-OutboundCall-Internal/1.10"/>
+            <param name="sip-trace" value="$${sip_trace}"/>
+            <param name="multiple-registrations" value="contact"/>
+            <param name="max-auth-validity" value="100"/>
+          </settings>
+        </profile>
+        
+        <!-- 外呼 Profile -->
+        <profile name="outbound">
+          <gateways>
+            <gateway name="carrier_trunk">
+              <param name="username" value="$${carrier_username}"/>
+              <param name="password" value="$${carrier_password}"/>
+              <param name="realm" value="$${carrier_sip_server}:6922"/>
+              <param name="proxy" value="$${carrier_sip_server}:6922"/>
+              <param name="register" value="false"/>
+              <param name="expire-seconds" value="1800"/>
+              <param name="retry-seconds" value="30"/>
+              <param name="register-transport" value="udp"/>
+              <param name="ping" value="25"/>
+              <param name="ping-max" value="3"/>
+              <param name="ping-min" value="1"/>
+              <param name="caller-id-in-from" value="true"/>
+              <param name="caller-id-in-uri" value="true"/>
+              <param name="extension" value="$${carrier_username}"/>
+              <param name="contact-params" value="transport=udp"/>
+              <param name="from-user" value="$${outbound_caller_id}"/>
+              <param name="from-domain" value="$${carrier_sip_server}"/>
+              <param name="prefix" value="$${provider_prefix}"/>
+              <param name="ping" value="25"/>
+              <param name="expire-seconds" value="600"/>
+              <param name="retry-seconds" value="30"/>
+            </gateway>
+          </gateways>
+          <settings>
+            <param name="sip-port" value="5080"/>
+            <param name="sip-ip" value="$${local_ip_v4}"/>
+            <param name="rtp-ip" value="$${local_ip_v4}"/>
+            <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+            <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+            <param name="apply-nat-acl" value="nat.auto"/>
+            <param name="stun-enabled" value="false"/>
+            <param name="stun-auto-disable" value="true"/>
+            <param name="rtp-start-port" value="$${rtp_start_port}"/>
+            <param name="rtp-end-port" value="$${rtp_end_port}"/>
+            <param name="inbound-codec-prefs" value="PCMU,PCMA"/>
+            <param name="outbound-codec-prefs" value="PCMU,PCMA"/>
+            <param name="inbound-late-negotiation" value="true"/>
+            <param name="inbound-zrtp-passthru" value="true"/>
+            <param name="dtmf-type" value="rfc2833"/>
+            <param name="session-timeout" value="1800"/>
+            <param name="rtp-timeout-sec" value="300"/>
+            <param name="rtp-hold-timeout-sec" value="1800"/>
+            <param name="sip-tos" value="CS3"/>
+            <param name="rtp-tos" value="EF"/>
+            <param name="user-agent-string" value="AI-OutboundCall/1.10"/>
+            <param name="context" value="ai_outbound"/>
+            <param name="sip-trace" value="$${sip_trace}"/>
+            <param name="hangup-timeout-ms" value="500"/>
+            <param name="record-path" value="$${recording_base_dir}"/>
+            <param name="record-format" value="wav"/>
+            <param name="disable-register" value="false"/>
+            <param name="accept-blind-reg" value="false"/>
+            <param name="accept-blind-auth" value="false"/>
+            <param name="send-100-automatically" value="true"/>
+            <param name="sip-timer-T1" value="500"/>
+            <param name="sip-timer-T2" value="4000"/>
+          </settings>
+        </profile>
+        
+      </profiles>
+      
+    </configuration>
+  </section>
+</document>

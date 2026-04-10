@@ -100,6 +100,9 @@ class AsyncESLConnection:
         """
         发起外呼。所有业务参数作为 channel 变量传入，
         CallAgent 通过 ESL channel_vars 读取。
+
+        内部分机模式：A-leg &park 保持，接通后转移至 AI_CALL 连接后端。
+        PSTN 模式：通过 dialplan 的 ai_outbound_answered 扩展处理。
         """
         endpoint, target_type, dest = self._build_originate_target(
             phone=phone,
@@ -109,24 +112,37 @@ class AsyncESLConnection:
         cmd = (
             f"originate {{"
             f"origination_uuid={call_uuid},"
-            f"task_id={task_id},"
-            f"script_id={script_id},"
-            f"call_target_type={target_type},"
-            f"original_destination={phone},"
             f"ai_agent=true,"
+            f"export:ai_agent=true,"
+            f"export:task_id={task_id},"
+            f"export:script_id={script_id},"
+            f"export:call_target_type={target_type},"
+            f"export:original_destination={phone},"
             f"origination_caller_id_number={caller_id},"
-            f"originate_timeout={originate_timeout},"
-            f"ignore_early_media=true,"
-            f"hangup_after_bridge=false"
+            f"originate_timeout={originate_timeout}"
             f"}}"
-            f"{endpoint} "
-            f"&socket({socket_host}:{socket_port} async full)"
+            f"{endpoint} &park"
         )
         logger.info(
             f"ESL originate → {phone} "
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
         )
-        return await self.bgapi(cmd, job_uuid=call_uuid)
+        result = await self.bgapi(cmd, job_uuid=call_uuid)
+
+        # 内部分机：A-leg 接通后需转移至 AI_CALL 才能连接后端 socket
+        if target_type == "internal_extension":
+            asyncio.create_task(self._transfer_to_ai_handler(call_uuid))
+
+        return result
+
+    async def _transfer_to_ai_handler(self, call_uuid: str):
+        """内部分机接通后，将 A-leg 转接到 AI_CALL 扩展以连接后端 socket"""
+        await asyncio.sleep(2)
+        try:
+            result = await self.api(f"uuid_transfer {call_uuid} AI_CALL XML default")
+            logger.info(f"[{call_uuid[:8]}] uuid_transfer AI_CALL: {result.strip()[:100]}")
+        except Exception as e:
+            logger.error(f"[{call_uuid[:8]}] uuid_transfer 失败: {e}")
 
     @staticmethod
     def _build_originate_target(phone: str, gateway: str, internal_domain: str) -> tuple[str, str, str]:
@@ -278,7 +294,8 @@ class ESLSocketCallSession:
     提供对单路通话的完整控制能力
     """
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                 esl_pool=None, ws_server=None):
         self._reader = reader
         self._writer = writer
         self._uuid: Optional[str] = None
@@ -290,6 +307,10 @@ class ESLSocketCallSession:
         self._playback_done = asyncio.Event()
         self._hangup_cause: Optional[str] = None
         self._sip_code: Optional[int] = None
+        self.esl_pool = esl_pool  # ESL Inbound pool for uuid_eavesdrop
+        self.ws_server = ws_server  # AudioStreamWebSocket for mod_audio_stream
+        self._audio_mode: str = "unknown"  # "websocket" | "file_poll" | "custom"
+        self._audio_started: bool = False  # 防止重复启动 uuid_audio_stream
 
     @property
     def uuid(self) -> Optional[str]:
@@ -301,7 +322,11 @@ class ESLSocketCallSession:
         return self._channel_vars
 
     async def connect(self) -> dict:
-        """完成握手，返回全部 channel 数据"""
+        """完成握手，返回全部 channel 数据。可安全重复调用（幂等）。"""
+        # 如果已经握手完成，直接返回缓存的 channel 变量
+        if self._uuid is not None:
+            return self._channel_vars
+
         await self._send("connect\n\n")
         data = await self._read_event()
 
@@ -344,7 +369,9 @@ class ESLSocketCallSession:
         )
         if arg:
             msg += f"execute-app-arg: {arg}\n"
-        if lock:
+        # Outbound socket 模式下 event-lock 会阻止 CHANNEL_EXECUTE_COMPLETE 返回
+        # playback 和 start_dtmf 必须设为 false，否则无法收到完成事件
+        if lock and app not in ("playback", "start_dtmf", "set"):
             msg += "event-lock: true\n"
         msg += f"Event-UUID: {event_uuid}\n\n"
         async with self._lock:
@@ -352,14 +379,51 @@ class ESLSocketCallSession:
         return event_uuid
 
     async def play(self, audio_path: str, timeout: float = 60.0):
-        """播放音频，阻塞直到播放完成或超时"""
-        self._playback_done.clear()
-        await self.execute("playback", audio_path)
+        """播放音频：通过 ESL Inbound pool 的 uuid_broadcast API 播放
+
+        sendmsg execute playback 在 Outbound socket 模式下有编解码/媒体路径问题，
+        改用 uuid_broadcast 更可靠。
+        """
+        import os
+        if not self.esl_pool:
+            # 降级：使用 sendmsg execute
+            logger.warning(f"[{self._uuid}] ESL pool 不可用，降级 sendmsg execute playback")
+            self._playback_done.clear()
+            await self.execute("playback", audio_path)
+            try:
+                await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
+                await self.stop_playback()
+            return
+
+        # 计算播放时长（用于等待）
         try:
-            await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
-            await self.stop_playback()
+            file_size = os.path.getsize(audio_path)
+            # 8000Hz 16bit mono WAV: 44 header + 16000 bytes/sec
+            audio_bytes = max(0, file_size - 44)
+            estimated_duration = audio_bytes / 16000.0 if audio_bytes > 0 else 1.0
+        except Exception:
+            estimated_duration = 3.0
+
+        try:
+            result = await self.esl_pool.api(
+                f"uuid_broadcast {self._uuid} {audio_path} both"
+            )
+            logger.info(f"[{self._uuid}] uuid_broadcast 结果: {result.strip()[:100]}")
+        except Exception as e:
+            logger.error(f"[{self._uuid}] uuid_broadcast 失败: {e}，降级 sendmsg")
+            self._playback_done.clear()
+            await self.execute("playback", audio_path)
+            try:
+                await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
+                await self.stop_playback()
+            return
+
+        # 等待播放完成
+        await asyncio.sleep(estimated_duration)
 
     async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
         """
@@ -367,9 +431,13 @@ class ESLSocketCallSession:
         这不是严格的实时流式，但能保证真实 FreeSWITCH 路径可运行。
         """
         pcm_parts = []
+        total_bytes = 0
         async for chunk in audio_chunks:
             if chunk:
                 pcm_parts.append(chunk)
+                total_bytes += len(chunk)
+
+        logger.info(f"[{self._uuid}] TTS 流式收集完成: {len(pcm_parts)} 块, {total_bytes} 字节")
 
         if not pcm_parts:
             logger.warning(f"[{self._uuid}] TTS 流式播放收到空音频")
@@ -377,17 +445,32 @@ class ESLSocketCallSession:
 
         from backend.utils.audio import write_wav
 
+        # 写入两个容器共享的 /recordings 目录，FreeSWITCH 才能访问
+        shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
+        os.makedirs(shared_dir, exist_ok=True)
         fd, temp_path = tempfile.mkstemp(
             prefix=f"tts_{self._uuid or 'call'}_",
             suffix=".wav",
+            dir=shared_dir,
         )
         os.close(fd)
+
+        total_pcm = len(b"".join(pcm_parts))
+        logger.info(f"[{self._uuid}] 写入 WAV: {temp_path} ({total_pcm} bytes PCM)")
+
         try:
             write_wav(temp_path, b"".join(pcm_parts), sample_rate=8000)
+            file_size = os.path.getsize(temp_path)
+            logger.info(f"[{self._uuid}] WAV 文件大小: {file_size} bytes, 开始播放")
             await self.play(temp_path, timeout=timeout)
+            logger.info(f"[{self._uuid}] 播放完成")
+        except Exception as e:
+            logger.error(f"[{self._uuid}] 播放异常: {e}", exc_info=True)
         finally:
             try:
-                os.remove(temp_path)
+                if os.path.exists(temp_path):
+                    logger.debug(f"[{self._uuid}] 删除临时文件: {temp_path}")
+                    os.remove(temp_path)
             except OSError:
                 pass
 
@@ -419,10 +502,110 @@ class ESLSocketCallSession:
             pass
         self._connected = False
 
+    async def start_recording(self, record_path: Optional[str] = None) -> str:
+        """通过 uuid_record 启动会话录音，供 ASR 消费。"""
+        path = record_path or f"/recordings/asr_{self._uuid}.raw"
+        if not self.esl_pool:
+            return ""
+        try:
+            result = await self.esl_pool.api(f"uuid_record {self._uuid} start {path}")
+            logger.info(f"[{self._uuid}] uuid_record: {result.strip()[:100]}")
+            return path
+        except Exception as e:
+            logger.error(f"[{self._uuid}] 录音启动失败: {e}")
+            return ""
+
     async def start_audio_capture(self) -> asyncio.Queue:
-        """开始捕获通话音频，返回 PCM 数据队列"""
-        await self.execute("start_dtmf")
+        """开始捕获通话音频，返回 PCM 数据队列
+
+        优先级：
+          1. mod_audio_stream（通过 ESL pool 启动 uuid_audio_stream API）
+          2. 文件轮询（读取 dialplan record_session 写入的录音文件）
+
+        幂等：已启动后直接返回现有队列，不重复调用 uuid_audio_stream。
+        """
+        if not self._uuid:
+            logger.warning("无法启动音频捕获: UUID 为空")
+            self._audio_mode = "none"
+            return asyncio.Queue()
+
+        # 幂等：如果已经启动成功，直接返回音频队列
+        if self._audio_started and self._audio_mode != "none":
+            logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}，跳过重复启动")
+            return self._audio_queue
+
+        # 1. 尝试 mod_audio_stream WebSocket（如果 dialplan 没有 record_session 占用 media bug）
+        if self.esl_pool:
+            try:
+                ws_url = f"ws://backend:8765/{self._uuid}"
+                result = await self.esl_pool.api(
+                    f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
+                )
+                result_text = result.strip()
+                logger.info(f"[{self._uuid}] uuid_audio_stream 结果: {result_text[:100]}")
+                if result_text.startswith("+OK"):
+                    self._audio_mode = "audio_stream"
+                else:
+                    logger.debug(f"[{self._uuid}] uuid_audio_stream 返回错误: {result_text[:60]}，使用文件轮询")
+                    self._audio_mode = "file_poll"
+            except Exception as e:
+                logger.debug(f"[{self._uuid}] uuid_audio_stream 调用异常: {e}，使用文件轮询")
+                self._audio_mode = "file_poll"
+
+        # 2. 获取 WebSocket 会话队列
+        if self._audio_mode == "audio_stream" and self.ws_server:
+            ws_queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
+            if ws_queue is not None:
+                logger.info(f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket")
+                self._audio_started = True
+                return ws_queue
+            logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
+            self._audio_mode = "file_poll"
+
+        # 3. 文件轮询：dialplan 的 record_session 已在写入 /recordings/asr_${uuid}.raw
+        #    无需调用 uuid_record（会与 record_session 的 media bug 冲突）
+        if self._audio_mode == "file_poll":
+            asr_path = f"/recordings/asr_{self._uuid}.raw"
+            self._audio_started = True
+            logger.info(f"[{self._uuid}] 音频采集: 文件轮询 {asr_path}（dialplan record_session）")
+            asyncio.create_task(self._poll_audio_file(asr_path))
+            return self._audio_queue
+
+        logger.warning(f"[{self._uuid}] 音频采集不可用，ASR 将无法工作")
+        self._audio_mode = "none"
         return self._audio_queue
+
+    async def _poll_audio_file(self, path: str):
+        """轮询音频文件，读取新增数据送入音频队列"""
+        import os
+        import aiofiles
+
+        # 等待文件创建（FreeSWITCH record_session 创建文件）
+        for _ in range(60):  # 最多等 6 秒
+            if os.path.exists(path):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            logger.warning(f"[{self._uuid}] 音频文件未创建: {path}")
+            return
+
+        offset = 0
+        while self._connected:
+            try:
+                current_size = os.path.getsize(path)
+                if current_size > offset:
+                    async with aiofiles.open(path, "rb") as f:
+                        await f.seek(offset)
+                        chunk = await f.read(current_size - offset)
+                        if chunk:
+                            offset += len(chunk)
+                            await self._safe_put(self._audio_queue, chunk)
+                await asyncio.sleep(0.05)  # 50ms 轮询间隔
+            except FileNotFoundError:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"[{self._uuid}] 音频文件读取失败: {e}")
+                await asyncio.sleep(0.1)
 
     # ── 事件主循环 ────────────────────────────────────────────
 
@@ -471,12 +654,14 @@ class ESLSocketCallSession:
 
             elif name == "CUSTOM":
                 body = event.get("_body", "")
+                event_subclass = event.get("Event-Subclass", "")
                 if body:
                     try:
                         pcm = base64.b64decode(body)
+                        logger.debug(f"[{self._uuid}] CUSTOM audio: {len(pcm)} bytes, subclass={event_subclass}")
                         await self._safe_put(self._audio_queue, pcm)
                     except Exception:
-                        pass
+                        logger.debug(f"[{self._uuid}] CUSTOM event decode failed: subclass={event_subclass}, body_len={len(body)}")
 
         # 确保所有等待者能退出
         self._playback_done.set()
@@ -554,12 +739,16 @@ class ESLSocketServer:
         port: int,
         call_handler: Callable[[ESLSocketCallSession], Awaitable[None]],
         max_connections: int = 200,
+        esl_pool=None,
+        ws_server=None,
     ):
         self.host = host
         self.port = port
         self.call_handler = call_handler
         self._sem = asyncio.Semaphore(max_connections)
         self._server: Optional[asyncio.Server] = None
+        self._esl_pool = esl_pool
+        self._ws_server = ws_server
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -576,7 +765,8 @@ class ESLSocketServer:
 
     async def _handle(self, reader, writer):
         async with self._sem:
-            session = ESLSocketCallSession(reader, writer)
+            session = ESLSocketCallSession(reader, writer, esl_pool=self._esl_pool,
+                                           ws_server=self._ws_server)
             try:
                 await self.call_handler(session)
             except Exception as e:

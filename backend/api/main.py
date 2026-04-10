@@ -23,13 +23,13 @@ from fastapi.responses import FileResponse
 
 from backend.api.monitor_api import MonitorAPI
 from backend.api.operations_api import OperationsAPI
-from backend.api.test_call_api import TestCallAPI
 from backend.core.config import config
 from backend.core.call_agent import CallAgent
 from backend.core.scheduler import TaskScheduler
 from backend.core.state_machine import CallContext, CallResult
 from backend.services.esl_service import AsyncESLPool, ESLSocketServer, ESLSocketCallSession
 from backend.services.asr_service import create_asr_client
+from backend.services.audio_stream_ws import AudioStreamWebSocket
 from backend.services.tts_service import create_tts_client
 from backend.services.llm_service import LLMService
 from backend.services.crm_service import crm
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # 全局单例
 # ─────────────────────────────────────────────────────────────
 _esl_pool: Optional[AsyncESLPool] = None
+_ws_server: Optional[AudioStreamWebSocket] = None
 _asr = None
 _tts = None
 _llm = None
@@ -111,6 +112,7 @@ async def _handle_call_session(session: ESLSocketCallSession):
         asr=_asr,
         tts=_tts,
         llm=_llm,
+        esl_pool=_esl_pool,
     )
 
     _active_calls[call_uuid] = agent
@@ -149,7 +151,7 @@ async def _handle_call_session(session: ESLSocketCallSession):
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _esl_pool, _asr, _tts, _llm, _scheduler
+    global _esl_pool, _ws_server, _asr, _tts, _llm, _scheduler
 
     logger.info("━" * 50)
     logger.info("  智能外呼系统启动")
@@ -174,6 +176,18 @@ async def lifespan(app: FastAPI):
     _llm = LLMService()
     logger.info("✓ ASR / TTS / LLM 服务初始化完成")
 
+    # mod_audio_stream WebSocket Server（接收 FreeSWITCH 实时音频流）
+    _ws_server = AudioStreamWebSocket(
+        host="0.0.0.0",
+        port=config.freeswitch.audio_stream_port,
+    )
+    try:
+        await _ws_server.start()
+        logger.info(f"✓ AudioStream WebSocket 监听 :{config.freeswitch.audio_stream_port}")
+    except Exception as e:
+        logger.warning(f"✗ AudioStream WebSocket 启动失败（将降级到文件轮询）: {e}")
+        _ws_server = None
+
     # ESL 连接池
     _esl_pool = AsyncESLPool(
         host=config.freeswitch.host,
@@ -196,6 +210,8 @@ async def lifespan(app: FastAPI):
         port=config.freeswitch.socket_port,
         call_handler=_handle_call_session,
         max_connections=config.max_concurrent_calls + 50,
+        esl_pool=_esl_pool,
+        ws_server=_ws_server,
     )
     server_task = asyncio.create_task(esl_server.start())
     logger.info(f"✓ ESL Socket Server 监听 :{config.freeswitch.socket_port}")
@@ -227,6 +243,9 @@ async def lifespan(app: FastAPI):
                            return_exceptions=True),
             timeout=10.0,
         )
+
+    if _ws_server:
+        await _ws_server.stop()
 
     if _esl_pool:
         await _esl_pool.stop()
@@ -262,21 +281,11 @@ _monitor_api = MonitorAPI(
     esl_pool_getter=lambda: _esl_pool,
     start_time=_start_time,
 )
-_test_call_api = TestCallAPI(
-    config=config,
-    active_calls=_active_calls,
-    metrics=_metrics,
-    broadcast_stats=_monitor_api.broadcast_stats,
-    asr_getter=lambda: _asr,
-    tts_getter=lambda: _tts,
-    llm_getter=lambda: _llm,
-)
 _operations_api = OperationsAPI(
     scheduler_getter=lambda: _scheduler,
     metrics=_metrics,
 )
 app.include_router(_monitor_api.router)
-app.include_router(_test_call_api.router)
 app.include_router(_operations_api.router)
 
 

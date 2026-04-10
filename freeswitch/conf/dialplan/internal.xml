@@ -10,12 +10,29 @@
        ============================================================ -->
   <context name="internal">
 
+    <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
+    <extension name="AI_Agent_Call" continue="true">
+      <condition field="${ai_agent}" expression="^true$">
+        <action application="answer"/>
+        <action application="sleep" data="500"/>
+        <action application="set" data="RECORD_STEREO=false"/>
+        <action application="set" data="media_bug_answer_req=true"/>
+        <action application="set" data="record_file=/recordings/${uuid}.wav"/>
+        <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <action application="socket" data="backend:9999 async full"/>
+      </condition>
+    </extension>
+
     <!-- 内部直拨 -->
     <extension name="Local_Extension">
       <condition field="destination_number" expression="^(10[01][0-9])$">
         <action application="export" data="dialed_extension=$1"/>
         <action application="set" data="continue_on_fail=NORMAL_TEMPORARY_FAILURE,USER_BUSY,NO_ANSWER,TIMEOUT,EXTENSION_NOT_FOUND,INVALID_NUMBER_FORMAT,DOMAIN_NOT_FOUND"/>
-        <action application="transfer" data="$1 XML default"/>
+        <action application="set" data="ringback=${us-ring}"/>
+        <action application="set" data="transfer_ringback=${us-ring}"/>
+        <action application="set" data="call_timeout=30"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="bridge" data="user/${dialed_extension}@${sip_domain}"/>
       </condition>
     </extension>
 
