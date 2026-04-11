@@ -128,24 +128,32 @@ class AsyncESLConnection:
         )
 
         if target_type == "internal_extension":
-            # 内部分机：user/ 目录查找绕过 dialplan，
-            # 使用拨号计划扩展处理，而不是 execute_on_answer（避免变量解析问题）
-            # 在拨号计划中设置 ai_agent=true，让后续处理在 dialplan 中完成
+            # 内部分机：B-leg 接听后通过 execute_on_answer 显式转到 AI dialplan
+            context = "internal"
+            var_str = f"{aleg_vars}{bleg_vars}"
             cmd = (
-                f"originate {{{aleg_vars}{bleg_vars}}}"
-                f"{endpoint}"
+                f"originate "
+                f"{{{var_str},"
+                f"origination_caller_id_number={caller_id},"
+                f"origination_uuid={call_uuid},"
+                f"execute_on_answer='transfer AI_Agent_Call xml {context}',"
+                f"ignore_early_media=true}} "
+                f"{endpoint} &park()"
             )
-            logger.info(
-                f"ESL originate u2192 {phone} "
-                f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
+        else:
+            # PSTN 外呼：B-leg 接听后转到 default context 的 AI handler
+            context = "default"
+            var_str = f"{aleg_vars}{bleg_vars}"
+            cmd = (
+                f"originate "
+                f"{{{var_str},"
+                f"origination_caller_id_number={caller_id},"
+                f"origination_uuid={call_uuid},"
+                f"execute_on_answer='transfer ai_outbound_answered xml {context}',"
+                f"ignore_early_media=true}} "
+                f"{endpoint} &park()"
             )
-            return await self.bgapi(cmd, job_uuid=call_uuid)
 
-        # PSTN 外呼
-        cmd = (
-            f"originate {{{aleg_vars}{bleg_vars}}}"
-            f"{endpoint} &park()"
-        )
         logger.info(
             f"ESL originate → {phone} "
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"

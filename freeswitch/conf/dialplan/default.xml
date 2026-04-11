@@ -68,16 +68,35 @@
       </condition>
     </extension>
 
+    <!-- 内部 AI 呼叫处理：当 ai_agent=true 且拨打内部号码时 -->
+    <extension name="internal_ai_call_handler">
+      <condition field="${ai_agent}" expression="^true$"/>
+      <condition field="${destination_number}" expression="^(1001|1002|10[01][0-9])$"/> <!-- 匹配内部分机 -->
+      <action application="set" data="dialed_extension=${destination_number}"/>
+      <action application="answer"/>
+      <action application="sleep" data="500"/>
+      <action application="set" data="RECORD_STEREO=false"/>
+      <action application="set" data="media_bug_answer_req=true"/>
+      <action application="set" data="record_file=/recordings/${uuid}.wav"/>
+      <action application="record_session" data="/recordings/${uuid}.wav"/>
+      <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
+      <action application="socket" data="backend:9999 async full"/>
+      <action application="bridge" data="user/${dialed_extension}@${domain}"/>
+    </extension>
+
     <!-- 外呼通话处理 - 被叫接通后交给 ESL socket 应用 -->
     <extension name="ai_outbound_answered">
       <condition field="${direction}" expression="^outbound$">
       <condition field="${ai_agent}" expression="^true$">
         <action application="answer"/>
+        <action application="sleep" data="500"/>
         <action application="set" data="RECORD_STEREO=false"/>
         <action application="set" data="media_bug_answer_req=true"/>
         <!-- 开始录音（合规要求） -->
         <action application="set" data="record_file=/recordings/${uuid}.wav"/>
         <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <!-- 实时音频流（ASR 消费） -->
+        <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
         <!-- 将通话控制权交给后端 call_agent.py -->
         <action application="socket" data="backend:9999 async full"/>
       </condition>
