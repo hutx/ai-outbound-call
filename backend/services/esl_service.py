@@ -128,12 +128,13 @@ class AsyncESLConnection:
         )
 
         if endpoint_type == "internal_extension":
-            # 内部分机：sofia B-leg 直接进入 dialplan（不指定 post-dial app），
-            # 匹配 ai_agent=true 扩展 → audio_stream + socket。
-            # 不再使用 loopback bridge，避免 bridged channel 上无法启动音频流的问题。
+            # 内部分机：B-leg 接通后执行 &park() 进入 dialplan。
+            # park 让 B-leg 带着 ai_agent=true 等变量进入 internal 拨号计划，
+            # 匹配 AI_Agent_Call 扩展 → audio_stream + socket。
+            # 不使用 bridge（bridge 会跳过 dialplan 直接桥接），也不使用 loopback（bridged channel 上无法启动音频流）。
             cmd = (
                 f"originate [{channel_vars}] "
-                f"{endpoint}"
+                f"{endpoint} &park()"
             )
         else:
             # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
