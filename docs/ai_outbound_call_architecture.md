@@ -98,13 +98,9 @@
 
 ### 2.5 拨号计划（Dialplan）
 
-**文件**: `freeswitch/conf/dialplan/internal.xml`
+外呼通过 originate 的 `&bridge(loopback/AI_CALL)` 执行，不需要内部分机拨号计划匹配。
 
-> **注意**：AI 外呼主流程不再依赖 dialplan 路由。
-> 内部分机外呼通过 originate 的 **post-dial apps** 直接执行 `audio_stream` + `socket`。
-> dialplan 中的 `AI_Agent_Call` 扩展仅保留用于手动拨打 2000/3000 测试。
-
-内部直拨扩展（1002-1019）：
+`freeswitch/conf/dialplan/default.xml` 中的 `ai_call_handler` 处理 loopback-b：
 
 ---
 
@@ -132,81 +128,42 @@
 **文件**: `backend/services/esl_service.py` — `AsyncESLConnection.originate()`
 
 ```python
-async def originate(
-    self,
-    phone: str,
-    call_uuid: str,
-    task_id: str,
-    script_id: str,
-    caller_id: str = "1001",
-    gateway: str = "carrier_trunk",
-    originate_timeout: int = 30,
-    socket_host: str = "127.0.0.1",
-    socket_port: int = 9999,
-    internal_domain: str = "$${local_ip_v4}",
-) -> str:
-    endpoint, endpoint_type, target_type = self._build_originate_target(
-        phone=phone, gateway=gateway, internal_domain=internal_domain,
+async def originate(self, phone, call_uuid, task_id, script_id, ...) -> str:
+    endpoint, endpoint_type, target_type = self._build_originate_target(...)
+
+    channel_vars = (
+        f"origination_uuid={call_uuid},"
+        f"ai_agent=true,"
+        f"export_ai_agent=true,"        # ← 导出到 B-leg
+        f"export_task_id={task_id},"
+        f"export_script_id={script_id},"
+        f"export_call_target_type={target_type},"
+        f"export_original_destination={phone},"
+        f"export_origination_uuid={call_uuid},"
+        ...
     )
 
     if endpoint_type == "internal_extension":
-        # 内部分机：user/ endpoint 查找注册信息（自动处理 NAT）
-        # B-leg 接通后链式执行 post-dial apps：answer → record → audio_stream → socket
-        internal_vars = (
-            f"origination_uuid={call_uuid},"
-            f"ai_agent=true,"
-            f"task_id={task_id},"
-            f"script_id={script_id},"
-            f"call_target_type={target_type},"
-            f"origination_caller_id_number={caller_id},"
-            f"originate_timeout={originate_timeout}"
-        )
-        cmd = (
-            f"originate [{internal_vars}] "
-            f"{endpoint} "
-            f"&answer()"
-            f"&sleep(500)"
-            f"&set(RECORD_STEREO=false)"
-            f"&set(media_bug_answer_req=true)"
-            f"&record_session(/recordings/${{uuid}}.wav)"
-            f"&audio_stream(ws://backend:8765/${{uuid}} 8000 read 20)"
-            f"&socket(backend:9999 async full)"
-        )
+        # 内部分机：user/ 查找注册 → Zoiper 振铃 → bridge(loopback/AI_CALL)
+        cmd = f"originate [{channel_vars}] {endpoint} &bridge(loopback/AI_CALL)"
     elif endpoint_type == "pstn":
-        # PSTN 外呼：通过运营商网关，B-leg 进入 outbound_calls context
-        pstn_vars = (
-            f"origination_uuid={call_uuid},"
-            f"ai_agent=true,"
-            f"export_ai_agent=true,"
-            ...
-        )
+        # PSTN 外呼
         cmd = f"originate [{pstn_vars}] {endpoint}"
 ```
 
-#### 内部分机 originate 命令解析
+#### 变量传递规则
 
-完整命令示例（拨打 1001）：
+| 变量前缀 | 作用域 | 示例 |
+|----------|--------|------|
+| `var=val` | 仅 A-leg | `origination_uuid=xxx` |
+| `export_var=val` | 导出到 B-leg | `export_ai_agent=true` → B-leg 中 `ai_agent=true` |
 
-```
-originate [origination_uuid=xxx, ai_agent=true, task_id=yyy, script_id=zzz, ...]
-  user/1001@domain
-  &answer()
-  &sleep(500)
-  &set(RECORD_STEREO=false)
-  &set(media_bug_answer_req=true)
-  &record_session(/recordings/${uuid}.wav)
-  &audio_stream(ws://backend:8765/${uuid} 8000 read 20)
-  &socket(backend:9999 async full)
-```
+#### 端点类型
 
-| 阶段 | 说明 |
-|------|------|
-| `user/1001@domain` | Directory 查找 1001 的注册联系信息 → SIP INVITE |
-| `&answer()` | B-leg 接通后接听 |
-| `&sleep(500)` | 等待 500ms 确保 RTP 媒体路径稳定 |
-| `&record_session(...)` | 全程录音，`${uuid}` 解析为 B-leg UUID |
-| `&audio_stream(...)` | mod_audio_stream 启动，持续推送用户麦克风到 WebSocket |
-| `&socket(...)` | FreeSWITCH TCP 连接后端 :9999 → CallAgent 接管 |
+| 类型 | 端点格式 | 说明 |
+|------|----------|------|
+| 内部分机 | `user/1001@{domain}` | directory 查找注册地址 → SIP INVITE |
+| PSTN 外呼 | `sofia/gateway/{gw}/{number}` | 通过运营商网关 |
 
 ### 3.3 ESL Outbound Socket Server — 接受 FS 连入
 
@@ -444,17 +401,20 @@ sofia channel 音频流:
     ESL :8021 → bgapi originate [ai_agent=true,...] user/1001@domain
 
 [3] FreeSWITCH 建立 SIP 呼叫
-    INVITE → Zoiper (1001)  ← 通过 directory 查找注册地址（自动处理 NAT）
+    INVITE → Zoiper (1001)
     Zoiper 振铃 ✓
     Zoiper 应答 200 OK
     RTP 媒体路径建立
 
-[4] B-leg 接通后执行 post-dial apps（链式，不走 dialplan）
-    ├─ answer()            → 接听
-    ├─ sleep(500)          → 等待 RTP 稳定
-    ├─ record_session(...) → 全程录音
-    ├─ audio_stream(...)   → mod_audio_stream 开始推送用户麦克风 PCM
-    └─ socket(...)         → FreeSWITCH TCP 连接后端 :9999
+[4] 执行 &bridge(loopback/AI_CALL)
+    sofia B-leg ↔ loopback-a ↔ loopback-b
+
+[5] loopback-b 进入 default context
+    匹配 ai_call_handler (destination_number=AI_CALL)
+    ├─ answer
+    ├─ record_session → /recordings/{uuid}.wav
+    └─ socket → backend:9999 async full
+        └─ FreeSWITCH TCP 连接后端
 
 [5] 后端 ESL Outbound Server 接受连接
     创建 ESLSocketCallSession
@@ -553,6 +513,14 @@ docker-compose logs freeswitch | grep "AI_Agent_Call"
 
 ### Q3: audio_stream 只收到 1 帧就断开
 
-**原因**: channel 被 bridge 后，`mod_audio_stream` media bug 无法附加到 bridged channel 上。
+**原因**: loopback bridge 架构下，`mod_audio_stream` 附加到 loopback 通道时，
+TTS 播放期间有音频，但 TTS 结束后用户麦克风音频不再流经 loopback 通道。
 
-**解决**: 不要在 bridge 架构下使用 mod_audio_stream。让 sofia channel 直接进入 dialplan 的 `audio_stream` + `socket`，不使用 loopback bridge。
+**架构限制**:
+```
+用户麦克风 → sofia B-leg → loopback-a → loopback-b(socket) → 后端
+```
+loopback 通道只接收从后端发送的 TTS 音频（write 方向），
+用户麦克风音频只流经 sofia B-leg，不流经 loopback 通道。
+
+**替代方案探索中**: 需要找到能在非 bridged 通道上捕获音频的方法。
