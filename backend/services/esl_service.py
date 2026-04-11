@@ -143,7 +143,7 @@ class AsyncESLConnection:
             logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
             # 对于AI代理呼叫，使用拨号计划扩展而不是直接连接用户
             # 这样可以确保AI处理逻辑被执行
-            return f"user/{normalized}@{domain}", "internal_extension", normalized
+            return f"sofia/internal/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
         return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
