@@ -232,10 +232,11 @@ class AsyncESLConnection:
         normalized = (phone or "").strip()
         if INTERNAL_EXTENSION_RE.fullmatch(normalized):
             domain = (internal_domain or "$${local_ip_v4}").strip()
-            logger.debug(f"ESL originate → {phone} (internal_extension) → sofia/internal/{normalized}@{domain}")
-            # 使用 sofia/internal/ endpoint 绕过 directory 查找，
-            # 直接在 sofia profile 上建立 SIP INVITE，B-leg 进入 profile 的 context=internal 拨号计划。
-            return f"sofia/internal/{normalized}@{domain}", "internal_extension", normalized
+            logger.debug(f"ESL originate → {phone} (internal_extension) → user/{normalized}@{domain}")
+            # 使用 user/ endpoint 查找注册信息（directory），FreeSWITCH 自动处理 NAT。
+            # 用户的 user_context=internal（directory.xml），B-leg 进入 internal 拨号计划。
+            # ai_agent=true 通过 channel variable 传递，dialplan 条件匹配。
+            return f"user/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
         return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
