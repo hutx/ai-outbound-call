@@ -378,10 +378,13 @@ class ESLEventListener:
         """持续读取 ESL 事件，分发给等待者。"""
         while self._connected and self._running:
             try:
-                event = await asyncio.wait_for(self._read_event(), timeout=60.0)
+                event = await asyncio.wait_for(self._read_event(), timeout=120.0)
             except asyncio.CancelledError:
                 break
-            except (asyncio.TimeoutError, Exception):
+            except asyncio.TimeoutError:
+                # 长时间无事件，保持连接继续监听（非致命）
+                continue
+            except Exception:
                 self._connected = False
                 logger.warning("ESL 事件监听器连接断开")
                 break
