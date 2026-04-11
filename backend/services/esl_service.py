@@ -111,30 +111,30 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
-        # FreeSWITCH 变量继承规则：
-        # - [var=val] 仅设置 A-leg
-        # - [export_var=val] 导出到 B-leg（bridge 后的通道）
-        channel_vars = (
-            f"origination_uuid={call_uuid},"
-            f"ai_agent=true,"
-            f"export_ai_agent=true,"
-            f"export_task_id={task_id},"
-            f"export_script_id={script_id},"
-            f"export_call_target_type={target_type},"
-            f"export_original_destination={phone},"
-            f"export_origination_uuid={call_uuid},"
-            f"origination_caller_id_number={caller_id},"
-            f"originate_timeout={originate_timeout}"
-        )
-
         if endpoint_type == "internal_extension":
-            # 内部分机：B-leg 接通后执行 &park() 进入 dialplan。
-            # park 让 B-leg 带着 ai_agent=true 等变量进入 internal 拨号计划，
-            # 匹配 AI_Agent_Call 扩展 → audio_stream + socket。
-            # 不使用 bridge（bridge 会跳过 dialplan 直接桥接），也不使用 loopback（bridged channel 上无法启动音频流）。
+            # 内部分机：user/ endpoint 通过 directory 查找注册信息（自动处理 NAT），
+            # B-leg 接通后直接链式执行 post-dial apps，不走 dialplan。
+            # 这样 audio_stream 在非 bridged 通道上运行，可以正常捕获用户麦克风。
+            # 注意：& 连接的 apps 在 B-leg 上顺序执行，socket 会长时间占用。
+            internal_vars = (
+                f"origination_uuid={call_uuid},"
+                f"ai_agent=true,"
+                f"task_id={task_id},"
+                f"script_id={script_id},"
+                f"call_target_type={target_type},"
+                f"origination_caller_id_number={caller_id},"
+                f"originate_timeout={originate_timeout}"
+            )
             cmd = (
-                f"originate [{channel_vars}] "
-                f"{endpoint} &park()"
+                f"originate [{internal_vars}] "
+                f"{endpoint} "
+                f"&answer()"
+                f"&sleep(500)"
+                f"&set(RECORD_STEREO=false)"
+                f"&set(media_bug_answer_req=true)"
+                f"&record_session(/recordings/${{uuid}}.wav)"
+                f"&audio_stream(ws://backend:8765/${{uuid}} 8000 read 20)"
+                f"&socket(backend:9999 async full)"
             )
         else:
             # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
