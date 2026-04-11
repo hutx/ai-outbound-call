@@ -114,10 +114,10 @@ services:
       - ../freeswitch/conf/dialplan/default.xml:/etc/freeswitch/dialplan/default.xml:ro
       - ../freeswitch/conf/directory/default.xml:/etc/freeswitch/directory/default.xml:ro
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
-      - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
+      # - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
       - ./recordings:/recordings
-      # - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds  # 使用镜像内置声音文件
+      - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds  # 使用镜像内置声音文件
       # 日志
       - ./logs/freeswitch:/var/log/freeswitch
       - /usr/share/alsa:/usr/share/alsa:ro

@@ -178,10 +178,9 @@
         <param name="sip-ip"   value="0.0.0.0"/>
         <param name="rtp-ip"   value="0.0.0.0"/>
 
-        <!-- 安全：只允许局域网注册 -->
+        <!-- 允许外网注册 -->
         <param name="apply-inbound-acl"  value="domains"/>
         <param name="apply-register-acl" value="domains"/>
-        <param name="local-network-acl"  value="localnet.auto"/>
 
         <!-- NAT 穿透（Docker 容器部署必须配置，否则 SDP 中为容器内网 IP） -->
         <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>

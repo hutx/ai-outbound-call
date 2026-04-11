@@ -129,16 +129,14 @@ class AsyncESLConnection:
 
         if target_type == "internal_extension":
             # 内部分机：user/ 目录查找绕过 dialplan，
-            # 用 execute_on_answer 在 B-leg 应答后同时启动录音 + socket 连接后端
-            socket_cmd = f"socket {socket_host}:{socket_port} async full"
-            record_cmd = "record_session /recordings/asr_${uuid}.wav"
+            # 使用拨号计划扩展处理，而不是 execute_on_answer（避免变量解析问题）
+            # 在拨号计划中设置 ai_agent=true，让后续处理在 dialplan 中完成
             cmd = (
-                f"originate {{{aleg_vars}{bleg_vars}"
-                f"execute_on_answer='{record_cmd};{socket_cmd}'}}"
-                f"{endpoint} &park()"
+                f"originate {{{aleg_vars}{bleg_vars}}}"
+                f"{endpoint}"
             )
             logger.info(
-                f"ESL originate → {phone} "
+                f"ESL originate u2192 {phone} "
                 f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
             )
             return await self.bgapi(cmd, job_uuid=call_uuid)
@@ -160,6 +158,8 @@ class AsyncESLConnection:
         if INTERNAL_EXTENSION_RE.fullmatch(normalized):
             domain = (internal_domain or "$${local_ip_v4}").strip()
             logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
+            # 对于AI代理呼叫，使用拨号计划扩展而不是直接连接用户
+            # 这样可以确保AI处理逻辑被执行
             return f"user/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
