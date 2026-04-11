@@ -115,7 +115,7 @@ class AsyncESLConnection:
             # 内部分机：user/ endpoint 通过 directory 查找注册信息（自动处理 NAT），
             # B-leg 接通后直接链式执行 post-dial apps，不走 dialplan。
             # 这样 audio_stream 在非 bridged 通道上运行，可以正常捕获用户麦克风。
-            # 注意：& 连接的 apps 在 B-leg 上顺序执行，socket 会长时间占用。
+            # ${uuid} 在 post-dial apps 中解析为 B-leg 自身的 UUID。
             internal_vars = (
                 f"origination_uuid={call_uuid},"
                 f"ai_agent=true,"
@@ -136,7 +136,7 @@ class AsyncESLConnection:
                 f"&audio_stream(ws://backend:8765/${{uuid}} 8000 read 20)"
                 f"&socket(backend:9999 async full)"
             )
-        else:
+        elif endpoint_type == "pstn":
             # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
             # 扩展会 answer → record_session → socket(backend:9999)
             # 添加 export_ 前缀使变量传递到 B-leg（PSTN 通道）
