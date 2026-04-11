@@ -183,6 +183,13 @@
         <param name="apply-register-acl" value="domains"/>
         <param name="local-network-acl"  value="localnet.auto"/>
 
+        <!-- NAT 穿透（Docker 容器部署必须配置，否则 SDP 中为容器内网 IP） -->
+        <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+        <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+        <param name="apply-nat-acl" value="nat.auto"/>
+        <param name="disable-srv-lookups" value="true"/>
+        <param name="auto-rtp-bug" value="true"/>
+
         <!-- 需要鉴权 -->
         <param name="auth-calls"      value="true"/>
         <param name="auth-all-packets" value="false"/>

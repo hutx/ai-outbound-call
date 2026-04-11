@@ -17,6 +17,7 @@ ENV/
 
 docker/postgres_data/
 docker/recordings/
+docker/docker/
 docker/logs/
 docker/redis_data/
 docker/.env
