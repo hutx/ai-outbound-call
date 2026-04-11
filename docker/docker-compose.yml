@@ -61,11 +61,14 @@ services:
 
   # ── FreeSWITCH ─────────────────────────────────────────────
   freeswitch:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.freeswitch-ai
     #
     # ★ 推荐镜像：drachtio/freeswitch-modules（含常用模块，开箱即用）
     #   备选：signalwire/freeswitch:1.10.10（官方，更新，但部分模块需手动安装）
     #
-    image: docker.io/library/freeswitch-sudio:latest  
+    image: freeswitch-ai:latest  
     # image: safarov/freeswitch:latest
     # image: rocketchat/freeswitch:latest
     # image: ghcr.io/patrickbaus/freeswitch-docker:master
@@ -182,7 +185,7 @@ services:
       FS_ESL_PASSWORD:       ${FS_ESL_PASSWORD:-ClueCon}
       FS_SOCKET_PORT:        9999
       FS_GATEWAY:            ${FS_GATEWAY:-carrier_trunk}
-      FS_INTERNAL_DOMAIN:    ${FS_INTERNAL_DOMAIN:-192.168.2.5}
+      FS_INTERNAL_DOMAIN:    ${FS_INTERNAL_DOMAIN:-192.168.5.15}
       FS_RECORDING_PATH:     /recordings
       FS_ORIGINATE_TIMEOUT:  ${FS_ORIGINATE_TIMEOUT:-30}
       # FreeSWITCH 反连后端的 socket 地址（容器内使用服务名）
@@ -233,8 +236,10 @@ services:
       SCRIPTS_PATH:          ${SCRIPTS_PATH:-}
       TZ:                    Asia/Shanghai
     volumes:
+      - ../backend:/app/backend:ro
+      - ../frontend:/app/frontend:ro
       - ./docker/recordings:/recordings
-      - tts_cache:/tmp/tts_cache
+      - ./tts_cache:/tmp/tts_cache
       - ./logs/backend:/var/log/backend
     ports:
       - "8000:8000"

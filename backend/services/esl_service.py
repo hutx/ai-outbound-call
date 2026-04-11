@@ -101,78 +101,64 @@ class AsyncESLConnection:
         发起外呼。所有业务参数作为 channel 变量传入，
         CallAgent 通过 ESL channel_vars 读取。
 
-        内部分机模式：同步 originate 等 B-leg 接听，然后转移 A-leg 到 AI_CALL。
-        PSTN 模式：通过 bgapi + dialplan 的 ai_outbound_answered 扩展处理。
+        流程：
+          - 内部分机：user/ 目录查找 → B-leg 应答后 execute_on_answer 触发 socket
+          - PSTN 外呼：bgapi 异步发起，由 dialplan ai_outbound_answered 处理
         """
-        endpoint, target_type, dest = self._build_originate_target(
+        endpoint, target_type, _ = self._build_originate_target(
             phone=phone,
             gateway=gateway,
             internal_domain=internal_domain,
         )
 
-        if target_type == "internal_extension":
-            # 内部分机：同步 originate，等 B-leg 接听后再转移 A-leg
-            cmd = (
-                f"originate {{"
-                f"origination_uuid={call_uuid},"
-                f"ai_agent=true,"
-                f"export:ai_agent=true,"
-                f"export:task_id={task_id},"
-                f"export:script_id={script_id},"
-                f"export:call_target_type={target_type},"
-                f"export:original_destination={phone},"
-                f"origination_caller_id_number={caller_id},"
-                f"originate_timeout={originate_timeout}"
-                f"}}"
-                f"{endpoint} &park"
-            )
-            logger.info(
-                f"ESL originate → {phone} "
-                f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
-            )
-            # 使用同步 api originate，阻塞直到 B-leg 接听
-            result = await self.api(cmd)
-
-            if "+OK" in result or call_uuid in result:
-                # B-leg 已接听，立即转移 A-leg 到 AI handler
-                asyncio.create_task(self._transfer_to_ai_handler(call_uuid))
-                return f"answered:{call_uuid}"
-            return result
-
-        # PSTN 外呼：使用 bgapi + dialplan 处理
-        cmd = (
-            f"originate {{"
-            f"origination_uuid={call_uuid},"
-            f"export:ai_agent=true,"
+        # 业务变量传给 B-leg
+        bleg_vars = (
             f"export:task_id={task_id},"
             f"export:script_id={script_id},"
             f"export:call_target_type={target_type},"
             f"export:original_destination={phone},"
+        )
+
+        aleg_vars = (
+            f"origination_uuid={call_uuid},"
+            f"export:ai_agent=true,"
+            f"continue_on_fail=USER_BUSY,NO_ANSWER,TIMEOUT,NO_ROUTE_DESTINATION,"
             f"origination_caller_id_number={caller_id},"
-            f"originate_timeout={originate_timeout}"
-            f"}}"
-            f"{endpoint} &park"
+            f"originate_timeout={originate_timeout},"
+        )
+
+        if target_type == "internal_extension":
+            # 内部分机：user/ 目录查找绕过 dialplan，
+            # 用 execute_on_answer 在 B-leg 应答后直接执行 socket 连接后端
+            socket_cmd = f"socket {socket_host}:{socket_port} async full"
+            cmd = (
+                f"originate {{{aleg_vars}{bleg_vars}"
+                f"execute_on_answer='{socket_cmd}'}}"
+                f"{endpoint} &park()"
+            )
+            logger.info(
+                f"ESL originate → {phone} "
+                f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
+            )
+            return await self.bgapi(cmd, job_uuid=call_uuid)
+
+        # PSTN 外呼
+        cmd = (
+            f"originate {{{aleg_vars}{bleg_vars}}}"
+            f"{endpoint} &park()"
         )
         logger.info(
             f"ESL originate → {phone} "
-            f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type}, dest={dest})"
+            f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
         )
-        result = await self.bgapi(cmd, job_uuid=call_uuid)
-        return result
-
-    async def _transfer_to_ai_handler(self, call_uuid: str):
-        """内部分机接通后，将 A-leg 转接到 AI_CALL 扩展以连接后端 socket"""
-        try:
-            result = await self.api(f"uuid_transfer {call_uuid} AI_CALL XML default")
-            logger.info(f"[{call_uuid[:8]}] uuid_transfer AI_CALL: {result.strip()[:100]}")
-        except Exception as e:
-            logger.error(f"[{call_uuid[:8]}] uuid_transfer 失败: {e}")
+        return await self.bgapi(cmd, job_uuid=call_uuid)
 
     @staticmethod
     def _build_originate_target(phone: str, gateway: str, internal_domain: str) -> tuple[str, str, str]:
         normalized = (phone or "").strip()
         if INTERNAL_EXTENSION_RE.fullmatch(normalized):
             domain = (internal_domain or "$${local_ip_v4}").strip()
+            logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
             return f"user/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
@@ -542,11 +528,8 @@ class ESLSocketCallSession:
     async def start_audio_capture(self) -> asyncio.Queue:
         """开始捕获通话音频，返回 PCM 数据队列
 
-        优先级：
-          1. mod_audio_stream（通过 ESL pool 启动 uuid_audio_stream API）
-          2. 文件轮询（读取 dialplan record_session 写入的录音文件）
-
-        幂等：已启动后直接返回现有队列，不重复调用 uuid_audio_stream。
+        mod_audio_stream 已由 dialplan 的 audio_stream 指令启动，
+        此处仅等待 WebSocket 连接建立并返回队列。
         """
         if not self._uuid:
             logger.warning("无法启动音频捕获: UUID 为空")
@@ -558,45 +541,22 @@ class ESLSocketCallSession:
             logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}，跳过重复启动")
             return self._audio_queue
 
-        # 1. 尝试 mod_audio_stream WebSocket（如果 dialplan 没有 record_session 占用 media bug）
-        if self.esl_pool:
-            try:
-                ws_url = f"ws://backend:8765/{self._uuid}"
-                result = await self.esl_pool.api(
-                    f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
-                )
-                result_text = result.strip()
-                logger.info(f"[{self._uuid}] uuid_audio_stream 结果: {result_text[:100]}")
-                if result_text.startswith("+OK"):
-                    self._audio_mode = "audio_stream"
-                else:
-                    logger.debug(f"[{self._uuid}] uuid_audio_stream 返回错误: {result_text[:60]}，使用文件轮询")
-                    self._audio_mode = "file_poll"
-            except Exception as e:
-                logger.debug(f"[{self._uuid}] uuid_audio_stream 调用异常: {e}，使用文件轮询")
-                self._audio_mode = "file_poll"
-
-        # 2. 获取 WebSocket 会话队列
-        if self._audio_mode == "audio_stream" and self.ws_server:
+        # dialplan 已启动 audio_stream，等待 WebSocket 连接建立
+        if self.ws_server:
             ws_queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
             if ws_queue is not None:
                 logger.info(f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket")
+                self._audio_mode = "websocket"
                 self._audio_started = True
                 return ws_queue
             logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
-            self._audio_mode = "file_poll"
 
-        # 3. 文件轮询：dialplan 的 record_session 已在写入 /recordings/asr_${uuid}.raw
-        #    无需调用 uuid_record（会与 record_session 的 media bug 冲突）
-        if self._audio_mode == "file_poll":
-            asr_path = f"/recordings/asr_{self._uuid}.raw"
-            self._audio_started = True
-            logger.info(f"[{self._uuid}] 音频采集: 文件轮询 {asr_path}（dialplan record_session）")
-            asyncio.create_task(self._poll_audio_file(asr_path))
-            return self._audio_queue
-
-        logger.warning(f"[{self._uuid}] 音频采集不可用，ASR 将无法工作")
-        self._audio_mode = "none"
+        # 降级：文件轮询
+        asr_path = f"/recordings/asr_{self._uuid}.raw"
+        self._audio_mode = "file_poll"
+        self._audio_started = True
+        logger.info(f"[{self._uuid}] 音频采集: 文件轮询 {asr_path}（dialplan record_session）")
+        asyncio.create_task(self._poll_audio_file(asr_path))
         return self._audio_queue
 
     async def _poll_audio_file(self, path: str):
