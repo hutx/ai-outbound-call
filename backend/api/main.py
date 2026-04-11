@@ -27,7 +27,7 @@ from backend.core.config import config
 from backend.core.call_agent import CallAgent
 from backend.core.scheduler import TaskScheduler
 from backend.core.state_machine import CallContext, CallResult
-from backend.services.esl_service import AsyncESLPool, ESLSocketServer, ESLSocketCallSession
+from backend.services.esl_service import AsyncESLPool, ESLSocketServer, ESLSocketCallSession, ESLEventListener
 from backend.services.asr_service import create_asr_client
 from backend.services.audio_stream_ws import AudioStreamWebSocket
 from backend.services.tts_service import create_tts_client
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # 全局单例
 # ─────────────────────────────────────────────────────────────
 _esl_pool: Optional[AsyncESLPool] = None
+_esl_listener: Optional[ESLEventListener] = None
 _ws_server: Optional[AudioStreamWebSocket] = None
 _asr = None
 _tts = None
@@ -151,7 +152,7 @@ async def _handle_call_session(session: ESLSocketCallSession):
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _esl_pool, _ws_server, _asr, _tts, _llm, _scheduler
+    global _esl_pool, _esl_listener, _ws_server, _asr, _tts, _llm, _scheduler
 
     logger.info("━" * 50)
     logger.info("  智能外呼系统启动")
@@ -188,12 +189,26 @@ async def lifespan(app: FastAPI):
         logger.warning(f"✗ AudioStream WebSocket 启动失败（将降级到文件轮询）: {e}")
         _ws_server = None
 
-    # ESL 连接池
+    # ESL 事件监听器（持久订阅 CHANNEL_ANSWER 等事件）
+    _esl_listener = ESLEventListener(
+        host=config.freeswitch.host,
+        port=config.freeswitch.port,
+        password=config.freeswitch.password,
+    )
+    try:
+        await _esl_listener.start()
+        logger.info("✓ ESL 事件监听器就绪")
+    except Exception as e:
+        logger.warning(f"✗ ESL 事件监听器启动失败（将降级轮询）: {e}")
+        _esl_listener = None
+
+    # ESL 连接池（传入事件监听器用于应答检测）
     _esl_pool = AsyncESLPool(
         host=config.freeswitch.host,
         port=config.freeswitch.port,
         password=config.freeswitch.password,
         pool_size=5,
+        event_listener=_esl_listener,
     )
     try:
         await _esl_pool.start()
@@ -249,6 +264,9 @@ async def lifespan(app: FastAPI):
 
     if _esl_pool:
         await _esl_pool.stop()
+
+    if _esl_listener:
+        await _esl_listener.stop()
 
     await dispose_db()
     logger.info("服务已关闭")
