@@ -82,6 +82,7 @@ class AsyncESLConnection:
             await self._send(f"bgapi {command}\nJob-UUID: {job_uuid}\n\n")
             event = await asyncio.wait_for(self._read_event(), timeout=10.0)
             self._last_used = time.time()
+        logger.debug(f"bgapi 回复 event keys: {list(event.keys())}, Reply-Text: {event.get('Reply-Text', '')[:100]}")
         reply = event.get("Reply-Text", "")
         if "+OK" in reply:
             return job_uuid
@@ -101,14 +102,8 @@ class AsyncESLConnection:
         internal_domain: str = "$${local_ip_v4}",
     ) -> str:
         """
-        发起外呼。所有业务参数作为 channel 变量传入，
-        CallAgent 通过 ESL channel_vars 读取。
-
-        流程：
-          1. bgapi originate → B-leg 振铃后 &park()
-          2. 监听 CHANNEL_ANSWER 事件
-          3. uuid_audio_stream 启动 WebSocket 音频流
-          4. uuid_broadcast socket 连接后端:9999（ESL Outbound 模式）
+        发起外呼。使用同步 api originate。
+        变量通过 originate 的 [ ] 语法传入。
         """
         endpoint, target_type, _ = self._build_originate_target(
             phone=phone,
@@ -119,31 +114,30 @@ class AsyncESLConnection:
         channel_vars = (
             f"origination_uuid={call_uuid},"
             f"ai_agent=true,"
-            f"export:task_id={task_id},"
-            f"export:script_id={script_id},"
-            f"export:call_target_type={target_type},"
-            f"export:original_destination={phone},"
-            f"continue_on_fail=USER_BUSY,NO_ANSWER,TIMEOUT,NO_ROUTE_DESTINATION,"
+            f"task_id={task_id},"
+            f"script_id={script_id},"
+            f"call_target_type={target_type},"
+            f"original_destination={phone},"
             f"origination_caller_id_number={caller_id},"
-            f"originate_timeout={originate_timeout},"
+            f"originate_timeout={originate_timeout}"
         )
 
         cmd = (
             f"originate [{channel_vars}]"
-            f"{endpoint} &park()"
+            f"{endpoint} &socket(backend:9999 full)"
         )
+        logger.debug(f"ESL 发送 originate 命令: {cmd[:200]}")
         logger.info(
             f"ESL originate → {phone} "
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
         )
-        result = await self.bgapi(cmd, job_uuid=call_uuid)
+        # 使用 bgapi（非阻塞，&socket 会长时间阻塞 api 调用）
+        job_uuid = await self.bgapi(cmd, job_uuid=call_uuid)
+        logger.info(f"ESL originate 回复: {job_uuid}")
+        if job_uuid.startswith("-ERR"):
+            raise ESLError(f"originate 失败: {job_uuid}")
 
-        # B-leg 应答后启动 AI 流程
-        asyncio.create_task(
-            self._on_call_answered(call_uuid, phone, task_id, script_id, target_type)
-        )
-
-        return result
+        return call_uuid
 
     async def _on_call_answered(
         self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str
@@ -232,6 +226,7 @@ class AsyncESLConnection:
 
     async def _read_event(self) -> dict:
         headers: dict = {}
+        found_headers = False
         while True:
             try:
                 line = await self._reader.readline()
@@ -243,7 +238,237 @@ class AsyncESLConnection:
                 raise ESLError("ESL 连接断开（EOF）")
             line = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
+                if not found_headers:
+                    continue  # Skip leading empty lines (FreeSWITCH auth response has leading \n)
                 break
+            found_headers = True
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers[k.strip()] = v.strip()
+        content_length = int(headers.get("Content-Length", 0))
+        if content_length > 0:
+            body = await self._reader.readexactly(content_length)
+            headers["_body"] = body.decode("utf-8", errors="replace")
+        return headers
+
+
+# ─────────────────────────────────────────────────────────────
+# ESL 事件监听器（专用持久连接）
+# ─────────────────────────────────────────────────────────────
+class ESLEventListener:
+    """
+    专用 ESL 连接，持久订阅 FreeSWITCH 事件。
+    在应用启动时建立连接并订阅， originate 前注册回调，
+    避免 originate 后再订阅导致事件丢失。
+    """
+
+    def __init__(self, host: str, port: int, password: str):
+        self.host = host
+        self.port = port
+        self.password = password
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._connected = False
+        self._running = True  # 控制重连循环
+        # uuid → asyncio.Queue (等待该 uuid 的 CHANNEL_ANSWER)
+        self._waiters: dict[str, asyncio.Queue] = {}
+        self._job_waiters: dict[str, asyncio.Queue] = {}  # job_uuid → Queue (BACKGROUND_JOB)
+        self._listener_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._writer is not None and not self._writer.is_closing()
+
+    async def start(self):
+        """建立连接、认证、订阅事件，开始后台监听循环（含自动重连）。"""
+        self._listener_task = asyncio.create_task(self._connect_and_listen())
+        logger.info(f"ESL 事件监听器启动中: {self.host}:{self.port}")
+
+    async def _connect_and_listen(self):
+        """带重连的连接-监听循环。"""
+        retry_delay = 3.0
+        while self._running:
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port), timeout=5.0
+                )
+                event = await asyncio.wait_for(self._read_event(), timeout=5.0)
+                if event.get("Content-Type") != "auth/request":
+                    raise ESLError(f"期望 auth/request，收到: {event}")
+                await self._send(f"auth {self.password}\n\n")
+                reply = await asyncio.wait_for(self._read_event(), timeout=5.0)
+                if "+OK" not in reply.get("Reply-Text", ""):
+                    raise ESLError(f"ESL 认证失败: {reply}")
+
+                await self._send("event CHANNEL_ANSWER CHANNEL_HANGUP CHANNEL_HANGUP_COMPLETE BACKGROUND_JOB\n\n")
+                reply = await asyncio.wait_for(self._read_event(), timeout=5.0)
+                if "+OK" not in reply.get("Reply-Text", ""):
+                    logger.warning(f"事件订阅回复异常: {reply.get('Reply-Text', '')}")
+
+                self._connected = True
+                retry_delay = 3.0
+                logger.info(f"ESL 事件监听器就绪: {self.host}:{self.port}")
+
+                # 进入监听循环
+                await self._listen_loop()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._connected = False
+                if self._running:
+                    logger.warning(f"ESL 事件监听器连接失败，{retry_delay}s 后重试: {e}")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+
+    async def stop(self):
+        self._running = False
+        self._connected = False
+        if self._listener_task:
+            self._listener_task.cancel()
+            await asyncio.gather(self._listener_task, return_exceptions=True)
+        # 唤醒所有等待者
+        for queue in self._waiters.values():
+            await queue.put({"type": "listener_stopped"})
+        self._waiters.clear()
+        if self._writer:
+            try:
+                self._writer.close()
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=2.0)
+            except Exception:
+                pass
+        logger.info("ESL 事件监听器已关闭")
+
+    def register_waiter(self, call_uuid: str) -> asyncio.Queue:
+        """注册一个等待队列， originate 前调用。"""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._waiters[call_uuid] = queue
+        return queue
+
+    def register_job_waiter(self, job_uuid: str) -> asyncio.Queue:
+        """注册 BACKGROUND_JOB 等待队列。"""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._job_waiters[job_uuid] = queue
+        return queue
+
+    def unregister_job_waiter(self, job_uuid: str):
+        self._job_waiters.pop(job_uuid, None)
+
+    def unregister_waiter(self, call_uuid: str):
+        """移除等待队列。"""
+        self._waiters.pop(call_uuid, None)
+
+    async def wait_for_answer(self, call_uuid: str, timeout: float = 60.0) -> Optional[dict]:
+        """等待指定 UUID 的 CHANNEL_ANSWER 事件。"""
+        queue = self.register_waiter(call_uuid)
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=timeout)
+            if event.get("type") == "listener_stopped":
+                logger.warning(f"[{call_uuid[:8]}] 事件监听器已停止")
+                return None
+            return event
+        except asyncio.TimeoutError:
+            logger.warning(f"[{call_uuid[:8]}] 等待 CHANNEL_ANSWER 超时 ({timeout}s)")
+            return None
+        finally:
+            self.unregister_waiter(call_uuid)
+
+    async def _listen_loop(self):
+        """持续读取 ESL 事件，分发给等待者。"""
+        while self._connected and self._running:
+            try:
+                event = await asyncio.wait_for(self._read_event(), timeout=60.0)
+            except asyncio.CancelledError:
+                break
+            except (asyncio.TimeoutError, Exception):
+                self._connected = False
+                logger.warning("ESL 事件监听器连接断开")
+                break
+
+            # text/event-plain 格式：事件数据在 _body 中
+            if "_body" in event:
+                for line in event["_body"].split("\n"):
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        event[k.strip()] = v.strip()
+
+            event_name = event.get("Event-Name", "")
+            unique_id = event.get("Unique-ID", "")
+            orig_uuid = event.get("variable_origination_uuid", "")
+            call_uuid = unique_id or orig_uuid
+
+            if event_name == "CHANNEL_ANSWER":
+                async with self._lock:
+                    waiter = self._waiters.get(call_uuid)
+                    if waiter:
+                        try:
+                            waiter.put_nowait({"type": "answered", "uuid": call_uuid, "event": event})
+                        except asyncio.QueueFull:
+                            pass
+                    else:
+                        # 没有精确匹配的 waiter，尝试 origination_uuid 匹配
+                        for uuid_key, q in list(self._waiters.items()):
+                            if uuid_key != call_uuid and (
+                                event.get(f"variable_origination_uuid", "") == uuid_key
+                                or event.get("Channel-Call-UUID", "") == uuid_key
+                            ):
+                                try:
+                                    q.put_nowait({"type": "answered", "uuid": call_uuid, "event": event})
+                                except asyncio.QueueFull:
+                                    pass
+                                break
+
+            elif event_name in ("CHANNEL_HANGUP", "CHANNEL_HANGUP_COMPLETE"):
+                # 唤醒可能还在等待的 waiter
+                async with self._lock:
+                    waiter = self._waiters.get(call_uuid)
+                    if waiter:
+                        try:
+                            waiter.put_nowait({"type": "hangup", "uuid": call_uuid, "event": event})
+                        except asyncio.QueueFull:
+                            pass
+
+            elif event_name == "BACKGROUND_JOB":
+                job_uuid = event.get("Job-UUID", "")
+                async with self._lock:
+                    job_waiter = self._job_waiters.get(job_uuid)
+                    if job_waiter:
+                        try:
+                            job_waiter.put_nowait({"type": "bgapi_result", "event": event})
+                        except asyncio.QueueFull:
+                            pass
+                        finally:
+                            self._job_waiters.pop(job_uuid, None)
+
+            logger.debug(
+                f"ESL Event: {event_name} uuid={call_uuid[:8] if call_uuid else '???'}"
+            )
+
+    async def _send(self, data: str):
+        self._writer.write(data.encode())
+        await self._writer.drain()
+
+    async def _read_event(self) -> dict:
+        headers: dict = {}
+        found_headers = False
+        while True:
+            try:
+                line = await self._reader.readline()
+            except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
+                self._connected = False
+                raise ESLError("ESL 连接断开")
+            if not line:
+                self._connected = False
+                raise ESLError("ESL 连接断开（EOF）")
+            line = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if not found_headers:
+                    # Skip leading empty lines (FreeSWITCH may send extra \n)
+                    continue
+                # End of headers
+                break
+            found_headers = True
             if ":" in line:
                 k, _, v = line.partition(":")
                 headers[k.strip()] = v.strip()
@@ -272,6 +497,7 @@ class AsyncESLPool:
         password: str,
         pool_size: int = 5,
         idle_timeout: float = 60.0,
+        event_listener: Optional[ESLEventListener] = None,
     ):
         self._host = host
         self._port = port
@@ -282,6 +508,7 @@ class AsyncESLPool:
         self._sem = asyncio.Semaphore(pool_size)
         self._pool_lock = asyncio.Lock()
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._event_listener = event_listener
 
     async def start(self):
         for _ in range(self._pool_size):
@@ -305,10 +532,130 @@ class AsyncESLPool:
         logger.info("ESL 连接池已关闭")
 
     async def originate(self, **kwargs) -> str:
-        async with self._sem:
-            conn = await self._acquire()
-            job_uuid = await conn.originate(**kwargs)
-            return job_uuid
+        """
+        使用专用连接发起 originate，避免事件订阅干扰命令回复。
+        每次 originate 创建独立连接，命令完成后关闭。
+        """
+        call_uuid = kwargs.get("call_uuid", "")
+        job_uuid = kwargs.get("job_uuid", "") or call_uuid
+
+        # 在 originate 之前就注册 waiter，避免事件丢失
+        answer_queue = None
+        job_queue = None
+        if self._event_listener and self._event_listener.is_connected and call_uuid:
+            answer_queue = self._event_listener.register_waiter(call_uuid)
+            job_queue = self._event_listener.register_job_waiter(job_uuid)
+
+        # 创建专用连接
+        conn = AsyncESLConnection(self._host, self._port, self._password)
+        try:
+            await asyncio.wait_for(conn.connect(), timeout=5.0)
+            returned_job_uuid = await conn.originate(**kwargs)
+        finally:
+            await conn.close()
+
+        # 检查 BACKGROUND_JOB 获取真实 originate 结果
+        if job_queue is not None:
+            asyncio.create_task(
+                self._wait_and_validate_originate_result(call_uuid, returned_job_uuid, answer_queue, job_queue, kwargs)
+            )
+        elif answer_queue is not None:
+            # 降级：只等待 CHANNEL_ANSWER
+            asyncio.create_task(
+                self._wait_and_start_ai_from_queue(call_uuid, answer_queue, kwargs)
+            )
+        else:
+            logger.warning(f"ESL 事件监听器不可用，originate 后将无法可靠检测应答")
+
+        return returned_job_uuid
+
+    async def _wait_and_validate_originate_result(
+        self, call_uuid: str, job_uuid: str,
+        answer_queue: asyncio.Queue | None,
+        job_queue: asyncio.Queue,
+        kwargs: dict,
+    ):
+        """等待 BACKGROUND_JOB 事件确认 originate 结果，成功后再等 CHANNEL_ANSWER。"""
+        try:
+            job_result = await asyncio.wait_for(job_queue.get(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{call_uuid[:8]}] 等待 BACKGROUND_JOB 超时 (30.0s)")
+            # 超时不代表失败，继续等 CHANNEL_ANSWER
+            if answer_queue is not None:
+                asyncio.create_task(
+                    self._wait_and_start_ai_from_queue(call_uuid, answer_queue, kwargs)
+                )
+            return
+        except asyncio.CancelledError:
+            return
+
+        event = job_result.get("event", {})
+        job_action = event.get("Job-Action", "")
+        reply_text = event.get("Job-Response", "") or event.get("Reply-Text", "")
+
+        # BACKGROUND_JOB 中 Reply-Text 通常是 "+OK Result-Header" 或 "+ERR ..."
+        if "-ERR" in reply_text or "ERR" in reply_text:
+            logger.error(f"[{call_uuid[:8]}] originate 失败 (BACKGROUND_JOB): {reply_text.strip()[:200]}")
+            return
+
+        logger.info(f"[{call_uuid[:8]}] originate 成功 (BACKGROUND_JOB): {job_action}")
+
+        # originate 成功，继续等待 CHANNEL_ANSWER
+        if answer_queue is not None:
+            await self._wait_and_start_ai_from_queue(call_uuid, answer_queue, kwargs)
+
+    async def _wait_and_start_ai_from_queue(self, call_uuid: str, queue: asyncio.Queue, kwargs: dict):
+        """从已注册的 queue 等待 CHANNEL_ANSWER，跟踪呼叫状态。"""
+        try:
+            result = await asyncio.wait_for(queue.get(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{call_uuid[:8]}] 等待 CHANNEL_ANSWER 超时 (60.0s)")
+            return
+        except asyncio.CancelledError:
+            return
+
+        if result.get("type") != "answered":
+            logger.warning(f"[{call_uuid[:8]}] 未收到 CHANNEL_ANSWER 事件")
+            return
+
+        answered_uuid = result.get("uuid", call_uuid)
+        logger.info(f"[{call_uuid[:8]}] 收到 CHANNEL_ANSWER (实际 uuid={answered_uuid[:8]})")
+        # socket 连接已建立，CallAgent 由 ESLSocketCallSession 自动启动，无需额外操作
+
+    async def _wait_and_start_ai(self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str):
+        """
+        等待 CHANNEL_ANSWER 事件，收到后启动 uuid_audio_stream + uuid_broadcast。
+        使用事件监听器的持久连接，不依赖 pool 连接。
+        """
+        assert self._event_listener is not None
+        event = await self._event_listener.wait_for_answer(call_uuid, timeout=60.0)
+        if event is None or event.get("type") != "answered":
+            logger.warning(f"[{call_uuid[:8]}] 未收到 CHANNEL_ANSWER 事件")
+            return
+
+        answered_uuid = event.get("uuid", call_uuid)
+        logger.info(f"[{call_uuid[:8]}] 收到 CHANNEL_ANSWER (实际 uuid={answered_uuid[:8]})")
+
+        # 使用 pool 的任意连接执行 API 调用
+        ws_url = f"ws://backend:8765/{answered_uuid}"
+        socket_addr = "backend:9999 async full"
+
+        # 1. 启动 mod_audio_stream
+        try:
+            result = await self.api(f"uuid_audio_stream {answered_uuid} start {ws_url} mono 8000")
+            if result.strip().startswith("+OK"):
+                logger.info(f"[{call_uuid[:8]}] uuid_audio_stream 启动成功: {ws_url}")
+            else:
+                logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}")
+        except Exception as e:
+            logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 失败: {e}")
+
+        # 2. 广播 socket 应用连接后端 ESL Outbound
+        try:
+            result = await self.api(f"uuid_broadcast {answered_uuid} {socket_addr} both")
+            logger.info(f"[{call_uuid[:8]}] uuid_broadcast socket 结果: {result.strip()[:100]}")
+        except Exception as e:
+            logger.error(f"[{call_uuid[:8]}] uuid_broadcast socket 失败: {e}")
 
     async def wait_for_event(self, event_name: str, filter_key: str, filter_value: str, timeout: float = 30.0) -> Optional[dict]:
         async with self._sem:
@@ -779,6 +1126,7 @@ class ESLSocketCallSession:
 
     async def _read_event(self) -> dict:
         headers: dict = {}
+        found_headers = False
         while True:
             try:
                 line = await self._reader.readline()
@@ -788,7 +1136,10 @@ class ESLSocketCallSession:
                 raise ESLError("连接断开（EOF）")
             line = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
+                if not found_headers:
+                    continue
                 break
+            found_headers = True
             if ":" in line:
                 k, _, v = line.partition(":")
                 headers[k.strip()] = v.strip()
