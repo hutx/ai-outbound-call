@@ -112,10 +112,11 @@ class AsyncESLConnection:
         )
 
         if endpoint_type == "internal_extension":
-            # 内部分机：user/ endpoint 通过 directory 查找注册信息（自动处理 NAT），
-            # B-leg 接通后直接链式执行 post-dial apps，不走 dialplan。
-            # 这样 audio_stream 在非 bridged 通道上运行，可以正常捕获用户麦克风。
+            # 内部分机：sofia/internal/ endpoint 绕过 directory + dialplan，
+            # 直接 SIP INVITE 到分机，B-leg 接通后执行 post-dial apps。
             # ${uuid} 在 post-dial apps 中解析为 B-leg 自身的 UUID。
+            domain = (internal_domain or "$${local_ip_v4}").strip()
+            sofia_endpoint = f"sofia/internal/{phone}@{domain}"
             internal_vars = (
                 f"origination_uuid={call_uuid},"
                 f"ai_agent=true,"
@@ -127,7 +128,7 @@ class AsyncESLConnection:
             )
             cmd = (
                 f"originate [{internal_vars}] "
-                f"{endpoint} "
+                f"{sofia_endpoint} "
                 f"&answer()"
                 f"&sleep(500)"
                 f"&set(RECORD_STEREO=false)"
