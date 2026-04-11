@@ -114,28 +114,8 @@
 
   </context>
 
-  <context name="internal">
-    <extension name="process_leg_B">
-      <condition field="${process_callee_leg}" expression="^true$"/>
-      <action application="answer"/>
-      <action application="reset_mediabug_write"/>
-      <action application="set" data="sip_auto_answer=true"/>
-      <action application="set" data="ringback=${us-ring}"/>
-      <action application="set" data="transfer_ringback=${us-ring}"/>
-      <action application="set" data="call_timeout=30"/>
-      <action application="set" data="hangup_after_bridge=true"/>
-      <action application="set" data="continue_on_fail=USER_BUSY,NO_ANSWER,TIMEOUT"/>
-      <action application="bridge" data="${user_call(${dialed_extension}@${dialed_domain})}"/>
-    </extension>
-  </context>
 
-  <context name="agents">
-    <extension name="agent_queue">
-      <condition field="destination_number" expression="^\d+$">
-        <action application="answer"/>
-        <action application="fifo" data="agent_queue@default in /recordings/wait_music.wav"/>
-      </condition>
-    </extension>
-  </context>
+
+
 
 </include>

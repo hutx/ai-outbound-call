@@ -102,8 +102,9 @@ class AsyncESLConnection:
         CallAgent 通过 ESL channel_vars 读取。
 
         流程：
-          - 内部分机：user/ 目录查找 → B-leg 应答后 execute_on_answer 触发 socket
-          - PSTN 外呼：bgapi 异步发起，由 dialplan ai_outbound_answered 处理
+          - B-leg 应答后进入 internal context 的 XML dialplan
+          - 匹配 AI_Agent_Call 扩展 → audio_stream + socket(backend:9999)
+          - PSTN 外呼：由 dialplan ai_outbound_answered 处理
         """
         endpoint, target_type, _ = self._build_originate_target(
             phone=phone,
@@ -111,49 +112,23 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
-        # 业务变量传给 B-leg
-        bleg_vars = (
+        # 业务变量：ai_agent=true 让 B-leg 在 dialplan 中匹配 AI 扩展
+        channel_vars = (
+            f"origination_uuid={call_uuid},"
+            f"ai_agent=true,"
             f"export:task_id={task_id},"
             f"export:script_id={script_id},"
             f"export:call_target_type={target_type},"
             f"export:original_destination={phone},"
-        )
-
-        aleg_vars = (
-            f"origination_uuid={call_uuid},"
-            f"export:ai_agent=true,"
             f"continue_on_fail=USER_BUSY,NO_ANSWER,TIMEOUT,NO_ROUTE_DESTINATION,"
             f"origination_caller_id_number={caller_id},"
             f"originate_timeout={originate_timeout},"
         )
 
-        if target_type == "internal_extension":
-            # 内部分机：B-leg 接听后通过 execute_on_answer 显式转到 AI dialplan
-            context = "internal"
-            var_str = f"{aleg_vars}{bleg_vars}"
-            cmd = (
-                f"originate "
-                f"{{{var_str},"
-                f"origination_caller_id_number={caller_id},"
-                f"origination_uuid={call_uuid},"
-                f"execute_on_answer='transfer AI_Agent_Call xml {context}',"
-                f"ignore_early_media=true}} "
-                f"{endpoint} &park()"
-            )
-        else:
-            # PSTN 外呼：B-leg 接听后转到 default context 的 AI handler
-            context = "default"
-            var_str = f"{aleg_vars}{bleg_vars}"
-            cmd = (
-                f"originate "
-                f"{{{var_str},"
-                f"origination_caller_id_number={caller_id},"
-                f"origination_uuid={call_uuid},"
-                f"execute_on_answer='transfer ai_outbound_answered xml {context}',"
-                f"ignore_early_media=true}} "
-                f"{endpoint} &park()"
-            )
-
+        cmd = (
+            f"originate {{{channel_vars}}}"
+            f"{endpoint} &park()"
+        )
         logger.info(
             f"ESL originate → {phone} "
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
