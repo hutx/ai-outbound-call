@@ -87,43 +87,6 @@ class AsyncESLConnection:
             return job_uuid
         raise ESLError(f"bgapi 失败: {reply}")
 
-    async def wait_for_event(
-        self, event_name: str, filter_key: str, filter_value: str, timeout: float = 30.0
-    ) -> Optional[dict]:
-        """
-        创建临时 ESL 连接，订阅指定事件，等待匹配的事件到达。
-        用于监听 originate 后的 CHANNEL_ANSWER 等异步事件。
-        """
-        conn = AsyncESLConnection(self.host, self.port, self.password)
-        try:
-            await asyncio.wait_for(conn.connect(), timeout=5.0)
-            # 订阅指定事件
-            await conn._send(
-                f"filter {filter_key} {filter_value}\n"
-                f"event plain {event_name}\n\n"
-            )
-            # 读取 filter 和 event 命令的响应
-            await asyncio.wait_for(conn._read_event(), timeout=5.0)
-            await asyncio.wait_for(conn._read_event(), timeout=5.0)
-
-            deadline = asyncio.get_event_loop().time() + timeout
-            while asyncio.get_event_loop().time() < deadline:
-                remaining = deadline - asyncio.get_event_loop().time()
-                try:
-                    event = await asyncio.wait_for(conn._read_event(), timeout=min(remaining, 1.0))
-                    if event.get("Event-Name", "").upper() == event_name.upper():
-                        return event
-                except asyncio.TimeoutError:
-                    continue
-            return None
-        except Exception:
-            return None
-        finally:
-            try:
-                await conn.close()
-            except Exception:
-                pass
-
     async def originate(
         self,
         phone: str,
@@ -166,7 +129,7 @@ class AsyncESLConnection:
         )
 
         cmd = (
-            f"originate {{{channel_vars}}}"
+            f"originate [{channel_vars}]"
             f"{endpoint} &park()"
         )
         logger.info(
@@ -189,23 +152,33 @@ class AsyncESLConnection:
         B-leg 应答后：
         1. 启动 uuid_audio_stream WebSocket 音频流
         2. 广播 socket 应用连接后端 ESL Outbound 服务
+        通过轮询通道状态来检测应答（避免 ESL event 订阅时序问题）。
         """
         ws_url = f"ws://backend:8765/{call_uuid}"
         socket_addr = "backend:9999 async full"
 
         try:
-            # 等待 CHANNEL_ANSWER 事件
-            answer_event = await self._wait_for_event(
-                event_name="CHANNEL_ANSWER",
-                filter_key="Unique-ID",
-                filter_value=call_uuid,
-                timeout=60.0,
-            )
-            if not answer_event:
-                logger.warning(f"[{call_uuid[:8]}] 外呼等待应答超时")
-                return
+            # 先等待 originate 完成，通道被创建
+            await asyncio.sleep(2)
 
-            logger.info(f"[{call_uuid[:8]}] B-leg 已应答，启动 AI 流程")
+            # 轮询等待通道出现（originate 需要时间建立 B-leg）
+            channel_exists = False
+            for attempt in range(60):  # 最多等 60 秒
+                try:
+                    result = await self.api(f"uuid_dump {call_uuid}")
+                    if result and "-ERR No such channel" not in result:
+                        channel_exists = True
+                        logger.info(f"[{call_uuid[:8]}] B-leg 已建立，启动 AI 流程")
+                        break
+                    elif result and "-ERR No such channel" in result:
+                        await asyncio.sleep(1)
+                        continue
+                except Exception:
+                    await asyncio.sleep(1)
+
+            if not channel_exists:
+                logger.warning(f"[{call_uuid[:8]}] 外呼等待通道建立超时")
+                return
 
             # 1. 启动 mod_audio_stream WebSocket 音频流
             try:
