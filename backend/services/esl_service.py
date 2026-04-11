@@ -135,14 +135,32 @@ class AsyncESLConnection:
         )
 
         if endpoint_type == "internal_extension":
+            # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
+            # loopback/AI_CALL 进入 default context 的 ai_call_handler，
+            # 该扩展按顺序执行 record_session → socket(backend:9999)
             cmd = (
                 f"originate [{channel_vars}] "
                 f"{endpoint} &bridge(loopback/AI_CALL)"
             )
         else:
+            # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
+            # 扩展会 answer → record_session → socket(backend:9999)
+            # 添加 export_ 前缀使变量传递到 B-leg（PSTN 通道）
+            pstn_vars = (
+                f"origination_uuid={call_uuid},"
+                f"ai_agent=true,"
+                f"export_ai_agent=true,"
+                f"export_task_id={task_id},"
+                f"export_script_id={script_id},"
+                f"export_call_target_type={target_type},"
+                f"export_original_destination={phone},"
+                f"export_origination_uuid={call_uuid},"
+                f"origination_caller_id_number={caller_id},"
+                f"originate_timeout={originate_timeout}"
+            )
             cmd = (
-                f"originate [{channel_vars}] "
-                f"{endpoint} &park()"
+                f"originate [{pstn_vars}] "
+                f"{endpoint}"
             )
         logger.debug(f"ESL 发送 originate 命令: {cmd[:200]}")
         logger.info(
@@ -802,12 +820,23 @@ class ESLSocketCallSession:
         await self._send("divert_events on\n\n")
 
         # 在 socket 控制下启动 uuid_audio_stream
-        # 关键：stream 需要放在 A-leg（signal_bond）上才能捕获用户侧音频
-        # B-leg 上只能捕获 AI 产生的音频（TTS），用户说话时 B-leg 是静音
+        # 关键：stream 需要放在用户音频流经的通道上才能捕获人声
+        #
+        # 音频路径分析：
+        #   sofia(A-leg, 用户麦克风) ↔ loopback-a ↔ loopback-b(socket)
+        #
+        # 测试结论：
+        # - B-leg (loopback-b): 只有 TTS 期间有音频，之后全是静音
+        # - sofia A-leg: 桥接时媒体路径可能被锁定，stream 也是静音
+        # - loopback-a: 理论上桥接两边的音频都流经此通道
         if self.esl_pool and self.ws_server:
-            # 优先使用 A-leg UUID（signal_bond 是桥接对端的 UUID）
+            # 按优先级尝试不同 UUID：
+            # 1. other_loopback_leg_uuid: loopback-a 通道（桥接音频都流经此）
+            # 2. signal_bond: 桥接对端
+            # 3. 当前通道 UUID（降级方案）
             stream_uuid = (
-                self._channel_vars.get("signal_bond")
+                self._channel_vars.get("other_loopback_leg_uuid")
+                or self._channel_vars.get("signal_bond")
                 or self._uuid
             )
             ws_url = f"ws://backend:8765/{stream_uuid}"
