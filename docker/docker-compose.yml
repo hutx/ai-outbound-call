@@ -116,7 +116,7 @@ services:
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
       - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
-      - ./docker/recordings:/recordings
+      - ./recordings:/recordings
       # - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds  # 使用镜像内置声音文件
       # 日志
       - ./logs/freeswitch:/var/log/freeswitch
@@ -142,7 +142,7 @@ services:
     environment:
       JACK_NO_AUDIO_RESERVATION: "1"
       TZ: Asia/Shanghai
-      FS_EXTERNAL_IP: 219.143.45.154
+      FS_EXTERNAL_IP: 61.180.80.84
       SOUND_RATES: 8000:16000
       SOUND_TYPES: music:en-us-callie
     healthcheck:
@@ -238,7 +238,7 @@ services:
     volumes:
       - ../backend:/app/backend:ro
       - ../frontend:/app/frontend:ro
-      - ./docker/recordings:/recordings
+      - ./recordings:/recordings
       - ./tts_cache:/tmp/tts_cache
       - ./logs/backend:/var/log/backend
     ports:

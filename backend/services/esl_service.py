@@ -129,11 +129,12 @@ class AsyncESLConnection:
 
         if target_type == "internal_extension":
             # 内部分机：user/ 目录查找绕过 dialplan，
-            # 用 execute_on_answer 在 B-leg 应答后直接执行 socket 连接后端
+            # 用 execute_on_answer 在 B-leg 应答后同时启动录音 + socket 连接后端
             socket_cmd = f"socket {socket_host}:{socket_port} async full"
+            record_cmd = "record_session /recordings/asr_${uuid}.wav"
             cmd = (
                 f"originate {{{aleg_vars}{bleg_vars}"
-                f"execute_on_answer='{socket_cmd}'}}"
+                f"execute_on_answer='{record_cmd};{socket_cmd}'}}"
                 f"{endpoint} &park()"
             )
             logger.info(
@@ -321,6 +322,7 @@ class ESLSocketCallSession:
         self.ws_server = ws_server  # AudioStreamWebSocket for mod_audio_stream
         self._audio_mode: str = "unknown"  # "websocket" | "file_poll" | "custom"
         self._audio_started: bool = False  # 防止重复启动 uuid_audio_stream
+        self._active_uuid: Optional[str] = None  # CHANNEL_ANSWER 中捕获的实际通话 UUID
 
     @property
     def uuid(self) -> Optional[str]:
@@ -416,11 +418,12 @@ class ESLSocketCallSession:
         except Exception:
             estimated_duration = 3.0
 
+        target_uuid = self._active_uuid or self._uuid
         try:
             result = await self.esl_pool.api(
-                f"uuid_broadcast {self._uuid} {audio_path} both"
+                f"uuid_broadcast {target_uuid} {audio_path} both"
             )
-            logger.info(f"[{self._uuid}] uuid_broadcast 结果: {result.strip()[:100]}")
+            logger.info(f"[{self._uuid}] uuid_broadcast({target_uuid}) 结果: {result.strip()[:100]}")
         except Exception as e:
             logger.error(f"[{self._uuid}] uuid_broadcast 失败: {e}，降级 sendmsg")
             self._playback_done.clear()
@@ -528,8 +531,8 @@ class ESLSocketCallSession:
     async def start_audio_capture(self) -> asyncio.Queue:
         """开始捕获通话音频，返回 PCM 数据队列
 
-        mod_audio_stream 已由 dialplan 的 audio_stream 指令启动，
-        此处仅等待 WebSocket 连接建立并返回队列。
+        优先通过 ESL API 的 uuid_audio_stream 启动实时音频流（mod_audio_stream），
+        降级为文件轮询（uuid_record 录音）。
         """
         if not self._uuid:
             logger.warning("无法启动音频捕获: UUID 为空")
@@ -541,21 +544,42 @@ class ESLSocketCallSession:
             logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}，跳过重复启动")
             return self._audio_queue
 
-        # dialplan 已启动 audio_stream，等待 WebSocket 连接建立
-        if self.ws_server:
-            ws_queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
-            if ws_queue is not None:
-                logger.info(f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket")
-                self._audio_mode = "websocket"
-                self._audio_started = True
-                return ws_queue
-            logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
+        # 方案 1：通过 ESL API 启动 mod_audio_stream 实时音频流
+        if self.esl_pool and self.ws_server:
+            try:
+                target_uuid = self._active_uuid or self._uuid
+                ws_url = f"ws://backend:8765/{target_uuid}"
+                result = await self.esl_pool.api(
+                    f"uuid_audio_stream {target_uuid} start {ws_url} mono 8000"
+                )
+                if result.strip().startswith("+OK"):
+                    ws_queue = await self.ws_server.get_session_queue(target_uuid, timeout=5.0)
+                    if ws_queue is not None:
+                        logger.info(
+                            f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket (ESL API), "
+                            f"target={target_uuid}"
+                        )
+                        self._audio_mode = "websocket"
+                        self._audio_started = True
+                        return ws_queue
+                    logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
+                else:
+                    logger.warning(f"[{self._uuid}] uuid_audio_stream 未返回 +OK: {result.strip()[:200]}")
+            except Exception as e:
+                logger.warning(f"[{self._uuid}] uuid_audio_stream 失败: {e}")
 
-        # 降级：文件轮询
+        # 方案 2：降级 — 文件轮询（用 uuid_record 启动录音）
         asr_path = f"/recordings/asr_{self._uuid}.raw"
+        if self.esl_pool:
+            try:
+                result = await self.esl_pool.api(f"uuid_record {self._uuid} start {asr_path}")
+                logger.info(f"[{self._uuid}] uuid_record 降级: {result.strip()[:100]}")
+            except Exception as e:
+                logger.warning(f"[{self._uuid}] uuid_record 失败: {e}")
+
         self._audio_mode = "file_poll"
         self._audio_started = True
-        logger.info(f"[{self._uuid}] 音频采集: 文件轮询 {asr_path}（dialplan record_session）")
+        logger.info(f"[{self._uuid}] 音频采集: 文件轮询 {asr_path}")
         asyncio.create_task(self._poll_audio_file(asr_path))
         return self._audio_queue
 
@@ -624,6 +648,10 @@ class ESLSocketCallSession:
                 self._connected = False
                 await self._safe_put(self._event_queue, {"type": "hangup", "cause": cause})
                 break
+
+            elif name == "CHANNEL_ANSWER":
+                self._active_uuid = event.get("Unique-ID", self._uuid)
+                logger.info(f"[{self._uuid}] Channel answered, active_uuid={self._active_uuid}")
 
             elif name == "CHANNEL_EXECUTE_COMPLETE":
                 app = event.get("Application", "")

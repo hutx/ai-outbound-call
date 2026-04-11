@@ -19,6 +19,7 @@
         <action application="set" data="media_bug_answer_req=true"/>
         <action application="set" data="record_file=/recordings/${uuid}.wav"/>
         <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
         <action application="socket" data="backend:9999 async full"/>
       </condition>
     </extension>
