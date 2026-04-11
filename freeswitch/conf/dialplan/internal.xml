@@ -11,7 +11,6 @@
   <context name="internal">
 
     <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
-    <!-- audio_stream 通过 ESL API uuid_audio_stream 启动，不在 dialplan 中 -->
     <extension name="AI_Agent_Call" continue="true">
       <condition field="${ai_agent}" expression="^true$">
         <action application="answer" />

@@ -10,7 +10,6 @@
     </extension>
 
     <!-- AI 外呼 B-leg 处理（ originate 创建的 B-leg 在 default context 中） -->
-    <!-- audio_stream 通过 ESL API uuid_audio_stream 启动，不在 dialplan 中 -->
     <extension name="ai_outbound_bleg">
       <condition field="${ai_agent}" expression="^true$">
         <action application="answer"/>
@@ -76,18 +75,16 @@
       </condition>
     </extension>
 
-    <!-- AI 外呼 A-leg 处理 -->
+    <!-- AI 外呼 A-leg 处理（loopback/AI_CALL 匹配此扩展） -->
     <extension name="ai_call_handler">
       <condition field="destination_number" expression="^AI_CALL$">
-        <condition field="${ai_agent}" expression="^true$">
-          <action application="answer"/>
-          <action application="sleep" data="500"/>
-          <action application="set" data="RECORD_STEREO=false"/>
-          <action application="set" data="media_bug_answer_req=true"/>
-          <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-          <action application="record_session" data="/recordings/${uuid}.wav"/>
-          <action application="socket" data="backend:9999 async full"/>
-        </condition>
+        <action application="answer"/>
+        <action application="sleep" data="500"/>
+        <action application="set" data="RECORD_STEREO=false"/>
+        <action application="set" data="media_bug_answer_req=true"/>
+        <action application="set" data="record_file=/recordings/${uuid}.wav"/>
+        <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <action application="socket" data="backend:9999 async full"/>
       </condition>
     </extension>
 

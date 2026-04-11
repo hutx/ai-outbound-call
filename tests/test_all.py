@@ -391,7 +391,7 @@ class TestDBHelpers:
             uuid="u1",
             task_id="t1",
             phone_number="13800000000",
-            script_id="default",
+            script_id="finance_product_a",
         )
         ctx.messages = [{"role": "user", "content": str(i)} for i in range(40)]
         values = _build_call_record_values(ctx)
@@ -592,7 +592,7 @@ class TestCallAgent:
             uuid="u1",
             task_id="t1",
             phone_number="13800000000",
-            script_id="default",
+            script_id="finance_product_a",
         )
         return CallAgent(
             self.DummySession(),
@@ -650,7 +650,7 @@ class TestCallAgent:
 
         async def fake_schedule(phone, task_id="", callback_time=None, note=""):
             callback_calls.append((phone, task_id, callback_time, note))
-            return {"success": True, "callback_time": callback_time or "default"}
+            return {"success": True, "callback_time": callback_time or "finance_product_a"}
 
         monkeypatch.setattr(script_utils, "get_barge_in_config", fake_get_barge)
         monkeypatch.setattr(crm, "schedule_callback", fake_schedule)
@@ -962,7 +962,7 @@ class TestTestCallAPI:
 
         response = client.post(
             "/api/test-call/start",
-            json={"phone_number": "13800000000", "script_id": "default", "customer_info": {}},
+            json={"phone_number": "13800000000", "script_id": "finance_product_a", "customer_info": {}},
         )
 
         assert response.status_code == 200

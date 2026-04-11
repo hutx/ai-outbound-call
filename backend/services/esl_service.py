@@ -111,21 +111,39 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
+        # FreeSWITCH 变量继承规则：
+        # - [var=val] 仅设置 A-leg
+        # - [export_var=val] 导出到 B-leg（bridge 后的通道）
+        # B-leg（loopback/AI_CALL）需要 ai_agent 等变量才能匹配 dialplan 扩展
         channel_vars = (
             f"origination_uuid={call_uuid},"
             f"ai_agent=true,"
-            f"task_id={task_id},"
-            f"script_id={script_id},"
-            f"call_target_type={target_type},"
-            f"original_destination={phone},"
+            f"export_ai_agent=true,"
+            f"export_task_id={task_id},"
+            f"export_script_id={script_id},"
+            f"export_call_target_type={target_type},"
+            f"export_original_destination={phone},"
+            f"export_origination_uuid={call_uuid},"
             f"origination_caller_id_number={caller_id},"
             f"originate_timeout={originate_timeout}"
         )
 
-        cmd = (
-            f"originate [{channel_vars}]"
-            f"{endpoint} &socket(backend:9999 full)"
+        endpoint, endpoint_type, _ = self._build_originate_target(
+            phone=phone,
+            gateway=gateway,
+            internal_domain=internal_domain,
         )
+
+        if endpoint_type == "internal_extension":
+            cmd = (
+                f"originate [{channel_vars}] "
+                f"{endpoint} &bridge(loopback/AI_CALL)"
+            )
+        else:
+            cmd = (
+                f"originate [{channel_vars}] "
+                f"{endpoint} &park()"
+            )
         logger.debug(f"ESL 发送 originate 命令: {cmd[:200]}")
         logger.info(
             f"ESL originate → {phone} "
@@ -596,9 +614,12 @@ class AsyncESLPool:
         job_action = event.get("Job-Action", "")
         reply_text = event.get("Job-Response", "") or event.get("Reply-Text", "")
 
-        # BACKGROUND_JOB 中 Reply-Text 通常是 "+OK Result-Header" 或 "+ERR ..."
-        if "-ERR" in reply_text or "ERR" in reply_text:
-            logger.error(f"[{call_uuid[:8]}] originate 失败 (BACKGROUND_JOB): {reply_text.strip()[:200]}")
+        # 检查 originate 实际结果：originate 失败时 err 字段会有错误原因
+        err_cause = event.get("err", "") or event.get("Error", "") or event.get("Cause", "")
+        job_status = event.get("Job-Status", "")
+
+        if "-ERR" in reply_text or "ERR" in reply_text or err_cause:
+            logger.error(f"[{call_uuid[:8]}] originate 失败 (BACKGROUND_JOB): reply={reply_text.strip()[:100]}, err={err_cause}, event_keys={list(event.keys())[:15]}")
             return
 
         logger.info(f"[{call_uuid[:8]}] originate 成功 (BACKGROUND_JOB): {job_action}")
@@ -608,7 +629,12 @@ class AsyncESLPool:
             await self._wait_and_start_ai_from_queue(call_uuid, answer_queue, kwargs)
 
     async def _wait_and_start_ai_from_queue(self, call_uuid: str, queue: asyncio.Queue, kwargs: dict):
-        """从已注册的 queue 等待 CHANNEL_ANSWER，跟踪呼叫状态。"""
+        """从已注册的 queue 等待 CHANNEL_ANSWER。
+
+        对于内部分机：originate 使用 &bridge(loopback/AI_CALL)，
+        拨号计划会处理 audio_stream + socket，无需额外操作。
+        对于 PSTN 外呼：需要后续完善（目前 &park() + transfer）。
+        """
         try:
             result = await asyncio.wait_for(queue.get(), timeout=60.0)
         except asyncio.TimeoutError:
@@ -623,7 +649,7 @@ class AsyncESLPool:
 
         answered_uuid = result.get("uuid", call_uuid)
         logger.info(f"[{call_uuid[:8]}] 收到 CHANNEL_ANSWER (实际 uuid={answered_uuid[:8]})")
-        # socket 连接已建立，CallAgent 由 ESLSocketCallSession 自动启动，无需额外操作
+        # 拨号计划已处理 audio_stream + socket，CallAgent 由 ESL socket 自动启动
 
     async def _wait_and_start_ai(self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str):
         """
@@ -774,6 +800,34 @@ class ESLSocketCallSession:
         await self._send("myevents\n\n")
         await self._read_event()
         await self._send("divert_events on\n\n")
+
+        # 在 socket 控制下启动 uuid_audio_stream
+        # 关键：stream 需要放在 A-leg（signal_bond）上才能捕获用户侧音频
+        # B-leg 上只能捕获 AI 产生的音频（TTS），用户说话时 B-leg 是静音
+        if self.esl_pool and self.ws_server:
+            # 优先使用 A-leg UUID（signal_bond 是桥接对端的 UUID）
+            stream_uuid = (
+                self._channel_vars.get("signal_bond")
+                or self._uuid
+            )
+            ws_url = f"ws://backend:8765/{stream_uuid}"
+            try:
+                result = await self.esl_pool.api(
+                    f"uuid_audio_stream {stream_uuid} start {ws_url} mono 8000"
+                )
+                if result.strip().startswith("+OK"):
+                    logger.info(
+                        f"[{self._uuid[:8]}] uuid_audio_stream 启动成功 on {stream_uuid[:8]}: {ws_url}"
+                    )
+                else:
+                    logger.warning(
+                        f"[{self._uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{self._uuid[:8]}] uuid_audio_stream 失败（将降级文件轮询）: {e}"
+                )
+
         return data
 
     # ── 通话控制 ──────────────────────────────────────────────

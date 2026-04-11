@@ -40,7 +40,13 @@
       "Bash(.venv/bin/python3:*)",
       "Bash(docker ps:*)",
       "Bash(git:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(cat:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.cnblogs.com)",
+      "Bash(1:*)",
+      "Bash(docker port:*)",
+      "Bash(docker exec:*)"
     ]
   }
 }

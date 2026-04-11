@@ -15,7 +15,25 @@
       "Bash(ls -la *.log)",
       "Read(//Users/hvtux/work/hvyogo/ai_work/ai-outbound-call-new/backend/services/**)",
       "Read(//etc/freeswitch/**)",
-      "Bash(nc -z -w 3 127.0.0.1 8021)"
+      "Bash(nc -z -w 3 127.0.0.1 8021)",
+      "Bash(grep -E \"^\\\\w{8,}\")",
+      "Bash(docker cp:*)",
+      "Bash(xmllint --noout /Users/hutx/work/hvyogo/ai_work/ai-outbound-call-new/freeswitch/conf/autoload_configs/sofia.conf.xml)",
+      "Bash(nc -u -w1 192.168.5.15 5060)",
+      "Bash(grep -v \"^\\\\s*$\")",
+      "WebFetch(domain:hub.docker.com)",
+      "WebFetch(domain:github.com)",
+      "Read(//tmp/mod_audio_stream_inspect/**)",
+      "Read(//private/tmp/mod_audio_stream_inspect/**)",
+      "Bash(docker history:*)",
+      "Bash(nc -zu 127.0.0.1 5060)",
+      "Bash(nc -zv 127.0.0.1 5060)",
+      "Bash(nc -u 127.0.0.1 5060)",
+      "Bash(nc -u -w 2 127.0.0.1 5060)",
+      "Bash(wait)",
+      "Bash(netstat -ulnp)",
+      "Read(//Users/hutx/work/hvyogo/ai_work/ai-outbound-call-new/docker/**)",
+      "Bash(apt-get install:*)"
     ]
   }
 }

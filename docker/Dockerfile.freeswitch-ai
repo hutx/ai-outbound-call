@@ -18,6 +18,7 @@ LABEL description="FreeSWITCH with mod_audio_stream for AI Voice"
 COPY --from=module-source /usr/local/freeswitch/mod/mod_audio_stream.so /usr/lib/freeswitch/mod/mod_audio_stream.so
 COPY --from=module-source /usr/local/freeswitch/mod/mod_audio_stream.so /usr/local/freeswitch/mod/mod_audio_stream.so
 
+COPY ../freeswitch/lib/mod_forkzstream.so /usr/lib/freeswitch/mod/mod_forkzstream.so
 # Copy OpenSSL 1.1 libraries required by the pre-compiled module
 COPY --from=module-source /usr/lib/x86_64-linux-gnu/libssl.so.1.1 /usr/lib/x86_64-linux-gnu/libssl.so.1.1
 COPY --from=module-source /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1
