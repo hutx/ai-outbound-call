@@ -13,186 +13,192 @@
     <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
     <extension name="AI_Agent_Call" continue="true">
       <condition field="${ai_agent}" expression="^true$">
-        <action application="answer"/>
-        <action application="sleep" data="500"/>
-        <action application="set" data="RECORD_STEREO=false"/>
-        <action application="set" data="media_bug_answer_req=true"/>
-        <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-        <action application="record_session" data="/recordings/${uuid}.wav"/>
-        <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-        <action application="socket" data="backend:9999 async full"/>
+        <action application="answer" />
+        <action application="sleep" data="500" />
+        <action application="set" data="RECORD_STEREO=false" />
+        <action application="set" data="media_bug_answer_req=true" />
+        <action application="set" data="record_file=/recordings/${uuid}.wav" />
+        <action application="record_session" data="/recordings/${uuid}.wav" />
+        <action application="audio_stream" data="ws://backend:8765/${uuid}" />
+        <action application="socket" data="backend:9999 async full" />
+        <!-- 3. 保持通道，交由后端状态机控制 -->
+        <!-- <action application="park" /> -->
       </condition>
     </extension>
 
     <!-- 内部直拨：1001分机使用AI语音交互 -->
     <extension name="AI_Agent_1001">
       <condition field="destination_number" expression="^1001$">
-        <action application="set" data="ai_agent=true"/>
-        <action application="set" data="task_id=ai_test_1001"/>
-        <action application="set" data="script_id=default"/>
-        <action application="answer"/>
-        <action application="sleep" data="500"/>
-        <action application="set" data="RECORD_STEREO=false"/>
-        <action application="set" data="media_bug_answer_req=true"/>
-        <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-        <action application="record_session" data="/recordings/${uuid}.wav"/>
-        <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-        <action application="socket" data="backend:9999 async full"/>
+        <action application="set" data="ai_agent=true" />
+        <action application="set" data="task_id=ai_test_1001" />
+        <action application="set" data="script_id=default" />
+        <action application="answer" />
+        <action application="sleep" data="500" />
+        <action application="set" data="RECORD_STEREO=false" />
+        <action application="set" data="media_bug_answer_req=true" />
+        <action application="set" data="record_file=/recordings/${uuid}.wav" />
+        <action application="record_session" data="/recordings/${uuid}.wav" />
+        <action application="audio_stream" data="ws://backend:8765/${uuid}" />
+        <action application="socket" data="backend:9999 async full" />
       </condition>
     </extension>
 
     <!-- 1001分机应答后处理（用于后端发起的外呼到1001） -->
     <extension name="AI_Agent_1001_Answer">
-      <condition field="${destination_number}" expression="^1001$"/>
-      <condition field="${context}" expression="^internal$"/>
-      <condition field="${ai_agent}" expression="^true$"/>
-      <action application="answer"/>
-      <action application="sleep" data="500"/>
-      <action application="set" data="RECORD_STEREO=false"/>
-      <action application="set" data="media_bug_answer_req=true"/>
-      <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-      <action application="record_session" data="/recordings/${uuid}.wav"/>
-      <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-      <action application="socket" data="backend:9999 async full"/>
+      <condition field="${destination_number}" expression="^1001$" />
+      <condition field="${context}" expression="^internal$" />
+      <condition field="${ai_agent}" expression="^true$" />
+      <action application="answer" />
+      <action application="sleep" data="500" />
+      <action application="set" data="RECORD_STEREO=false" />
+      <action application="set" data="media_bug_answer_req=true" />
+      <action application="set" data="record_file=/recordings/${uuid}.wav" />
+      <action application="record_session" data="/recordings/${uuid}.wav" />
+      <action application="audio_stream" data="ws://backend:8765/${uuid}" />
+      <action application="socket" data="backend:9999 async full" />
     </extension>
 
     <!-- 处理 user/1001@domain 格式的呼叫（当后端发起呼叫到1001时） -->
     <extension name="AI_Agent_1001_User_Call">
-      <condition field="${sip_called_user}" expression="^1001$"/>
-      <condition field="${context}" expression="^internal$"/>
-      <condition field="${ai_agent}" expression="^true$"/>
-      <action application="answer"/>
-      <action application="sleep" data="500"/>
-      <action application="set" data="RECORD_STEREO=false"/>
-      <action application="set" data="media_bug_answer_req=true"/>
-      <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-      <action application="record_session" data="/recordings/${uuid}.wav"/>
-      <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-      <action application="socket" data="backend:9999 async full"/>
+      <condition field="${sip_called_user}" expression="^1001$" />
+      <condition field="${context}" expression="^internal$" />
+      <condition field="${ai_agent}" expression="^true$" />
+      <action application="answer" />
+      <action application="sleep" data="500" />
+      <action application="set" data="RECORD_STEREO=false" />
+      <action application="set" data="media_bug_answer_req=true" />
+      <action application="set" data="record_file=/recordings/${uuid}.wav" />
+      <action application="record_session" data="/recordings/${uuid}.wav" />
+      <action application="audio_stream" data="ws://backend:8765/${uuid}" />
+      <action application="socket" data="backend:9999 async full" />
     </extension>
 
     <!-- 1001分机作为坐席应答呼入电话时的AI处理 -->
     <extension name="AI_Agent_1001_Inbound">
-      <condition field="${sip_has_contact}" expression="^true$"/>
-      <condition field="${destination_number}" expression="^1001$"/>
-      <condition field="${user_context}" expression="^internal$"/>
-      <action application="set" data="ai_agent=true"/>
-      <action application="set" data="task_id=inbound_call_1001"/>
-      <action application="set" data="script_id=default"/>
-      <action application="answer"/>
-      <action application="sleep" data="500"/>
-      <action application="set" data="RECORD_STEREO=false"/>
-      <action application="set" data="media_bug_answer_req=true"/>
-      <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-      <action application="record_session" data="/recordings/${uuid}.wav"/>
-      <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-      <action application="socket" data="backend:9999 async full"/>
+      <condition field="${sip_has_contact}" expression="^true$" />
+      <condition field="${destination_number}" expression="^1001$" />
+      <condition field="${user_context}" expression="^internal$" />
+      <action application="set" data="ai_agent=true" />
+      <action application="set" data="task_id=inbound_call_1001" />
+      <action application="set" data="script_id=default" />
+      <action application="answer" />
+      <action application="sleep" data="500" />
+      <action application="set" data="RECORD_STEREO=false" />
+      <action application="set" data="media_bug_answer_req=true" />
+      <action application="set" data="record_file=/recordings/${uuid}.wav" />
+      <action application="record_session" data="/recordings/${uuid}.wav" />
+      <action application="audio_stream" data="ws://backend:8765/${uuid}" />
+      <action application="socket" data="backend:9999 async full" />
     </extension>
 
     <!-- 内部直拨：其他分机（1002-1019） -->
     <extension name="Local_Extension">
       <condition field="destination_number" expression="^(10[01][2-9]|10[2-9]\d)$">
-        <action application="export" data="dialed_extension=$1"/>
-        <action application="set" data="continue_on_fail=NORMAL_TEMPORARY_FAILURE,USER_BUSY,NO_ANSWER,TIMEOUT,EXTENSION_NOT_FOUND,INVALID_NUMBER_FORMAT,DOMAIN_NOT_FOUND"/>
-        <action application="set" data="ringback=${us-ring}"/>
-        <action application="set" data="transfer_ringback=${us-ring}"/>
-        <action application="set" data="call_timeout=30"/>
-        <action application="set" data="hangup_after_bridge=true"/>
-        <action application="bridge" data="user/${dialed_extension}@${sip_domain}"/>
+        <action application="export" data="dialed_extension=$1" />
+        <action application="set"
+          data="continue_on_fail=NORMAL_TEMPORARY_FAILURE,USER_BUSY,NO_ANSWER,TIMEOUT,EXTENSION_NOT_FOUND,INVALID_NUMBER_FORMAT,DOMAIN_NOT_FOUND" />
+        <action application="set" data="ringback=${us-ring}" />
+        <action application="set" data="transfer_ringback=${us-ring}" />
+        <action application="set" data="call_timeout=30" />
+        <action application="set" data="hangup_after_bridge=true" />
+        <action application="bridge" data="user/${dialed_extension}@${sip_domain}" />
       </condition>
     </extension>
 
     <!-- 测试 AI 代理 - 拨打 2000 转接到 AI 代理 -->
     <extension name="AI_Agent_Test">
       <condition field="destination_number" expression="^2000$">
-        <action application="answer"/>
-        <action application="sleep" data="1000"/>
-        <action application="set" data="effective_caller_id_name=AI_Test_Caller"/>
-        <action application="set" data="effective_caller_id_number=2001"/>
+        <action application="answer" />
+        <action application="sleep" data="1000" />
+        <action application="set" data="effective_caller_id_name=AI_Test_Caller" />
+        <action application="set" data="effective_caller_id_number=2001" />
         <!-- 将通话连接到后端 AI 代理 -->
-        <action application="set" data="ai_agent=true"/>
-        <action application="set" data="task_id=test_ai_call"/>
-        <action application="set" data="script_id=default"/>
-        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
+        <action application="set" data="ai_agent=true" />
+        <action application="set" data="task_id=test_ai_call" />
+        <action application="set" data="script_id=default" />
+        <action application="socket"
+          data="$${backend_socket_host}:$${backend_socket_port} async full" />
       </condition>
     </extension>
 
     <!-- 测试 AI 代理 - 拨打 3000 转接到 AI 代理（作为被叫）-->
     <extension name="AI_Agent_Inbound_Test">
       <condition field="destination_number" expression="^3000$">
-        <condition field="${context}" expression="internal"/>
-        <action application="answer"/>
-        <action application="sleep" data="200"/>
-        <action application="set" data="media_bug_answer_req=true"/>
-        <action application="set" data="RECORD_STEREO=false"/>
-        <action application="set" data="record_file=/recordings/${uuid}.wav"/>
-        <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <condition field="${context}" expression="internal" />
+        <action application="answer" />
+        <action application="sleep" data="200" />
+        <action application="set" data="media_bug_answer_req=true" />
+        <action application="set" data="RECORD_STEREO=false" />
+        <action application="set" data="record_file=/recordings/${uuid}.wav" />
+        <action application="record_session" data="/recordings/${uuid}.wav" />
         <!-- 将通话连接到后端 AI 代理 -->
-        <action application="set" data="ai_agent=true"/>
-        <action application="set" data="task_id=inbound_ai_test"/>
-        <action application="set" data="script_id=default"/>
-        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
+        <action application="set" data="ai_agent=true" />
+        <action application="set" data="task_id=inbound_ai_test" />
+        <action application="set" data="script_id=default" />
+        <action application="socket"
+          data="$${backend_socket_host}:$${backend_socket_port} async full" />
       </condition>
     </extension>
 
     <!-- 会议桥接测试 -->
     <extension name="EasyConference">
-      <condition field="destination_number" expression="^confctl(\d+)@(.*)$|^(.*)@confctl(\d+)$|^conf(\d+)$">
-        <action application="answer"/>
-        <action application="conference" data="$1$2$3$4@$${domain}"/>
+      <condition field="destination_number"
+        expression="^confctl(\d+)@(.*)$|^(.*)@confctl(\d+)$|^conf(\d+)$">
+        <action application="answer" />
+        <action application="conference" data="$1$2$3$4@$${domain}" />
       </condition>
     </extension>
 
     <!-- 语音邮箱 -->
     <extension name="voicemail_main">
-      <condition field="destination_number" expression="^voicemail$|^8501$|^pickup$"/>
-      <condition field="authorize" expression="all"/>
-      <action application="answer"/>
-      <action application="sleep" data="1000"/>
-      <action application="voicemail" data="check default ${domain}"/>
+      <condition field="destination_number" expression="^voicemail$|^8501$|^pickup$" />
+      <condition field="authorize" expression="all" />
+      <action application="answer" />
+      <action application="sleep" data="1000" />
+      <action application="voicemail" data="check default ${domain}" />
     </extension>
 
     <!-- 语音邮箱用户 -->
     <extension name="voicemail_single">
       <condition field="destination_number" expression="^8(1[0-9][0-9])$">
         <condition field="network_addr" expression="^$${local_network_acl}$" />
-        <action application="answer"/>
-        <action application="sleep" data="1000"/>
-        <action application="voicemail" data="check $1 default ${domain}"/>
+        <action application="answer" />
+        <action application="sleep" data="1000" />
+        <action application="voicemail" data="check $1 default ${domain}" />
       </condition>
     </extension>
 
     <!-- 通话记录 -->
     <extension name="call_return">
       <condition field="destination_number" expression="^(\*66)$">
-        <action application="set" data="called_party_call_return=${call_return_${caller_id_number}}"/>
-        <action application="unset" data="continue_on_fail"/>
-        <action application="transfer" data="${called_party_call_return}"/>
+        <action application="set" data="called_party_call_return=${call_return_${caller_id_number}}" />
+        <action application="unset" data="continue_on_fail" />
+        <action application="transfer" data="${called_party_call_return}" />
       </condition>
     </extension>
 
     <!-- 盲转 -->
     <extension name="transfer_blind">
       <condition field="destination_number" expression="^(70[01][0-9])$">
-        <action application="transfer" data="$1 XML internal"/>
+        <action application="transfer" data="$1 XML internal" />
       </condition>
     </extension>
 
     <!-- 闹钟服务 -->
     <extension name="alarm">
-      <condition field="destination_number" expression="^alarm$|^3322$"/>
-      <action application="answer"/>
-      <action application="sleep" data="1000"/>
-      <action application="playback" data="alarm-message.wav"/>
-      <action application="log" data="ALARM MESSAGE PLAYED FOR ${caller_id_number}"/>
+      <condition field="destination_number" expression="^alarm$|^3322$" />
+      <action application="answer" />
+      <action application="sleep" data="1000" />
+      <action application="playback" data="alarm-message.wav" />
+      <action application="log" data="ALARM MESSAGE PLAYED FOR ${caller_id_number}" />
     </extension>
 
     <!-- 电话簿 -->
     <extension name="directory">
-      <condition field="destination_number" expression="^(5000)$"/>
-      <action application="answer"/>
-      <action application="sleep" data="1000"/>
-      <action application="directory" data="default XML"/>
+      <condition field="destination_number" expression="^(5000)$" />
+      <action application="answer" />
+      <action application="sleep" data="1000" />
+      <action application="directory" data="default XML" />
     </extension>
 
   </context>
