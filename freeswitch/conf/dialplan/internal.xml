@@ -10,8 +10,11 @@
        ============================================================ -->
   <context name="internal">
 
-    <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
-    <extension name="AI_Agent_Call" continue="true">
+    <!-- AI 外呼处理：通用 — 任何 ai_agent=true 的内部分机都走这里
+         1. answer
+         2. 启动 mod_audio_stream → ws://backend:8765/{uuid}（用户麦克风）
+         3. socket → backend:9999（TTS + 通话控制） -->
+    <extension name="AI_Agent_Call" continue="false">
       <condition field="${ai_agent}" expression="^true$">
         <action application="answer" />
         <action application="sleep" data="500" />
@@ -19,7 +22,10 @@
         <action application="set" data="media_bug_answer_req=true" />
         <action application="set" data="record_file=/recordings/${uuid}.wav" />
         <action application="record_session" data="/recordings/${uuid}.wav" />
-        <action application="socket" data="backend:9999 async full" />
+        <!-- 先启动 audio_stream，再进入 socket。
+             此通道是 sofia 直连（非 bridge），mod_audio_stream 可以正常捕获用户麦克风。 -->
+        <action application="audio_stream" data="ws://backend:8765/${uuid} 8000 read 20" />
+        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full" />
       </condition>
     </extension>
 

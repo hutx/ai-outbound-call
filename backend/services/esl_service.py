@@ -105,7 +105,7 @@ class AsyncESLConnection:
         发起外呼。使用同步 api originate。
         变量通过 originate 的 [ ] 语法传入。
         """
-        endpoint, target_type, _ = self._build_originate_target(
+        endpoint, endpoint_type, target_type = self._build_originate_target(
             phone=phone,
             gateway=gateway,
             internal_domain=internal_domain,
@@ -114,7 +114,6 @@ class AsyncESLConnection:
         # FreeSWITCH 变量继承规则：
         # - [var=val] 仅设置 A-leg
         # - [export_var=val] 导出到 B-leg（bridge 后的通道）
-        # B-leg（loopback/AI_CALL）需要 ai_agent 等变量才能匹配 dialplan 扩展
         channel_vars = (
             f"origination_uuid={call_uuid},"
             f"ai_agent=true,"
@@ -128,19 +127,13 @@ class AsyncESLConnection:
             f"originate_timeout={originate_timeout}"
         )
 
-        endpoint, endpoint_type, _ = self._build_originate_target(
-            phone=phone,
-            gateway=gateway,
-            internal_domain=internal_domain,
-        )
-
         if endpoint_type == "internal_extension":
-            # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
-            # loopback/AI_CALL 进入 default context 的 ai_call_handler，
-            # 该扩展按顺序执行 record_session → socket(backend:9999)
+            # 内部分机：sofia B-leg 直接进入 dialplan（不指定 post-dial app），
+            # 匹配 ai_agent=true 扩展 → audio_stream + socket。
+            # 不再使用 loopback bridge，避免 bridged channel 上无法启动音频流的问题。
             cmd = (
                 f"originate [{channel_vars}] "
-                f"{endpoint} &bridge(loopback/AI_CALL)"
+                f"{endpoint}"
             )
         else:
             # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
@@ -239,10 +232,10 @@ class AsyncESLConnection:
         normalized = (phone or "").strip()
         if INTERNAL_EXTENSION_RE.fullmatch(normalized):
             domain = (internal_domain or "$${local_ip_v4}").strip()
-            logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
-            # 对于AI代理呼叫，使用拨号计划扩展而不是直接连接用户
-            # 这样可以确保AI处理逻辑被执行
-            return f"user/{normalized}@{domain}", "internal_extension", normalized
+            logger.debug(f"ESL originate → {phone} (internal_extension) → sofia/internal/{normalized}@{domain}")
+            # 使用 sofia/internal/ endpoint 绕过 directory 查找，
+            # 直接在 sofia profile 上建立 SIP INVITE，B-leg 进入 profile 的 context=internal 拨号计划。
+            return f"sofia/internal/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
         return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
@@ -807,6 +800,12 @@ class ESLSocketCallSession:
         for k, v in data.items():
             if k.startswith("variable_"):
                 self._channel_vars[k[9:]] = v
+        # Also log loopback-specific vars for debugging
+        for k in data:
+            if "loopback" in k.lower() or k in ("Other-Leg-Channel-Name", "Other-Type", "Other-Leg-Source"):
+                logger.debug(
+                    f"[{self._uuid[:8]}] channel var {k} = {data[k][:100]}"
+                )
 
         logger.info(
             f"ESL Outbound 握手 uuid={self._uuid} "
@@ -819,43 +818,11 @@ class ESLSocketCallSession:
         await self._read_event()
         await self._send("divert_events on\n\n")
 
-        # 在 socket 控制下启动 uuid_audio_stream
-        # 关键：stream 需要放在用户音频流经的通道上才能捕获人声
-        #
-        # 音频路径分析：
-        #   sofia(A-leg, 用户麦克风) ↔ loopback-a ↔ loopback-b(socket)
-        #
-        # 测试结论：
-        # - B-leg (loopback-b): 只有 TTS 期间有音频，之后全是静音
-        # - sofia A-leg: 桥接时媒体路径可能被锁定，stream 也是静音
-        # - loopback-a: 理论上桥接两边的音频都流经此通道
-        if self.esl_pool and self.ws_server:
-            # 按优先级尝试不同 UUID：
-            # 1. other_loopback_leg_uuid: loopback-a 通道（桥接音频都流经此）
-            # 2. signal_bond: 桥接对端
-            # 3. 当前通道 UUID（降级方案）
-            stream_uuid = (
-                self._channel_vars.get("other_loopback_leg_uuid")
-                or self._channel_vars.get("signal_bond")
-                or self._uuid
-            )
-            ws_url = f"ws://backend:8765/{stream_uuid}"
-            try:
-                result = await self.esl_pool.api(
-                    f"uuid_audio_stream {stream_uuid} start {ws_url} mono 8000"
-                )
-                if result.strip().startswith("+OK"):
-                    logger.info(
-                        f"[{self._uuid[:8]}] uuid_audio_stream 启动成功 on {stream_uuid[:8]}: {ws_url}"
-                    )
-                else:
-                    logger.warning(
-                        f"[{self._uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[{self._uuid[:8]}] uuid_audio_stream 失败（将降级文件轮询）: {e}"
-                )
+        # 用户音频捕获由 dialplan 中的 audio_stream 应用处理，
+        # 此 socket 连接仅用于通话控制（TTS 播放、DTMF 等）。
+        logger.debug(
+            f"[{self._uuid[:8]}] 音频捕获由 dialplan audio_stream 处理"
+        )
 
         return data
 
@@ -1022,44 +989,49 @@ class ESLSocketCallSession:
     async def start_audio_capture(self) -> asyncio.Queue:
         """开始捕获通话音频，返回 PCM 数据队列
 
-        优先通过 ESL API 的 uuid_audio_stream 启动实时音频流（mod_audio_stream），
-        降级为文件轮询（uuid_record 录音）。
+        优先级：
+        1. sofia 通道 mod_audio_stream 队列（dialplan 中启动，通过 ws_server 全局队列）
+        2. WebSocket 音频流队列（mod_audio_stream 备用方案）
+        3. 降级文件轮询（用 uuid_record 启动）
         """
         if not self._uuid:
             logger.warning("无法启动音频捕获: UUID 为空")
             self._audio_mode = "none"
             return asyncio.Queue()
 
-        # 幂等：如果已经启动成功，直接返回音频队列
-        if self._audio_started and self._audio_mode != "none":
-            logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}，跳过重复启动")
+        # 如果 sofia 通道的 mod_audio_stream 已在 connect() 中绑定
+        if self._audio_mode == "websocket_sofia":
+            logger.info(f"[{self._uuid}] 音频采集: 复用 sofia 通道的 mod_audio_stream 队列")
+            # 返回 ws_server 的全局队列（包含 sofia 麦克风音频）
+            sofia_uuid = self._channel_vars.get("other_loopback_from_uuid")
+            if sofia_uuid and self.ws_server:
+                try:
+                    ws_queue = await self.ws_server.get_session_queue(sofia_uuid, timeout=1.0)
+                    if ws_queue is not None:
+                        return ws_queue
+                except Exception:
+                    pass
+            # ws_server 队列不可用，降级
+            self._audio_mode = "unknown"
+
+        # 如果文件轮询已在运行（connect() 中的 uuid_record read），直接返回队列
+        if self._audio_mode == "file_poll_read":
+            logger.info(f"[{self._uuid}] 音频采集: 复用 connect() 中已启动的 sofia read 录制")
             return self._audio_queue
 
-        # 方案 1：通过 ESL API 启动 mod_audio_stream 实时音频流
-        if self.esl_pool and self.ws_server:
+        # 如果音频流已在 connect() 中启动，直接返回队列
+        if self.ws_server:
             try:
-                target_uuid = self._active_uuid or self._uuid
-                ws_url = f"ws://backend:8765/{target_uuid}"
-                result = await self.esl_pool.api(
-                    f"uuid_audio_stream {target_uuid} start {ws_url} mono 8000"
-                )
-                if result.strip().startswith("+OK"):
-                    ws_queue = await self.ws_server.get_session_queue(target_uuid, timeout=5.0)
-                    if ws_queue is not None:
-                        logger.info(
-                            f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket (ESL API), "
-                            f"target={target_uuid}"
-                        )
-                        self._audio_mode = "websocket"
-                        self._audio_started = True
-                        return ws_queue
-                    logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
-                else:
-                    logger.warning(f"[{self._uuid}] uuid_audio_stream 未返回 +OK: {result.strip()[:200]}")
+                ws_queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
+                if ws_queue is not None:
+                    self._audio_mode = "websocket"
+                    self._audio_started = True
+                    logger.info(f"[{self._uuid}] 音频采集: 复用 connect() 中已启动的 mod_audio_stream")
+                    return ws_queue
             except Exception as e:
-                logger.warning(f"[{self._uuid}] uuid_audio_stream 失败: {e}")
+                logger.warning(f"[{self._uuid}] 获取音频队列失败: {e}")
 
-        # 方案 2：降级 — 文件轮询（用 uuid_record 启动录音）
+        # 降级 — 文件轮询（用 uuid_record 启动录音）
         asr_path = f"/recordings/asr_{self._uuid}.raw"
         if self.esl_pool:
             try:

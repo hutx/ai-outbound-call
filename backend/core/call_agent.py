@@ -338,8 +338,22 @@ class CallAgent:
                            total_duration_ms: float = 0) -> str:
         self.sm.transition(CallState.USER_SPEAKING)
         audio_queue = await self.session.start_audio_capture()
-        queue_size = audio_queue.qsize()
-        logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
+
+        # 清空队列中残留的音频帧
+        # dialplan 中 audio_stream 持续向全局队列推送用户麦克风音频，
+        # TTS 播放期间队列中积累的是用户说话的声音（可能包含背景噪音），
+        # 但如果不清空历史帧，可能混入旧的残留数据
+        flushed = 0
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+                flushed += 1
+            except asyncio.QueueEmpty:
+                break
+        if flushed > 0:
+            logger.info(f"[{self.ctx.uuid}] 🔊 清空音频队列，丢弃 {flushed} 帧历史音频")
+
+        logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={audio_queue.qsize()}")
 
         adapter = AudioStreamAdapter(
             audio_queue,
