@@ -11,6 +11,7 @@
   <context name="internal">
 
     <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
+    <!-- audio_stream 通过 ESL API uuid_audio_stream 启动，不在 dialplan 中 -->
     <extension name="AI_Agent_Call" continue="true">
       <condition field="${ai_agent}" expression="^true$">
         <action application="answer" />
@@ -19,10 +20,7 @@
         <action application="set" data="media_bug_answer_req=true" />
         <action application="set" data="record_file=/recordings/${uuid}.wav" />
         <action application="record_session" data="/recordings/${uuid}.wav" />
-        <action application="audio_stream" data="ws://backend:8765/${uuid}" />
         <action application="socket" data="backend:9999 async full" />
-        <!-- 3. 保持通道，交由后端状态机控制 -->
-        <!-- <action application="park" /> -->
       </condition>
     </extension>
 

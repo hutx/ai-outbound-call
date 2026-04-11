@@ -80,9 +80,49 @@ class AsyncESLConnection:
         job_uuid = job_uuid or uuid.uuid4().hex
         async with self._lock:
             await self._send(f"bgapi {command}\nJob-UUID: {job_uuid}\n\n")
-            await asyncio.wait_for(self._read_event(), timeout=10.0)
+            event = await asyncio.wait_for(self._read_event(), timeout=10.0)
             self._last_used = time.time()
-        return job_uuid
+        reply = event.get("Reply-Text", "")
+        if "+OK" in reply:
+            return job_uuid
+        raise ESLError(f"bgapi 失败: {reply}")
+
+    async def wait_for_event(
+        self, event_name: str, filter_key: str, filter_value: str, timeout: float = 30.0
+    ) -> Optional[dict]:
+        """
+        创建临时 ESL 连接，订阅指定事件，等待匹配的事件到达。
+        用于监听 originate 后的 CHANNEL_ANSWER 等异步事件。
+        """
+        conn = AsyncESLConnection(self.host, self.port, self.password)
+        try:
+            await asyncio.wait_for(conn.connect(), timeout=5.0)
+            # 订阅指定事件
+            await conn._send(
+                f"filter {filter_key} {filter_value}\n"
+                f"event plain {event_name}\n\n"
+            )
+            # 读取 filter 和 event 命令的响应
+            await asyncio.wait_for(conn._read_event(), timeout=5.0)
+            await asyncio.wait_for(conn._read_event(), timeout=5.0)
+
+            deadline = asyncio.get_event_loop().time() + timeout
+            while asyncio.get_event_loop().time() < deadline:
+                remaining = deadline - asyncio.get_event_loop().time()
+                try:
+                    event = await asyncio.wait_for(conn._read_event(), timeout=min(remaining, 1.0))
+                    if event.get("Event-Name", "").upper() == event_name.upper():
+                        return event
+                except asyncio.TimeoutError:
+                    continue
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
     async def originate(
         self,
@@ -102,9 +142,10 @@ class AsyncESLConnection:
         CallAgent 通过 ESL channel_vars 读取。
 
         流程：
-          - B-leg 应答后进入 internal context 的 XML dialplan
-          - 匹配 AI_Agent_Call 扩展 → audio_stream + socket(backend:9999)
-          - PSTN 外呼：由 dialplan ai_outbound_answered 处理
+          1. bgapi originate → B-leg 振铃后 &park()
+          2. 监听 CHANNEL_ANSWER 事件
+          3. uuid_audio_stream 启动 WebSocket 音频流
+          4. uuid_broadcast socket 连接后端:9999（ESL Outbound 模式）
         """
         endpoint, target_type, _ = self._build_originate_target(
             phone=phone,
@@ -112,7 +153,6 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
-        # 业务变量：ai_agent=true 让 B-leg 在 dialplan 中匹配 AI 扩展
         channel_vars = (
             f"origination_uuid={call_uuid},"
             f"ai_agent=true,"
@@ -133,7 +173,63 @@ class AsyncESLConnection:
             f"ESL originate → {phone} "
             f"(uuid={call_uuid[:8]}, task={task_id}, target={target_type})"
         )
-        return await self.bgapi(cmd, job_uuid=call_uuid)
+        result = await self.bgapi(cmd, job_uuid=call_uuid)
+
+        # B-leg 应答后启动 AI 流程
+        asyncio.create_task(
+            self._on_call_answered(call_uuid, phone, task_id, script_id, target_type)
+        )
+
+        return result
+
+    async def _on_call_answered(
+        self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str
+    ):
+        """
+        B-leg 应答后：
+        1. 启动 uuid_audio_stream WebSocket 音频流
+        2. 广播 socket 应用连接后端 ESL Outbound 服务
+        """
+        ws_url = f"ws://backend:8765/{call_uuid}"
+        socket_addr = "backend:9999 async full"
+
+        try:
+            # 等待 CHANNEL_ANSWER 事件
+            answer_event = await self._wait_for_event(
+                event_name="CHANNEL_ANSWER",
+                filter_key="Unique-ID",
+                filter_value=call_uuid,
+                timeout=60.0,
+            )
+            if not answer_event:
+                logger.warning(f"[{call_uuid[:8]}] 外呼等待应答超时")
+                return
+
+            logger.info(f"[{call_uuid[:8]}] B-leg 已应答，启动 AI 流程")
+
+            # 1. 启动 mod_audio_stream WebSocket 音频流
+            try:
+                result = await self.api(
+                    f"uuid_audio_stream {call_uuid} start {ws_url} mono 8000"
+                )
+                if result.strip().startswith("+OK"):
+                    logger.info(f"[{call_uuid[:8]}] uuid_audio_stream 启动成功: {ws_url}")
+                else:
+                    logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}")
+            except Exception as e:
+                logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 失败: {e}，降级文件轮询")
+
+            # 2. 广播 socket 应用连接后端 ESL Outbound 服务
+            try:
+                result = await self.api(
+                    f"uuid_broadcast {call_uuid} {socket_addr} both"
+                )
+                logger.info(f"[{call_uuid[:8]}] uuid_broadcast socket 结果: {result.strip()[:100]}")
+            except Exception as e:
+                logger.error(f"[{call_uuid[:8]}] uuid_broadcast socket 失败: {e}")
+
+        except Exception as e:
+            logger.error(f"[{call_uuid[:8]}] _on_call_answered 异常: {e}", exc_info=True)
 
     @staticmethod
     def _build_originate_target(phone: str, gateway: str, internal_domain: str) -> tuple[str, str, str]:
@@ -143,7 +239,7 @@ class AsyncESLConnection:
             logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
             # 对于AI代理呼叫，使用拨号计划扩展而不是直接连接用户
             # 这样可以确保AI处理逻辑被执行
-            return f"sofia/internal/{normalized}@{domain}", "internal_extension", normalized
+            return f"user/{normalized}@{domain}", "internal_extension", normalized
 
         dest = f"97776{normalized}"
         return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
@@ -238,7 +334,13 @@ class AsyncESLPool:
     async def originate(self, **kwargs) -> str:
         async with self._sem:
             conn = await self._acquire()
-            return await conn.originate(**kwargs)
+            job_uuid = await conn.originate(**kwargs)
+            return job_uuid
+
+    async def wait_for_event(self, event_name: str, filter_key: str, filter_value: str, timeout: float = 30.0) -> Optional[dict]:
+        async with self._sem:
+            conn = await self._acquire()
+            return await conn.wait_for_event(event_name, filter_key, filter_value, timeout)
 
     async def api(self, command: str) -> str:
         async with self._sem:
