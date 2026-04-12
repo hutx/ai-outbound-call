@@ -10,9 +10,11 @@
        ============================================================ -->
   <context name="internal">
 
-    <!-- AI 外呼处理：当 ai_agent=true 时，直接连接后端 socket -->
-    <extension name="AI_Agent_Call" continue="true">
-      <condition field="${ai_agent}" expression="^true$">
+    <!-- AI 外呼处理：当 ai_agent=true 且目标是明确的 AI 扩展时 -->
+    <!-- 排除普通分机号（10xx），让它们走 Local_Extension 正常振铃 -->
+    <extension name="AI_Agent_Call">
+      <condition field="destination_number" expression="^(AI_CALL|2000|3000)$" break="never"/>
+      <condition field="${ai_agent}" expression="^true$" break="on-true">
         <action application="answer" />
         <action application="sleep" data="500" />
         <action application="set" data="RECORD_STEREO=false" />
@@ -25,9 +27,9 @@
 
     <!-- 通用 AI 扩展已移至 internal_ai_call_handler (default.xml) -->
 
-    <!-- 内部直拨：其他分机（1002-1019） -->
+    <!-- 内部直拨：分机 1000-1099 -->
     <extension name="Local_Extension">
-      <condition field="destination_number" expression="^(10[01][2-9]|10[2-9]\d)$">
+      <condition field="destination_number" expression="^(10\d{2})$">
         <action application="export" data="dialed_extension=$1" />
         <action application="set"
           data="continue_on_fail=NORMAL_TEMPORARY_FAILURE,USER_BUSY,NO_ANSWER,TIMEOUT,EXTENSION_NOT_FOUND,INVALID_NUMBER_FORMAT,DOMAIN_NOT_FOUND" />

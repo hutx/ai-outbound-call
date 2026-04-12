@@ -49,7 +49,6 @@
 
     <extension name="AI_Agent_Inbound_Test">
       <condition field="destination_number" expression="^3000$">
-        <condition field="${context}" expression="default"/>
         <action application="answer"/>
         <action application="sleep" data="200"/>
         <action application="set" data="media_bug_answer_req=true"/>

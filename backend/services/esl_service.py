@@ -139,8 +139,7 @@ class AsyncESLConnection:
             # loopback/AI_CALL 进入 default context 的 ai_call_handler，
             # 该扩展按顺序执行 record_session → socket(backend:9999)
             cmd = (
-                f"originate [{channel_vars}] "
-                f"{endpoint} &bridge(loopback/AI_CALL)"
+                f"originate {{{channel_vars}}}{endpoint} &bridge(loopback/AI_CALL)"
             )
         else:
             # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
@@ -159,8 +158,7 @@ class AsyncESLConnection:
                 f"originate_timeout={originate_timeout}"
             )
             cmd = (
-                f"originate [{pstn_vars}] "
-                f"{endpoint}"
+                f"originate {{{pstn_vars}}}{endpoint} &park()"
             )
         logger.debug(f"ESL 发送 originate 命令: {cmd[:200]}")
         logger.info(
