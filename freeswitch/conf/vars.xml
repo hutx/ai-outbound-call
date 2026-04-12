@@ -54,7 +54,7 @@
      <!-- 默认编解码器（PCMU=G.711 μ-law，延迟最低，与 ASR 兼容最好） -->
      <X-PRE-PROCESS cmd="set" data="global_codec_prefs=PCMU,PCMA,G729" />
      <!-- 默认采样率（8000Hz 为标准电话音质，也可用 16000Hz 提升 ASR 精度） -->
-     <X-PRE-PROCESS cmd="set" data="rtp_sampling_rate=8000" />
+     <X-PRE-PROCESS cmd="set" data="rtp_sampling_rate=16000" />
      <!-- 录音存储根目录 -->
      <X-PRE-PROCESS cmd="set" data="recording_base_dir=/recordings" />
      <!-- 音频提示音目录 -->
