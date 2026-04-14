@@ -1538,7 +1538,11 @@ class ESLSocketCallSession:
         return sub_queue
 
     async def _poll_audio_file(self, path: str):
-        """轮询音频文件，读取新增数据送入音频队列"""
+        """轮询音频文件，读取新增数据送入音频队列
+
+        每次读取的新数据按 320 bytes（20ms @ 8kHz mono 16bit）分帧广播，
+        避免一次性广播大块数据导致 ASR 处理异常。
+        """
         import os
         import aiofiles
 
@@ -1558,17 +1562,22 @@ class ESLSocketCallSession:
         if is_wav:
             logger.info(f"[{self._uuid}] 检测到 WAV 文件，跳过 {header_offset} 字节头")
 
+        frame_size = 320  # 20ms @ 8kHz mono 16bit
         while self._connected:
             try:
                 current_size = os.path.getsize(path)
                 if current_size > offset:
                     async with aiofiles.open(path, "rb") as f:
                         await f.seek(offset)
-                        chunk = await f.read(current_size - offset)
-                        if chunk:
-                            offset += len(chunk)
-                            await self._broadcast_audio(chunk)
-                await asyncio.sleep(0.05)  # 50ms 轮询间隔
+                        data = await f.read(current_size - offset)
+                        if data:
+                            offset += len(data)
+                            # 按 320 bytes 分帧广播
+                            for i in range(0, len(data), frame_size):
+                                frame = data[i:i + frame_size]
+                                if len(frame) >= frame_size:
+                                    await self._broadcast_audio(frame)
+                await asyncio.sleep(0.02)  # 20ms 轮询间隔
             except FileNotFoundError:
                 await asyncio.sleep(0.1)
             except Exception as e:
