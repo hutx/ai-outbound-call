@@ -135,20 +135,25 @@ class AsyncESLConnection:
             # loopback/AI_CALL 进入 default context 的 ai_call_handler，
             # 该扩展按顺序执行 record_session → socket(backend:9999)
             # 开场白由 CallAgent 在 socket 连接后通过 uuid_displace 播放
+            #
+            # ★ 关键：在 sofia A-leg 上启动 audio_stream（不是 loopback B-leg）
+            # sofia A-leg 是用户语音通过 RTP 进入的地方，loopback B-leg 的
+            # read 方向在 bridge 中捕获不到 sofia 侧的用户语音。
+            # answer() → execute_on_bridge('audio_stream ...') → bridge(loopback/AI_CALL)
             cmd = (
-                f"originate {{{channel_vars}}}{endpoint} &bridge(loopback/AI_CALL)"
+                f"originate {{{channel_vars}}}{endpoint} "
+                f"&answer(),execute_on_bridge('audio_stream ws://backend:8765/{call_uuid} mixed 20'),bridge(loopback/AI_CALL)"
             )
         else:
-            # PSTN 外呼：通过运营商网关导出，接通后 park
+            # PSTN 外呼：通过运营商网关导出，接通后 uuid_transfer 到 AI_Handler
+            # 与内部分机统一：先建立通道，再 uuid_transfer 到 AI_Handler
             pstn_vars = (
                 f"origination_uuid={call_uuid},"
                 f"ai_agent=true,"
                 f"export_ai_agent=true,"
-                f"export_task_id={task_id},"
-                f"export_script_id={script_id},"
-                f"export_call_target_type={target_type},"
-                f"export_original_destination={phone},"
                 f"export_origination_uuid={call_uuid},"
+                f"task_id={task_id},"
+                f"script_id={script_id},"
                 f"origination_caller_id_number={caller_id},"
                 f"originate_timeout={originate_timeout}"
             )
@@ -178,7 +183,7 @@ class AsyncESLConnection:
         socket 连接在 sofia A-leg 上（用户电话侧），媒体路径经过 FreeSWITCH，
         确保 uuid_broadcast TTS 和 uuid_audio_stream 都能正确工作。
 
-        PSTN 外呼：使用 uuid_broadcast socket 方式（保持原有逻辑）。
+        PSTN 外呼：同样 uuid_transfer 到 AI_Handler（保持统一）。
         """
         try:
             # 先等待 originate 完成，通道被创建
@@ -731,8 +736,10 @@ class AsyncESLPool:
             # socket(async full) 已建立，CallAgent 由 ESL socket 自动启动
             logger.info(f"[{call_uuid[:8]}] 内部分机已接通，socket 连接由 dialplan ai_call_handler 处理")
         else:
-            # PSTN 外呼：&park() + 等待后续处理
-            logger.info(f"[{call_uuid[:8]}] PSTN 外呼已接通，等待后续处理")
+            # PSTN 外呼：B-leg (sofia/gateway) 已匹配 ai_outbound_bleg dialplan
+            # dialplan 已执行 answer → record_session → socket(async full)
+            # CallAgent 由 B-leg 的 ESL socket 自动启动，A-leg 停留在 park
+            logger.info(f"[{call_uuid[:8]}] PSTN 外呼已接通，socket 连接由 B-leg dialplan ai_outbound_bleg 处理")
 
     async def _transfer_to_ai_handler(self, call_uuid: str):
         """执行 uuid_transfer 将通道转到 AI_Handler (9998 XML internal)。
