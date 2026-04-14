@@ -37,21 +37,32 @@
 - **现象**：TTS 播放返回 +OK 但用户听不到声音
 - **日期**：2026-04-14
 
+### 4. ❌ audio_stream 挂载在 loopback B-leg
+- **命令**：在 loopback B-leg（CallAgent socket 通道）上执行 `uuid_audio_stream` 或 dialplan `audio_stream`
+- **问题**：loopback B-leg 的 read 方向在 bridge(softia ↔ loopback) 中捕获不到 sofia 侧的用户语音
+- **现象**：WebSocket 收到完整音频帧（2704 帧 / 54 秒），但全是静音（max_rms=0），ASR 无法识别
+- **注意**：与 Zoiper 编解码无关，编解码不匹配会导致呼叫建立失败而非静音
+- **日期**：2026-04-14
+
 ## 当前外呼策略（已验证有效）
 
-### 内部分机：bridge(loopback/AI_CALL) + CallAgent uuid_displace 开场白 + socket(async full)
-- **命令**：`originate [{vars}] user/1002@domain &bridge(loopback/AI_CALL)`
+### 内部分机：bridge(loopback/AI_CALL) + sofia A-leg audio_stream + CallAgent uuid_displace
+- **命令**：`originate [{vars}] user/1002@domain &answer(),execute_on_bridge('audio_stream ws://backend:8765/{call_uuid} mixed 20'),bridge(loopback/AI_CALL)`
 - **流程**：
-  1. originate 创建 sofia A-leg，`&bridge(loopback/AI_CALL)` 创建 loopback B-leg
-  2. sofia A-leg (用户电话) ↔ loopback B-leg (AI_CALL)
-  3. loopback B-leg 匹配 default.xml 的 `ai_call_handler` 扩展
-  4. dialplan 执行：answer → sleep → record_session → socket(async full)
-  5. socket 连接后端 ESL Outbound → CallAgent.run()
-  6. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
-  7. **`uuid_displace` 必须写到 sofia A-leg UUID**（不是 loopback-a），用户才能听到
-  8. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
+  1. originate 创建 sofia A-leg（用户电话侧）
+  2. `&answer()` 接听 sofia A-leg
+  3. `execute_on_bridge('audio_stream ...')` 在 sofia A-leg 上启动 audio_stream（mixed=双向混音）
+     - sofia A-leg 是用户语音通过 RTP 进入的地方，read=用户说话，write=TTS
+     - mixed = 用户语音 + TTS 混音，ASR 能同时捕获两者
+  4. `bridge(loopback/AI_CALL)` 桥接到 loopback B-leg
+  5. loopback B-leg 匹配 default.xml 的 `ai_call_handler` 扩展
+  6. dialplan 执行：answer → sleep → record_session → socket(async full)
+  7. socket 连接后端 ESL Outbound → CallAgent.run()
+  8. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
+  9. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
+  10. ASR 通过 WebSocket 接收 sofia A-leg 的 audio_stream 音频（mixed 方向）
 - **关键**：loopback 不是 sofia 端点，bridge 后 RTP 不会旁路
-- **关键**：`uuid_displace` 的目标必须是 sofia A-leg UUID，loopback-a 是 FreeSWITCH 内部端点，写到它用户听不到
+- **关键**：audio_stream 必须在 sofia A-leg 上（不是 loopback B-leg），否则收到的是静音
 - **`uuid_displace` 正确目标查找**（`esl_service.py` `_discover_aleg_uuid()` + `play()`）：
   - 优先级：`other_loopback_from_uuid` > `export_origination_uuid` > `origination_uuid` > `signal_bond` > `other_loopback_leg_uuid`
   - `other_loopback_from_uuid` = sofia A-leg UUID ✓（正确目标）
