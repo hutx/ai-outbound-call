@@ -139,8 +139,10 @@ class AsyncESLConnection:
             # ★ 关键：在 sofia A-leg 上启动 audio_stream（不是 loopback B-leg）
             # sofia A-leg 是用户语音通过 RTP 进入的地方，loopback B-leg 的
             # read 方向在 bridge 中捕获不到 sofia 侧的用户语音。
-            # answer() → bridge(loopback/AI_CALL)
-            # audio_stream 由 CallAgent._start_audio_stream_on_aleg() 在 sofia A-leg 上启动
+            # 流程：
+            #   1. &answer() 接听 sofia A-leg
+            #   2. execute_on_bridge('audio_stream ...') 在 sofia A-leg 上启动音频流
+            #   3. bridge(loopback/AI_CALL) 桥接到 loopback B-leg
             cmd = (
                 f"originate {{{channel_vars}}}{endpoint} "
                 f"&bridge(loopback/AI_CALL)"
@@ -1089,30 +1091,33 @@ class ESLSocketCallSession:
         except Exception as e:
             logger.warning(f"[{self._uuid[:8]}] B-leg uuid_audio_stream 失败: {e}")
 
-    async def _start_audio_stream_on_aleg(self):
+    async def _start_audio_stream_on_aleg(self, aleg_uuid: str = None):
         """
         在 sofia A-leg 上启动 uuid_audio_stream 捕获用户语音。
         B-leg 的 socket 模式下无法捕获用户语音（read 被 socket 截获）。
 
-        关键：必须在 bridge 建立后才能获取 A-leg UUID。
-        如果 bridge 未建立，返回 False 让调用方延迟重试。
+        参数:
+            aleg_uuid: 如果调用方已经通过 channel_vars 找到了 A-leg UUID，直接传入即可。
+                       如果为 None，则通过 uuid_getvar 实时查询。
         """
         if not self.esl_pool or not self.ws_server:
             return False
 
-        a_leg_uuid = None
+        a_leg_uuid = aleg_uuid
 
-        # 方式 1：通过 uuid_getvar 获取 bridge_partner_uuid_str（bridge 建立后才有值）
-        try:
-            result = await self.esl_pool.api(
-                f"uuid_getvar {self._uuid} bridge_partner_uuid_str"
-            )
-            val = result.strip()
-            if val and val != "-ERR" and val != "_undef_":
-                a_leg_uuid = val
-                logger.info(f"[{self._uuid[:8]}] 通过 bridge_partner_uuid_str 找到 A-leg: {a_leg_uuid[:8]}")
-        except Exception as e:
-            logger.debug(f"[{self._uuid[:8]}] bridge_partner_uuid_str 查询失败: {e}")
+        # 如果没有提供 aleg_uuid，通过 uuid_getvar 实时查询
+        if not a_leg_uuid:
+            # 方式 1：通过 uuid_getvar 获取 bridge_partner_uuid_str（bridge 建立后才有值）
+            try:
+                result = await self.esl_pool.api(
+                    f"uuid_getvar {self._uuid} bridge_partner_uuid_str"
+                )
+                val = result.strip()
+                if val and val != "-ERR" and val != "_undef_":
+                    a_leg_uuid = val
+                    logger.info(f"[{self._uuid[:8]}] 通过 bridge_partner_uuid_str 找到 A-leg: {a_leg_uuid[:8]}")
+            except Exception as e:
+                logger.debug(f"[{self._uuid[:8]}] bridge_partner_uuid_str 查询失败: {e}")
 
         # 方式 2：通过 uuid_getvar 获取 signal_bond
         if not a_leg_uuid:
@@ -1444,9 +1449,13 @@ class ESLSocketCallSession:
 
         if aleg_uuid:
             self._aleg_uuid = aleg_uuid
+            logger.info(f"[{self._uuid}] A-leg UUID: {aleg_uuid[:8]}... (来源: {aleg_type})")
+        else:
+            logger.debug(f"[{self._uuid}] 未找到 A-leg UUID")
 
         # ★ 优先检查 WebSocket audio_stream 是否已启动
         #    如果 WebSocket 连接已建立，直接使用已有的 queue
+        logger.info(f"[{self._uuid}] start_audio_capture: ws_server={self.ws_server is not None}, connections_active={self.ws_server.stats.get('connections_active', 0) if self.ws_server else 'N/A'}")
         if self.ws_server and self.ws_server.stats.get("connections_active", 0) > 0:
             queue = await self.ws_server.get_session_queue(self._uuid, timeout=2.0)
             if queue is not None:
@@ -1455,24 +1464,38 @@ class ESLSocketCallSession:
                 self._audio_mode = "websocket"
                 return queue
 
-        # 尝试在 sofia A-leg 上启动 uuid_audio_stream 实时推送
-        if self.ws_server and self.esl_pool and aleg_uuid:
+        # ★ 关键：在 sofia A-leg 上启动 uuid_audio_stream 捕获用户语音
+        if self.ws_server and self.esl_pool:
+            aleg_stream_ok = await self._start_audio_stream_on_aleg(aleg_uuid=aleg_uuid)
+            if aleg_stream_ok:
+                # A-leg audio_stream 已启动，使用 A-leg 的 WebSocket queue
+                a_leg = self._aleg_uuid or aleg_uuid
+                if a_leg:
+                    queue = await self.ws_server.get_session_queue(a_leg, timeout=5.0)
+                    if queue is not None:
+                        logger.info(f"[{self._uuid}] A-leg audio_stream WebSocket 已就绪，使用 A-leg 队列")
+                        self._audio_started = True
+                        self._audio_mode = "websocket"
+                        return queue
+                    logger.warning(f"[{self._uuid}] A-leg audio_stream 启动成功但 WebSocket queue 未就绪")
+
+        # 降级 1：在 B-leg 上尝试 uuid_audio_stream（仅能捕获 TTS 回声）
+        if self.ws_server and self.esl_pool:
             try:
-                ws_url = f"ws://backend:8765/{aleg_uuid}"
+                ws_url = f"ws://backend:8765/{self._uuid}"
                 result = await self.esl_pool.api(
-                    f"uuid_audio_stream {aleg_uuid} start {ws_url} mono 8000"
+                    f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
                 )
                 if result.strip().startswith("+OK"):
-                    logger.info(f"[{self._uuid}] uuid_audio_stream on sofia A-leg ({aleg_uuid[:8]}): {ws_url}")
+                    logger.info(f"[{self._uuid}] B-leg uuid_audio_stream 启动成功: {ws_url}")
                     self._audio_started = True
                     self._audio_mode = "websocket"
-                    # 使用 aleg_uuid 查找 WebSocket 连接
-                    queue = await self.ws_server.get_session_queue(aleg_uuid, timeout=5.0)
+                    queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
                     return queue or self._audio_queue
                 else:
-                    logger.debug(f"[{self._uuid}] A-leg uuid_audio_stream 返回: {result.strip()[:200]}")
+                    logger.debug(f"[{self._uuid}] B-leg uuid_audio_stream 返回: {result.strip()[:200]}")
             except Exception as e:
-                logger.debug(f"[{self._uuid}] A-leg uuid_audio_stream 失败: {e}")
+                logger.debug(f"[{self._uuid}] B-leg uuid_audio_stream 失败: {e}")
 
         # 降级：文件轮询
         logger.warning(f"[{self._uuid}] uuid_audio_stream 不可用，降级文件轮询")
