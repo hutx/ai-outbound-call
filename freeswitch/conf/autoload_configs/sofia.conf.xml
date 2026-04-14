@@ -92,7 +92,8 @@
         <!-- NAT 穿透（云服务器/公网部署必须配置） -->
         <param name="ext-sip-ip" value="$${external_sip_ip}"/>
         <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
-        <param name="apply-nat-acl" value="nat.auto"/>
+        <param name="apply-nat-acl" value="force_nat"/>
+        <param name="aggressive-nat-detection" value="true"/>
         <!-- STUN 服务器（用于探测公网 IP） -->
         <param name="stun-enabled"      value="true"/>
         <param name="stun-auto-disable" value="true"/>
@@ -185,7 +186,9 @@
         <!-- NAT 穿透（Docker 容器部署必须配置，否则 SDP 中为容器内网 IP） -->
         <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
         <param name="ext-sip-ip" value="$${external_sip_ip}"/>
-        <param name="apply-nat-acl" value="nat.auto"/>
+        <param name="apply-nat-acl" value="force_nat"/>
+        <param name="aggressive-nat-detection" value="true"/>
+        <param name="local-network-acl" value="loopback.auto"/>
         <param name="disable-srv-lookups" value="true"/>
         <param name="auto-rtp-bug" value="true"/>
 
@@ -196,6 +199,11 @@
         <param name="inbound-codec-prefs"  value="PCMU,PCMA,G729"/>
         <param name="outbound-codec-prefs" value="PCMU,PCMA,G729"/>
         <param name="dtmf-type"            value="rfc2833"/>
+
+        <!-- ★ 强制 RTP 经过 FreeSWITCH 软件媒体层（不是直接旁路到对方） -->
+        <!-- 确保 uuid_broadcast TTS 和 mod_audio_stream 捕获都能工作 -->
+        <param name="media-option" value="proxy-media"/>
+
         <param name="session-timeout"      value="1800"/>
         <param name="context"              value="internal"/>
         <param name="hold-music"           value="$${hold_music}"/>

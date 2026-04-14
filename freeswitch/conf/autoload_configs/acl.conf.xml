@@ -47,5 +47,10 @@
       <node type="allow" cidr="192.168.0.0/16" />
     </list>
 
+    <!-- 🌟 强制所有连接使用 ext-rtp-ip（Docker 容器 NAT 环境） -->
+    <list name="force_nat" default="allow">
+      <node type="allow" cidr="0.0.0.0/0" />
+    </list>
+
   </network-lists>
 </configuration>

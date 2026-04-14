@@ -11,6 +11,7 @@ CallAgent — 生产级通话代理
 """
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Optional, AsyncGenerator
@@ -115,63 +116,116 @@ class AudioStreamAdapter:
         self._play_start_time = time.time()
         self._listen_start_time = self._play_start_time
         timeout_count = 0
-        while not self._stopped:
-            try:
-                chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
-            except asyncio.TimeoutError:
-                timeout_count += 1
-                elapsed_silence_ms = (time.time() - last_audio_ts) * 1000
-                initial_wait_ms = (
-                    (time.time() - self._listen_start_time) * 1000
-                    if self._listen_start_time is not None
-                    else 0
-                )
-                if timeout_count % 50 == 0:
-                    logger.debug(f"[adapter] 等待音频: {initial_wait_ms/1000:.1f}s, 超时次数={timeout_count}, 队列大小={self._queue.qsize()}")
-                if self._started_speaking and elapsed_silence_ms >= self._vad_silence_ms:
-                    break
-                if not self._started_speaking and initial_wait_ms >= 15000:
-                    break
-                continue
-            if not chunk:
+
+        # 🎵 调试：收集送入 ASR 的音频
+        import tempfile
+        dump_dir = os.environ.get("FS_RECORDING_PATH", "/recordings") + "/debug"
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(dump_dir, f"asr_input_{int(time.time())}.pcm")
+        dump_file = open(dump_path, "wb")
+        dump_bytes = 0
+
+        # 等待队列就绪：至少有一帧入队后再开始消费
+        # 防止在音频流尚未开始推送时就启动超时计数
+        # 注意：uuid_audio_stream 可能在 bridge 完成后才启动（最多 20+ 秒）
+        logger.debug(f"[adapter] 等待队列有音频数据... (队列大小={self._queue.qsize()})")
+        ready_deadline = time.time() + 30.0  # 最多等 30 秒
+        while time.time() < ready_deadline and not self._stopped:
+            if not self._queue.empty():
+                logger.debug(f"[adapter] 队列就绪，开始消费 (队列大小={self._queue.qsize()})")
                 break
-
-            chunk_duration_ms = self._chunk_duration_ms(chunk)
-            rms = self._vad.frame_rms(chunk)
-            has_speech = rms > self._vad.energy_threshold
-            self._total_chunks += 1
-            self._max_rms = max(self._max_rms, rms)
-
-            if has_speech:
-                self._started_speaking = True
-                self._silence_ms = 0.0
-                last_audio_ts = time.time()
-                self._speech_chunks += 1
-                self._speech_ms += chunk_duration_ms
+            await asyncio.sleep(0.1)
+        else:
+            if self._stopped:
+                logger.debug(f"[adapter] 适配器已停止，跳过消费")
             else:
-                self._silence_ms += chunk_duration_ms
-                if not self._started_speaking:
-                    if self._silence_ms >= 2000:
+                logger.warning(f"[adapter] 等待队列超时（30s），无音频数据")
+
+        try:
+            while not self._stopped:
+                try:
+                    chunk = await asyncio.wait_for(self._queue.get(), timeout=0.08)
+                except asyncio.TimeoutError:
+                    timeout_count += 1
+                    elapsed_silence_ms = (time.time() - last_audio_ts) * 1000
+                    if timeout_count % 50 == 0:
+                        logger.debug(f"[adapter] 等待音频: 超时次数={timeout_count}, 队列大小={self._queue.qsize()}")
+                    if self._started_speaking and elapsed_silence_ms >= self._vad_silence_ms:
+                        break
+                    # 移除固定 15 秒初始超时：改为 VAD 驱动的退出
+                    # 如果队列持续为空且未检测到语音，最多等待 5 秒后退出
+                    # 注意：计时从收到第一帧音频开始，而非从 listen_start 开始
+                    initial_wait = (time.time() - last_audio_ts) * 1000
+                    if not self._started_speaking and initial_wait >= 5000:
+                        logger.debug(f"[adapter] 初始等待 5s 无语音，退出")
                         break
                     continue
+                if not chunk:
+                    break
 
-            # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
-            should_barge_in = False
-            if has_speech and self._barge_in_enabled and self._play_start_time is not None:
-                elapsed_ms = (time.time() - self._play_start_time) * 1000
-                in_protect_start = elapsed_ms < self._protect_start_ms
-                in_protect_end = False
-                if self._total_duration_ms > 0:
-                    remaining_ms = self._total_duration_ms - elapsed_ms
-                    in_protect_end = remaining_ms < self._protect_end_ms
-                should_barge_in = not in_protect_start and not in_protect_end
+                chunk_duration_ms = self._chunk_duration_ms(chunk)
+                rms = self._vad.frame_rms(chunk)
+                has_speech = rms > self._vad.energy_threshold
+                self._total_chunks += 1
+                self._max_rms = max(self._max_rms, rms)
 
-            if should_barge_in and self._barge_in_event and not self._barge_in_event.is_set():
-                self._barge_in_event.set()
-            yield chunk
-            if self._started_speaking and not has_speech and self._silence_ms >= self._vad_silence_ms:
-                break
-        yield b""  # ASR 结束信号
+                if has_speech:
+                    self._started_speaking = True
+                    self._silence_ms = 0.0
+                    last_audio_ts = time.time()
+                    self._speech_chunks += 1
+                    self._speech_ms += chunk_duration_ms
+                    if self._speech_chunks <= 3:
+                        logger.info(f"[adapter] 检测到语音 #{self._speech_chunks}: rms={rms} threshold={self._vad.energy_threshold} chunk={len(chunk)}B duration={chunk_duration_ms:.1f}ms")
+                else:
+                    self._silence_ms += chunk_duration_ms
+                    if not self._started_speaking:
+                        if self._silence_ms >= 2000:
+                            break
+                        continue
+
+                # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
+                should_barge_in = False
+                if has_speech and self._barge_in_enabled and self._play_start_time is not None:
+                    elapsed_ms = (time.time() - self._play_start_time) * 1000
+                    in_protect_start = elapsed_ms < self._protect_start_ms
+                    in_protect_end = False
+                    if self._total_duration_ms > 0:
+                        remaining_ms = self._total_duration_ms - elapsed_ms
+                        in_protect_end = remaining_ms < self._protect_end_ms
+                    should_barge_in = not in_protect_start and not in_protect_end
+
+                if should_barge_in and self._barge_in_event and not self._barge_in_event.is_set():
+                    self._barge_in_event.set()
+
+                # 写入调试文件
+                dump_bytes += len(chunk)
+                dump_file.write(chunk)
+
+                yield chunk
+                if self._started_speaking and not has_speech and self._silence_ms >= self._vad_silence_ms:
+                    break
+            yield b""  # ASR 结束信号
+        finally:
+            dump_file.close()
+            if dump_bytes > 0:
+                wav_path = dump_path.replace(".pcm", ".wav")
+                try:
+                    from backend.utils.audio import write_wav
+                    pcm_data = open(dump_path, "rb").read()
+                    write_wav(wav_path, pcm_data, sample_rate=8000)
+                    dur = len(pcm_data) / 16000.0
+                    logger.info(
+                        f"[adapter] ASR 输入已保存: {wav_path} "
+                        f"({dump_bytes} bytes, {dur:.1f}s, "
+                        f"speech={self._speech_ms:.0f}ms, max_rms={self._max_rms})"
+                    )
+                except Exception as e:
+                    logger.warning(f"[adapter] WAV 保存失败: {e}")
+            try:
+                os.remove(dump_path)
+            except OSError:
+                pass
 
 
 class CallAgent:
@@ -337,6 +391,12 @@ class CallAgent:
                            protect_start_ms: int = 3000, protect_end_ms: int = 3000,
                            total_duration_ms: float = 0) -> str:
         self.sm.transition(CallState.USER_SPEAKING)
+
+        # 通话已断开时跳过 ASR
+        if not self.session._connected:
+            logger.info(f"[{self.ctx.uuid}] 会话已断开，跳过 ASR")
+            return ""
+
         audio_queue = await self.session.start_audio_capture()
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
