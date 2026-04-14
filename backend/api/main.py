@@ -41,6 +41,7 @@ logging.basicConfig(
     level=logging.DEBUG if config.debug else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,19 @@ async def _handle_call_session(session: ESLSocketCallSession):
 async def lifespan(app: FastAPI):
     global _esl_pool, _esl_listener, _ws_server, _asr, _tts, _llm, _scheduler
 
-    logger.info("━" * 50)
+    # ★ 显式配置日志（uvicorn 的 --log-level 不会配置根日志器）
+    _log_level = logging.DEBUG if config.debug else logging.INFO
+    _root = logging.getLogger()
+    _root.setLevel(_log_level)
+    if not _root.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        _root.addHandler(_h)
+    logging.getLogger("backend").setLevel(_log_level)
+
+    print("━" * 50, flush=True)
+    print("  智能外呼系统启动", flush=True)
+    print("━" * 50, flush=True)
     logger.info("  智能外呼系统启动")
     logger.info("━" * 50)
 
