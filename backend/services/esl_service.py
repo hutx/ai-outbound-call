@@ -1445,27 +1445,15 @@ class ESLSocketCallSession:
         else:
             logger.debug(f"[{self._uuid}] 未找到 A-leg UUID")
 
-        # ★ 优先检查 WebSocket audio_stream 是否已启动
-        #    如果 WebSocket 连接已建立，创建订阅者队列，由 _relay_ws_audio 广播
-        logger.info(f"[{self._uuid}] start_audio_capture: ws_server={self.ws_server is not None}, connections_active={self.ws_server.stats.get('connections_active', 0) if self.ws_server else 'N/A'}")
-        if self.ws_server and self.ws_server.stats.get("connections_active", 0) > 0:
-            queue = await self.ws_server.get_session_queue(self._uuid, timeout=2.0)
-            if queue is not None:
-                logger.info(f"[{self._uuid}] 检测到 dialplan audio_stream 已就绪")
-                sub_queue = asyncio.Queue(maxsize=500)
-                self._audio_subscribers.append(sub_queue)
-                logger.info(f"[{self._uuid}] WebSocket 音频订阅队列已创建 (总数: {len(self._audio_subscribers)})")
-                # 启动 WebSocket → 订阅者广播中继
-                asyncio.create_task(self._relay_ws_audio(queue))
-                self._audio_started = True
-                self._audio_mode = "websocket"
-                return sub_queue
-
-        # ★ 如果 WebSocket 连接未就绪，通过 uuid_audio_stream API 在 sofia A-leg 上启动
+        # ★ 通过 uuid_audio_stream API 在 sofia A-leg 上启动音频采集
         #    这是内部分机外呼的主要路径：
         #    1. 找到 sofia A-leg UUID（other_loopback_from_uuid）
-        #    2. 执行 uuid_audio_stream {aleg_uuid} start ws://backend:8765/{call_uuid} mixed 20
+        #    2. 执行 uuid_audio_stream {aleg_uuid} start ws://backend:8765/{call_uuid} mono 8000
         #    3. 等待 WebSocket 连接建立
+        #    4. 创建订阅队列，启动 _relay_ws_audio 广播
+        #
+        #    注意：不能用 connections_active > 0 判断 dialplan audio_stream 是否就绪，
+        #    因为该连接可能来自之前的调用或其他来源，无法代表当前通话有音频流。
         if self.esl_pool and not self._audio_started:
             stream_uuid = aleg_uuid or self._aleg_uuid
             if not stream_uuid and self._channel_vars:
