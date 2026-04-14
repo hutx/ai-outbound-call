@@ -138,10 +138,9 @@ class AsyncESLConnection:
         if endpoint_type == "internal_extension":
             # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
             # audio_stream 通过 uuid_audio_stream API 在 B-leg socket 连接后启动
-            # record_session 在 bridge 之前执行，确保录制 sofia A-leg 用户语音
             cmd = (
                 f"originate {{{simple_vars}}}{endpoint} "
-                f"&answer(),record_session(/recordings/{call_uuid}.wav),bridge(loopback/AI_CALL)"
+                f"&bridge(loopback/AI_CALL)"
             )
         else:
             # PSTN 外呼：通过运营商网关导出，接通后 uuid_transfer 到 AI_Handler
