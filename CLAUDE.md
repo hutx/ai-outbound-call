@@ -5,9 +5,10 @@
 
 ## 开发环境部署
 - **后端代码**：通过 Docker 卷映射（`./backend:/app/backend`），修改代码后 `docker compose restart backend` 即可生效，无需 rebuild
-- **FreeSWITCH 配置**：通过 Docker 卷映射（`./freeswitch/conf/:/etc/freeswitch/` 部分挂载），修改配置后需执行 `docker exec outbound_freeswitch fs_cli -x "fsctl send_sighup"` 重载
+- **FreeSWITCH 配置**：通过 Docker 卷映射（`./freeswitch/conf/:/etc/freeswitch/` 部分挂载），修改配置后需执行 `docker exec outbound_freeswitch1 fs_cli -x "reloadxml"` 重载
 - **Docker Compose 配置**：`docker/docker-compose.yml`
-- **FreeSWITCH 日志**：`docker logs outbound_freeswitch`
+- **FreeSWITCH 日志**：`docker logs outbound_freeswitch1`
+- **FreeSWITCH 容器名**：`outbound_freeswitch1`
 - **后端日志**：`docker logs outbound_backend`
 
 ## 架构概览
@@ -39,36 +40,47 @@
 
 ### 4. ❌ audio_stream 挂载在 loopback B-leg
 - **命令**：在 loopback B-leg（CallAgent socket 通道）上执行 `uuid_audio_stream` 或 dialplan `audio_stream`
-- **问题**：loopback B-leg 的 read 方向在 bridge(softia ↔ loopback) 中捕获不到 sofia 侧的用户语音
+- **问题**：loopback B-leg 的 read 方向在 bridge(sofia ↔ loopback) 中捕获不到 sofia 侧的用户语音
 - **现象**：WebSocket 收到完整音频帧（2704 帧 / 54 秒），但全是静音（max_rms=0），ASR 无法识别
 - **注意**：与 Zoiper 编解码无关，编解码不匹配会导致呼叫建立失败而非静音
 - **日期**：2026-04-14
 
+### 5. ❌ sofia profile 级 proxy-media 参数不生效
+- **配置**：`<param name="proxy-media" value="true"/>` 在 sofia profile settings 中
+- **问题**：FreeSWITCH 重启后仍显示 `proxy-media=false`，该参数被静默忽略
+- **注意**：`proxy-media` 是 channel variable，不是 profile 级参数
+- **日期**：2026-04-15
+
 ## 当前外呼策略（已验证有效）
 
-### 内部分机：bridge(loopback/AI_CALL) + sofia A-leg audio_stream + CallAgent uuid_displace
-- **命令**：`originate [{vars}] user/1002@domain &answer(),execute_on_bridge('audio_stream ws://backend:8765/{call_uuid} mixed 20'),bridge(loopback/AI_CALL)`
+### 内部分机：bridge(loopback/AI_CALL) + sofia A-leg uuid_audio_stream + CallAgent uuid_displace
+- **命令**：`originate [{vars},proxy_media=true] user/1002@domain &bridge(loopback/AI_CALL)`
 - **流程**：
   1. originate 创建 sofia A-leg（用户电话侧）
-  2. `&answer()` 接听 sofia A-leg
-  3. `execute_on_bridge('audio_stream ...')` 在 sofia A-leg 上启动 audio_stream（mixed=双向混音）
-     - sofia A-leg 是用户语音通过 RTP 进入的地方，read=用户说话，write=TTS
-     - mixed = 用户语音 + TTS 混音，ASR 能同时捕获两者
-  4. `bridge(loopback/AI_CALL)` 桥接到 loopback B-leg
-  5. loopback B-leg 匹配 default.xml 的 `ai_call_handler` 扩展
-  6. dialplan 执行：answer → sleep → record_session → socket(async full)
-  7. socket 连接后端 ESL Outbound → CallAgent.run()
-  8. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
-  9. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
-  10. ASR 通过 WebSocket 接收 sofia A-leg 的 audio_stream 音频（mixed 方向）
+  2. `proxy_media=true` 确保 RTP 经过 FreeSWITCH 软件层，不旁路
+  3. `&bridge(loopback/AI_CALL)` 桥接到 loopback B-leg
+  4. loopback B-leg 匹配 default.xml 的 `ai_call_handler` 扩展
+  5. dialplan 执行：answer → sleep → record_session → socket(async full)
+  6. socket 连接后端 ESL Outbound → CallAgent.run()
+  7. CallAgent._discover_aleg_uuid() → _start_audio_stream()
+  8. `uuid_audio_stream {sofia_a_leg_uuid} start ws://backend:8765/{stream_uuid} mono 8000`
+  9. FreeSWITCH 通过 mod_audio_stream 将 RTP 音频推送到 WebSocket
+  10. 后端 WebSocket 服务接收音频 → 广播到 ASR 订阅队列
+  11. ASR WebSocket 推送识别结果 → CallAgent 处理
+  12. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
+  13. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
 - **关键**：loopback 不是 sofia 端点，bridge 后 RTP 不会旁路
-- **关键**：audio_stream 必须在 sofia A-leg 上（不是 loopback B-leg），否则收到的是静音
+- **关键**：`proxy_media=true` 必须在 sofia A-leg 的 originate 命令中设置，否则 RTP 旁路导致 audio_stream 只推静音
+- **关键**：`uuid_audio_stream` 的 WebSocket URL 必须使用 **stream_uuid**（sofia A-leg UUID），不能用 B-leg UUID
+  - FreeSWITCH 通过 URL 中的 UUID 标识 WebSocket 连接
+  - 后端查找 WebSocket 队列也必须用同一个 UUID
 - **`uuid_displace` 正确目标查找**（`esl_service.py` `_discover_aleg_uuid()` + `play()`）：
   - 优先级：`other_loopback_from_uuid` > `export_origination_uuid` > `origination_uuid` > `signal_bond` > `other_loopback_leg_uuid`
   - `other_loopback_from_uuid` = sofia A-leg UUID ✓（正确目标）
   - `other_loopback_leg_uuid` = loopback-a UUID ✗（写到它用户听不到）
 - **首次播放延迟**：`play()` 中首次 `uuid_displace` 等待 3 秒（socket 接管媒体路径需要时间），后续播放等待 2 秒
-- **代码位置**：`backend/services/esl_service.py` — `ESLPool.originate()`, `ESLSocketCallSession.play()`, `_discover_aleg_uuid()`
+- **降级方案**：文件轮询 — 读取 `export_origination_uuid` 对应的 record_session WAV 文件
+- **代码位置**：`backend/services/esl_service.py` — `ESLPool.originate()`, `ESLSocketCallSession.start_audio_capture()`, `_discover_aleg_uuid()`, `_poll_audio_file()`
 
 ### PSTN 外呼：&park() + dialplan socket
 - **命令**：`originate [{vars}]sofia/gateway/... &park()`
@@ -85,12 +97,24 @@
 - `{var=val}` — FreeSWITCH 变量，紧跟端点不能有空格
 - `[var=val]` — channel 变量，允许端点前有空格
 
+### ✅ `proxy_media=true` 必须在 originate 命令中设置
+- **问题**：sofia A-leg 的 RTP 默认旁路（P2P），`uuid_audio_stream` 捕获不到用户语音
+- **表现**：WebSocket 连接成功但只收到 1 帧静音（320 bytes, max_rms=0）
+- **修复**：`originate [{vars},proxy_media=true] user/1002@domain &bridge(loopback/AI_CALL)`
+- **验证**：`max_rms=12679 total_chunks=160 speech_detected=True`
+- **日期**：2026-04-15
+
 ### ✅ `uuid_displace` 必须写到 sofia A-leg UUID
 - **问题**：loopback bridge 后有两个相关 UUID：
   - `other_loopback_leg_uuid` = loopback-a（FreeSWITCH 内部端点，写到它用户听不到）
   - `other_loopback_from_uuid` = sofia A-leg（用户电话侧，写到它用户才能听到）
 - **验证**：`uuid_displace(loopback-a)` 返回 +OK 但用户听不到；`uuid_displace(sofia A-leg)` 用户能听到
 - **日期**：2026-04-14
+
+### ✅ `uuid_audio_stream` WebSocket URL 必须使用 stream_uuid
+- **问题**：WebSocket URL 使用 B-leg UUID，FreeSWITCH 连接标识不匹配，后端收不到音频
+- **修复**：`ws://backend:8765/{stream_uuid}`（stream_uuid = sofia A-leg UUID）
+- **日期**：2026-04-15
 
 ## 项目结构
 - `backend/` - Python FastAPI 后端
