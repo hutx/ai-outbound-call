@@ -138,8 +138,9 @@ class AsyncESLConnection:
         if endpoint_type == "internal_extension":
             # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
             # audio_stream 通过 uuid_audio_stream API 在 B-leg socket 连接后启动
+            # proxy_media=true 确保 RTP 经过 FreeSWITCH 软件层，mod_audio_stream 能捕获音频
             cmd = (
-                f"originate {{{simple_vars}}}{endpoint} "
+                f"originate {{{simple_vars},proxy_media=true}}{endpoint} "
                 f"&bridge(loopback/AI_CALL)"
             )
         else:
