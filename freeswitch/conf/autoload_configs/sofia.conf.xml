@@ -202,6 +202,7 @@
 
         <!-- ★ 强制 RTP 经过 FreeSWITCH 软件媒体层（不是直接旁路到对方） -->
         <!-- 确保 uuid_broadcast TTS 和 mod_audio_stream 捕获都能工作 -->
+        <param name="inbound-proxy-media" value="true"/>
         <param name="media-option" value="proxy-media"/>
 
         <param name="session-timeout"      value="1800"/>
