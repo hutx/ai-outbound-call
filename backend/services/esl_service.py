@@ -1467,7 +1467,7 @@ class ESLSocketCallSession:
                 stream_uuid = self._uuid
                 logger.warning(f"[{self._uuid}] 未找到 A-leg UUID，降级到 B-leg uuid_audio_stream")
 
-            ws_url = f"ws://backend:8765/{self._uuid}"
+            ws_url = f"ws://backend:8765/{stream_uuid}"
             try:
                 result = await self.esl_pool.api(
                     f"uuid_audio_stream {stream_uuid} start {ws_url} mono 8000"
@@ -1481,7 +1481,7 @@ class ESLSocketCallSession:
                     for attempt in range(50):
                         await asyncio.sleep(0.1)
                         if self.ws_server and self.ws_server.stats.get("connections_active", 0) > 0:
-                            queue = await self.ws_server.get_session_queue(self._uuid, timeout=1.0)
+                            queue = await self.ws_server.get_session_queue(stream_uuid, timeout=1.0)
                             if queue is not None:
                                 sub_queue = asyncio.Queue(maxsize=500)
                                 self._audio_subscribers.append(sub_queue)
