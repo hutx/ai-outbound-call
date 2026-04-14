@@ -1495,60 +1495,34 @@ class ESLSocketCallSession:
             except Exception as e:
                 logger.warning(f"[{self._uuid}] uuid_audio_stream 启动失败: {e}")
 
-        # ★ 文件轮询：使用 sofia A-leg 的 record_session WAV 文件
-        #    record_session 在 originate 命令的 dialplan 中于 sofia A-leg 上执行
-        #    （answer → record_session(${uuid}.wav) → bridge），
-        #    录制到 /recordings/{sofia_a_leg_uuid}.wav。
-        #    B-leg 通过 other_loopback_from_uuid 获取 sofia A-leg UUID，
-        #    从而定位该录音文件。
+        # ★ 文件轮询：使用 B-leg（loopback）的 record_session WAV 文件
+        #    record_session 在 dialplan ai_call_handler 中于 loopback B-leg 上执行，
+        #    录制到 /recordings/{b_leg_uuid}.wav。
+        #    self._uuid 就是 B-leg UUID（ESL socket 通道）。
+        #
+        #    注意：sofia A-leg 上没有执行 record_session（originate 命令中只有
+        #    &answer() + execute_on_bridge + bridge），所以 A-leg 录音文件几乎为空。
 
-        # 确定 A-leg UUID
-        record_uuid = aleg_uuid or self._aleg_uuid
-        if not record_uuid and self.esl_pool:
-            # 最后尝试：通过 uuid_getvar 查询
-            for var in ("other_loopback_from_uuid", "signal_bond"):
-                try:
-                    result = await self.esl_pool.api(f"uuid_getvar {self._uuid} {var}")
-                    val = result.strip()
-                    if val and val not in ("-ERR", "_undef_"):
-                        record_uuid = val
-                        logger.info(f"[{self._uuid}] 从 uuid_getvar {var} 找到 A-leg: {record_uuid[:8]}...")
-                        break
-                except Exception as e:
-                    logger.debug(f"[{self._uuid}] {var} 查询失败: {e}")
+        record_uuid = self._uuid
+        record_path = f"/recordings/{record_uuid}.wav"
 
-        if not record_uuid:
-            logger.warning(f"[{self._uuid}] 未找到 A-leg UUID，降级到 B-leg uuid_record")
-            record_uuid = self._uuid
-            record_path = f"/recordings/asr_bleg_{record_uuid}.raw"
+        # 检查 B-leg record_session 文件是否已存在
+        if os.path.exists(record_path):
+            logger.info(f"[{self._uuid}] 找到 B-leg record_session 文件: {record_path}")
+        else:
+            # 文件不存在，在 B-leg 上启动 uuid_record
+            logger.warning(f"[{self._uuid}] B-leg record_session 文件不存在: {record_path}，启动 uuid_record")
             if self.esl_pool:
                 try:
-                    result = await self.esl_pool.api(f"uuid_record {record_uuid} start {record_path}")
+                    raw_path = f"/recordings/asr_bleg_{record_uuid}.raw"
+                    result = await self.esl_pool.api(f"uuid_record {record_uuid} start {raw_path}")
                     if result.strip().startswith("+OK"):
-                        logger.info(f"[{self._uuid}] B-leg uuid_record 启动: {record_path}")
+                        record_path = raw_path
+                        logger.info(f"[{self._uuid}] B-leg uuid_record 启动: {raw_path}")
+                    else:
+                        logger.warning(f"[{self._uuid}] B-leg uuid_record 返回: {result.strip()[:200]}")
                 except Exception as e:
                     logger.warning(f"[{self._uuid}] B-leg uuid_record 失败: {e}")
-        else:
-            record_path = f"/recordings/{record_uuid}.wav"
-
-        # 检查 A-leg record_session 文件是否已存在
-        if os.path.exists(record_path):
-            logger.info(f"[{self._uuid}] 找到 A-leg record_session 文件: {record_path}")
-        elif record_uuid == self._uuid:
-            # B-leg 降级路径：文件不存在，已在上面启动 uuid_record
-            pass
-        else:
-            # A-leg 文件不存在，尝试在 A-leg 上启动 uuid_record
-            logger.warning(f"[{self._uuid}] A-leg record_session 文件不存在: {record_path}")
-            if self.esl_pool:
-                try:
-                    result = await self.esl_pool.api(f"uuid_record {record_uuid} start {record_path}")
-                    if result.strip().startswith("+OK"):
-                        logger.info(f"[{self._uuid}] A-leg uuid_record 启动: {record_path}")
-                    else:
-                        logger.warning(f"[{self._uuid}] A-leg uuid_record 返回: {result.strip()[:200]}")
-                except Exception as e:
-                    logger.warning(f"[{self._uuid}] A-leg uuid_record 失败: {e}")
 
         asr_path = record_path
         self._audio_mode = "file_poll"
