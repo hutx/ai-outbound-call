@@ -125,21 +125,9 @@ class AudioStreamAdapter:
         dump_file = open(dump_path, "wb")
         dump_bytes = 0
 
-        # 等待队列就绪：至少有一帧入队后再开始消费
-        # 防止在音频流尚未开始推送时就启动超时计数
-        # 注意：uuid_audio_stream 可能在 bridge 完成后才启动（最多 20+ 秒）
-        logger.debug(f"[adapter] 等待队列有音频数据... (队列大小={self._queue.qsize()})")
-        ready_deadline = time.time() + 30.0  # 最多等 30 秒
-        while time.time() < ready_deadline and not self._stopped:
-            if not self._queue.empty():
-                logger.debug(f"[adapter] 队列就绪，开始消费 (队列大小={self._queue.qsize()})")
-                break
-            await asyncio.sleep(0.1)
-        else:
-            if self._stopped:
-                logger.debug(f"[adapter] 适配器已停止，跳过消费")
-            else:
-                logger.warning(f"[adapter] 等待队列超时（30s），无音频数据")
+        # ★ 修复：移除 30 秒队列等待逻辑，立即开始消费
+        #    实时通话场景中，音频是持续推送的，不应该等待队列就绪
+        #    如果队列为空，VAD 超时会自动退出
 
         try:
             while not self._stopped:
@@ -151,14 +139,11 @@ class AudioStreamAdapter:
                     if timeout_count % 50 == 0:
                         logger.debug(f"[adapter] 等待音频: 超时次数={timeout_count}, 队列大小={self._queue.qsize()}")
                     if self._started_speaking and elapsed_silence_ms >= self._vad_silence_ms:
+                        # 用户已开始说话且静音超过阈值，认为说完
                         break
-                    # 移除固定 15 秒初始超时：改为 VAD 驱动的退出
-                    # 如果队列持续为空且未检测到语音，最多等待 5 秒后退出
-                    # 注意：计时从收到第一帧音频开始，而非从 listen_start 开始
-                    initial_wait = (time.time() - last_audio_ts) * 1000
-                    if not self._started_speaking and initial_wait >= 5000:
-                        logger.debug(f"[adapter] 初始等待 5s 无语音，退出")
-                        break
+                    # ★ 修复：移除 5 秒初始等待超时
+                    #    实时通话中用户可能在任何时间说话，不应因为前 5 秒无语音就退出
+                    #    改为：如果队列持续为空且从未检测到语音，最多等待 ASR_TIMEOUT 后退出
                     continue
                 if not chunk:
                     break
@@ -180,6 +165,7 @@ class AudioStreamAdapter:
                 else:
                     self._silence_ms += chunk_duration_ms
                     if not self._started_speaking:
+                        # 未检测到语音开始时，连续静音 2 秒后退出（给 TTS 残余音频的时间）
                         if self._silence_ms >= 2000:
                             break
                         continue
@@ -338,7 +324,7 @@ class CallAgent:
         silence_retries = 0
 
         while self.sm.should_continue() and self.session._connected:
-            # 监听用户
+            # 监听用户（继续 _say 期间未完成的 ASR 监听）
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             cfg = self._last_barge_in_config
             user_text = await self._listen_user(
@@ -455,6 +441,26 @@ class CallAgent:
 
         return final_text
 
+    async def _barge_in_asr_loop(self, adapter: AudioStreamAdapter):
+        """
+        后台 ASR 循环，用于 TTS 播放期间的 barge-in 检测。
+        此方法不关心 ASR 最终结果，只关心是否检测到用户语音（用于打断）。
+        """
+        try:
+            async with asyncio.timeout(ASR_TIMEOUT):
+                async for result in self._asr_with_retry(adapter.stream()):
+                    if result.is_final and result.text:
+                        logger.info(f"[{self.ctx.uuid}] barge-in ASR: {result.text!r}")
+                        # 用户说话了，设置打断事件
+                        if not self._barge_in.is_set():
+                            self._barge_in.set()
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 超时")
+        except Exception as e:
+            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 异常: {e}")
+        finally:
+            adapter.stop()
+
     async def _asr_with_retry(self, audio_gen: AsyncGenerator[bytes, None]):
         """ASR 带超时的流式识别"""
         async def _gen_with_timeout():
@@ -554,6 +560,27 @@ class CallAgent:
                 logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，跳过播放")
                 return
 
+            # ★ 关键修复：在 TTS 播放期间启动后台 ASR 监听
+            #    这样用户可以在 TTS 播放期间（除保护期外）打断 AI
+            #    后台 ASR 检测到用户语音后会设置 _barge_in 事件
+            logger.info(f"[{self.ctx.uuid}] 启动后台 barge-in ASR 监听")
+            audio_queue = await self.session.start_audio_capture()
+            logger.info(f"[{self.ctx.uuid}] barge-in 音频队列已获取, 大小={audio_queue.qsize()}")
+            barge_in_adapter = AudioStreamAdapter(
+                audio_queue,
+                vad_silence_ms=config.asr.vad_silence_ms,
+                barge_in_cb=self._barge_in,
+                barge_in_enabled=barge_in_enabled,
+                total_duration_ms=total_duration_ms,
+                protect_start_ms=protect_start_ms,
+                protect_end_ms=protect_end_ms,
+            )
+            # 启动后台 ASR 任务（不阻塞 TTS 播放）
+            barge_in_asr_task = asyncio.create_task(
+                self._barge_in_asr_loop(barge_in_adapter)
+            )
+            logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动")
+
             # 收集 TTS 音频
             pcm_parts = []
             total_bytes = 0
@@ -561,9 +588,15 @@ class CallAgent:
                 if chunk:
                     pcm_parts.append(chunk)
                     total_bytes += len(chunk)
+                # 每收到一个 TTS chunk 都检查 barge-in
+                if self._barge_in.is_set():
+                    logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，停止 TTS 收集")
+                    barge_in_adapter.stop()
+                    break
 
             if not pcm_parts:
                 logger.warning(f"[{self.ctx.uuid}] TTS 流式播放收到空音频")
+                barge_in_adapter.stop()
                 return
 
             from backend.utils.audio import write_wav
@@ -594,6 +627,11 @@ class CallAgent:
             await self.session.play(temp_path, timeout=60.0)
 
             logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
+
+            # 停止后台 ASR 任务
+            barge_in_adapter.stop()
+            await asyncio.gather(barge_in_asr_task, return_exceptions=True)
+
         except asyncio.TimeoutError:
             logger.error(f"[{self.ctx.uuid}] TTS 超时")
         except Exception as e:
