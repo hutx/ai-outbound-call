@@ -10,8 +10,11 @@
     </extension>
 
     <!-- AI 外呼 B-leg 处理（ originate 创建的 B-leg 在 default context 中） -->
+    <!-- 只匹配 PSTN 外呼：destination_number 是 97776+手机号（16位） -->
     <extension name="ai_outbound_bleg">
-      <condition field="${ai_agent}" expression="^true$">
+      <condition field="${ai_agent}" expression="^true$" break="never"/>
+      <condition field="destination_number" expression="^97776\d{11}$">
+        <action application="set" data="origination_uuid=${export_origination_uuid}"/>
         <action application="answer"/>
         <action application="sleep" data="500"/>
         <action application="set" data="RECORD_STEREO=false"/>
@@ -19,16 +22,6 @@
         <action application="set" data="record_file=/recordings/${uuid}.wav"/>
         <action application="record_session" data="/recordings/${uuid}.wav"/>
         <action application="socket" data="backend:9999 async full"/>
-      </condition>
-    </extension>
-
-    <!-- 诊断：匹配 1001 目标 -->
-    <extension name="debug_1001">
-      <condition field="destination_number" expression="^1001$">
-        <action application="answer"/>
-        <action application="sleep" data="500"/>
-        <action application="log" data="WARNING DEBUG: matched debug_1001 extension!"/>
-        <action application="park"/>
       </condition>
     </extension>
 
@@ -83,6 +76,9 @@
         <action application="set" data="media_bug_answer_req=true"/>
         <action application="set" data="record_file=/recordings/${uuid}.wav"/>
         <action application="record_session" data="/recordings/${uuid}.wav"/>
+        <!-- 注意：不在这里播放 opening_greeting，因为 &bridge() 是异步的，
+              playback 可能在 sofia 侧用户应答前就执行了。
+             开场白由 CallAgent 在 socket 连接后通过 uuid_displace 播放。 -->
         <action application="socket" data="backend:9999 async full"/>
       </condition>
     </extension>
@@ -125,9 +121,5 @@
     </extension>
 
   </context>
-
-
-
-
 
 </include>

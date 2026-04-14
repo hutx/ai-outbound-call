@@ -202,13 +202,14 @@ async def lifespan(app: FastAPI):
         logger.warning(f"✗ ESL 事件监听器启动失败（将降级轮询）: {e}")
         _esl_listener = None
 
-    # ESL 连接池（传入事件监听器用于应答检测）
+    # ESL 连接池（传入事件监听器用于应答检测 + ws_server 用于音频流）
     _esl_pool = AsyncESLPool(
         host=config.freeswitch.host,
         port=config.freeswitch.port,
         password=config.freeswitch.password,
         pool_size=5,
         event_listener=_esl_listener,
+        ws_server=_ws_server,
     )
     try:
         await _esl_pool.start()

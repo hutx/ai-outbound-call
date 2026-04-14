@@ -63,7 +63,7 @@ services:
   freeswitch:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.freeswitch-ai
+      dockerfile: docker/Dockerfile.freeswitch.audio
     #
     # ★ 推荐镜像：drachtio/freeswitch-modules（含常用模块，开箱即用）
     #   备选：signalwire/freeswitch:1.10.10（官方，更新，但部分模块需手动安装）
@@ -76,27 +76,22 @@ services:
     container_name: outbound_freeswitch
     restart: unless-stopped
     #
-    # 使用桥接网络以允许服务间通信
-    # RTP 媒体流使用大范围动态端口（16384-32768）的问题可以通过端口映射解决
+    # ★ 桥接网络 + 端口映射
+    # rtp-ip 使用 $${local_ip_v4}（192.168.5.15），SDP 中正确显示宿主机 IP
     #
     ports:
-      # ESL 端口 - 用于与后端服务通信
       - "8021:8021"
-      # ESL 传输端口
       - "8022:8022"
-      # SIP 端口
       - "5060:5060"
       - "5060:5060/udp"
       - "5080:5080"
       - "5080:5080/udp"
-      # RTP 媒体流端口范围（重要：必须映射以支持语音通话）
       - "16384-16484:16384-16484/udp"
       - "16485-16585:16485-16585/udp"
       - "16586-16686:16586-16686/udp"
       - "16687-16787:16687-16787/udp"
       - "16788-16888:16788-16888/udp"
       - "16889-17384:16889-17384/udp"
-      # 如果需要外部访问其他端口，继续添加...
     volumes:
       # ★ 只挂载 autoload_configs 和 dialplan，其余用镜像内置默认值
       #   挂载整个 /etc/freeswitch 会覆盖镜像内的 ivr/sounds 等必要文件

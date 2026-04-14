@@ -10,13 +10,13 @@
      <!-- ============================================================
        网络配置
        ============================================================ -->
-     <!-- 本机内网 IP（Docker 容器每次重启 IP 可能不同，由 FreeSWITCH 自动检测） -->
-     <!-- 不设置 local_ip_v4，使用内置运行时变量 -->
-     <!-- SIP 域名称（用于用户注册和查找，NAT 环境下使用公网/宿主机 IP） -->
+     <!-- 本机内网 IP（Docker 容器使用宿主机 IP，需手动填写） -->
+     <X-PRE-PROCESS cmd="set" data="local_ip_v4=192.168.5.15" />
+     <!-- SIP 域名称 -->
      <X-PRE-PROCESS cmd="set" data="sip_domain=192.168.5.15" />
      <!-- 公网 IP（NAT 环境必填，云服务器填弹性公网 IP） -->
-     <X-PRE-PROCESS cmd="set" data="external_rtp_ip=61.180.80.84" />
-     <X-PRE-PROCESS cmd="set" data="external_sip_ip=61.180.80.84" />
+     <X-PRE-PROCESS cmd="set" data="external_rtp_ip=192.168.5.15" />
+     <X-PRE-PROCESS cmd="set" data="external_sip_ip=192.168.5.15" />
      <!-- SIP 监听端口 -->
      <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060" />
      <X-PRE-PROCESS cmd="set" data="internal_tls_port=5061" />

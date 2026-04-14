@@ -111,24 +111,20 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
-        # FreeSWITCH 变量继承规则：
-        # - [var=val] 仅设置 A-leg
-        # - [export_var=val] 导出到 B-leg（bridge 后的通道）
-        # B-leg（loopback/AI_CALL）需要 ai_agent 等变量才能匹配 dialplan 扩展
+        # FreeSWITCH 变量传递规则：
+        # - {var=val} 设置 A-leg 变量
+        # - {export_var=val} 导出到 bridge 后的 B-leg（仅对 sofia/gateway 有效）
+        # - loopback B-leg 不继承 export_ 变量，需要在 bridge 命令中显式传递
         channel_vars = (
             f"origination_uuid={call_uuid},"
             f"ai_agent=true,"
-            f"export_ai_agent=true,"
-            f"export_task_id={task_id},"
-            f"export_script_id={script_id},"
-            f"export_call_target_type={target_type},"
-            f"export_original_destination={phone},"
-            f"export_origination_uuid={call_uuid},"
+            f"task_id={task_id},"
+            f"script_id={script_id},"
             f"origination_caller_id_number={caller_id},"
             f"originate_timeout={originate_timeout}"
         )
 
-        endpoint, endpoint_type, _ = self._build_originate_target(
+        endpoint, endpoint_type, ext_num = self._build_originate_target(
             phone=phone,
             gateway=gateway,
             internal_domain=internal_domain,
@@ -138,13 +134,12 @@ class AsyncESLConnection:
             # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
             # loopback/AI_CALL 进入 default context 的 ai_call_handler，
             # 该扩展按顺序执行 record_session → socket(backend:9999)
+            # 开场白由 CallAgent 在 socket 连接后通过 uuid_displace 播放
             cmd = (
                 f"originate {{{channel_vars}}}{endpoint} &bridge(loopback/AI_CALL)"
             )
         else:
-            # PSTN 外呼：导出 ai_agent=true，default context 的 ai_outbound_bleg
-            # 扩展会 answer → record_session → socket(backend:9999)
-            # 添加 export_ 前缀使变量传递到 B-leg（PSTN 通道）
+            # PSTN 外呼：通过运营商网关导出，接通后 park
             pstn_vars = (
                 f"origination_uuid={call_uuid},"
                 f"ai_agent=true,"
@@ -177,26 +172,26 @@ class AsyncESLConnection:
         self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str
     ):
         """
-        B-leg 应答后：
-        1. 启动 uuid_audio_stream WebSocket 音频流
-        2. 广播 socket 应用连接后端 ESL Outbound 服务
-        通过轮询通道状态来检测应答（避免 ESL event 订阅时序问题）。
-        """
-        ws_url = f"ws://backend:8765/{call_uuid}"
-        socket_addr = "backend:9999 async full"
+        内部分机应答后：通过 uuid_transfer 转到 AI_Handler (9998 XML internal)。
 
+        AI_Handler 执行 bypass_media=false + record_session + socket(async full)，
+        socket 连接在 sofia A-leg 上（用户电话侧），媒体路径经过 FreeSWITCH，
+        确保 uuid_broadcast TTS 和 uuid_audio_stream 都能正确工作。
+
+        PSTN 外呼：使用 uuid_broadcast socket 方式（保持原有逻辑）。
+        """
         try:
             # 先等待 originate 完成，通道被创建
             await asyncio.sleep(2)
 
-            # 轮询等待通道出现（originate 需要时间建立 B-leg）
+            # 轮询等待通道出现（originate 需要时间建立通道）
             channel_exists = False
             for attempt in range(60):  # 最多等 60 秒
                 try:
                     result = await self.api(f"uuid_dump {call_uuid}")
                     if result and "-ERR No such channel" not in result:
                         channel_exists = True
-                        logger.info(f"[{call_uuid[:8]}] B-leg 已建立，启动 AI 流程")
+                        logger.info(f"[{call_uuid[:8]}] 通道已建立，启动 AI 流程")
                         break
                     elif result and "-ERR No such channel" in result:
                         await asyncio.sleep(1)
@@ -208,39 +203,85 @@ class AsyncESLConnection:
                 logger.warning(f"[{call_uuid[:8]}] 外呼等待通道建立超时")
                 return
 
-            # 1. 启动 mod_audio_stream WebSocket 音频流
-            try:
+            if target_type == "internal_extension":
+                # ★ 内部分机：uuid_transfer 到 AI_Handler (9998 XML internal)
+                # sofia A-leg 转到 AI_Handler 后执行：
+                # bypass_media=false + proxy_media=true + record_session + socket(async)
+                # socket 直接连接在 sofia A-leg（用户电话侧）上。
                 result = await self.api(
-                    f"uuid_audio_stream {call_uuid} start {ws_url} mono 8000"
+                    f"uuid_transfer {call_uuid} 9998 XML internal"
                 )
-                if result.strip().startswith("+OK"):
-                    logger.info(f"[{call_uuid[:8]}] uuid_audio_stream 启动成功: {ws_url}")
-                else:
-                    logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}")
-            except Exception as e:
-                logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 失败: {e}，降级文件轮询")
-
-            # 2. 广播 socket 应用连接后端 ESL Outbound 服务
-            try:
-                result = await self.api(
-                    f"uuid_broadcast {call_uuid} {socket_addr} both"
-                )
-                logger.info(f"[{call_uuid[:8]}] uuid_broadcast socket 结果: {result.strip()[:100]}")
-            except Exception as e:
-                logger.error(f"[{call_uuid[:8]}] uuid_broadcast socket 失败: {e}")
+                logger.info(f"[{call_uuid[:8]}] uuid_transfer 到 AI_Handler 结果: {result.strip()[:100]}")
+            else:
+                # PSTN 外呼：广播 socket 应用连接后端 ESL Outbound 服务
+                socket_addr = "backend:9999 async full"
+                try:
+                    result = await self.api(
+                        f"uuid_broadcast {call_uuid} {socket_addr} both"
+                    )
+                    logger.info(f"[{call_uuid[:8]}] uuid_broadcast socket 结果: {result.strip()[:100]}")
+                except Exception as e:
+                    logger.error(f"[{call_uuid[:8]}] uuid_broadcast socket 失败: {e}")
 
         except Exception as e:
             logger.error(f"[{call_uuid[:8]}] _on_call_answered 异常: {e}", exc_info=True)
 
+    async def _pre_generate_opening(self, script_id: str) -> Optional[str]:
+        """预生成开场白 TTS 文件，供 dialplan playback 使用。
+
+        dialplan 的 ai_call_handler 在 socket 之前执行 playback(${opening_greeting})，
+        此时媒体路径正常（sofia A-leg 直接到 loopback-a），TTS 能播放到用户电话。
+
+        TTS 文件必须生成到 /recordings（FreeSWITCH 可访问的共享目录）。
+        返回 TTS 文件路径，失败返回 None。
+        """
+        try:
+            from backend.services.async_script_utils import get_opening_for_call
+            from backend.services.tts_service import create_tts_client
+
+            opening = await get_opening_for_call(script_id, {})
+            opening_text = opening.get("reply", "")
+            if not opening_text:
+                logger.warning("预生成开场白：开场白文本为空")
+                return None
+
+            tts = create_tts_client()
+            tts_path = await tts.synthesize(opening_text)
+            if not tts_path or not os.path.exists(tts_path):
+                logger.warning(f"预生成开场白：TTS 合成失败或文件不存在: {tts_path}")
+                return None
+
+            # TTS 默认输出到 /tmp/tts_cache，FreeSWITCH 无法访问
+            # 需要复制到 /recordings（FreeSWITCH 共享目录）
+            shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
+            os.makedirs(shared_dir, exist_ok=True)
+            if not tts_path.startswith(shared_dir):
+                import shutil
+                dest = os.path.join(shared_dir, os.path.basename(tts_path))
+                shutil.copy2(tts_path, dest)
+                tts_path = dest
+                logger.debug(f"已复制 TTS 到共享目录: {tts_path}")
+
+            return tts_path
+        except Exception as e:
+            logger.warning(f"预生成开场白异常: {e}")
+            return None
+
     @staticmethod
     def _build_originate_target(phone: str, gateway: str, internal_domain: str) -> tuple[str, str, str]:
+        """构建 originate 目标端点。
+
+        内部分机：使用 user/{ext}@{domain}，通过 FreeSWITCH 目录解析
+        为已注册的 sofia 联系人地址，避免 sofia/internal 直接寻址
+        时产生独立 inbound 通道导致无法桥接的问题。
+        PSTN：通过运营商网关导出。
+        """
         normalized = (phone or "").strip()
         if INTERNAL_EXTENSION_RE.fullmatch(normalized):
-            domain = (internal_domain or "$${local_ip_v4}").strip()
-            logger.debug(f"ESL originate → {phone} (internal_extension) → {normalized}@{domain}")
-            # 对于AI代理呼叫，使用拨号计划扩展而不是直接连接用户
-            # 这样可以确保AI处理逻辑被执行
-            return f"user/{normalized}@{domain}", "internal_extension", normalized
+            domain = (internal_domain or "192.168.5.15").strip()
+            endpoint = f"user/{normalized}@{domain}"
+            logger.debug(f"ESL originate → {phone} (internal_extension) → {endpoint}")
+            return endpoint, "internal_extension", normalized
 
         dest = f"97776{normalized}"
         return f"sofia/gateway/{gateway}/{dest}", "pstn", dest
@@ -535,6 +576,7 @@ class AsyncESLPool:
         pool_size: int = 5,
         idle_timeout: float = 60.0,
         event_listener: Optional[ESLEventListener] = None,
+        ws_server=None,
     ):
         self._host = host
         self._port = port
@@ -546,6 +588,13 @@ class AsyncESLPool:
         self._pool_lock = asyncio.Lock()
         self._keepalive_task: Optional[asyncio.Task] = None
         self._event_listener = event_listener
+        self._ws_server = ws_server  # AudioStreamWebSocket for uuid_audio_stream
+        # call_uuid(origination_uuid) → B-leg UUID 映射（由 _wait_and_start_ai_from_queue 设置）
+        self._aleg_uuids: dict[str, str] = {}
+
+    @property
+    def ws_server(self):
+        return self._ws_server
 
     async def start(self):
         for _ in range(self._pool_size):
@@ -648,8 +697,8 @@ class AsyncESLPool:
         """从已注册的 queue 等待 CHANNEL_ANSWER。
 
         对于内部分机：originate 使用 &bridge(loopback/AI_CALL)，
-        拨号计划会处理 audio_stream + socket，无需额外操作。
-        对于 PSTN 外呼：需要后续完善（目前 &park() + transfer）。
+        拨号计划会处理 socket，无需额外操作。
+        对于 PSTN 外呼：&park() 后等待后续处理。
         """
         try:
             result = await asyncio.wait_for(queue.get(), timeout=60.0)
@@ -664,8 +713,66 @@ class AsyncESLPool:
             return
 
         answered_uuid = result.get("uuid", call_uuid)
-        logger.info(f"[{call_uuid[:8]}] 收到 CHANNEL_ANSWER (实际 uuid={answered_uuid[:8]})")
-        # 拨号计划已处理 audio_stream + socket，CallAgent 由 ESL socket 自动启动
+        logger.info(f"[{call_uuid[:8]}] 收到 CHANNEL_ANSWER (实际 uuid={answered_uuid[:8] if len(str(answered_uuid)) > 8 else answered_uuid})")
+
+        event_data = result.get("event", {})
+        full_uuid = event_data.get("Unique-ID", answered_uuid)
+        if len(str(full_uuid)) < 30:
+            full_uuid = call_uuid
+
+        self._aleg_uuids[call_uuid] = full_uuid
+
+        # 判断是否为内部分机呼叫
+        phone = kwargs.get("phone", "")
+        is_internal = self._is_internal_extension(phone)
+
+        if is_internal:
+            # 内部分机：bridge(loopback/AI_CALL) 已匹配 ai_call_handler dialplan
+            # socket(async full) 已建立，CallAgent 由 ESL socket 自动启动
+            logger.info(f"[{call_uuid[:8]}] 内部分机已接通，socket 连接由 dialplan ai_call_handler 处理")
+        else:
+            # PSTN 外呼：&park() + 等待后续处理
+            logger.info(f"[{call_uuid[:8]}] PSTN 外呼已接通，等待后续处理")
+
+    async def _transfer_to_ai_handler(self, call_uuid: str):
+        """执行 uuid_transfer 将通道转到 AI_Handler (9998 XML internal)。
+
+        AI_Handler dialplan 执行：
+        - answer() + sleep(200) + record_session
+        - socket(backend:9999 async full) ← ESL Outbound
+        """
+        try:
+            result = await self.api(f"uuid_transfer {call_uuid} 9998 XML internal")
+            logger.info(f"[{call_uuid[:8]}] uuid_transfer 到 AI_Handler 结果: {result.strip()[:200]}")
+        except Exception as e:
+            logger.error(f"[{call_uuid[:8]}] uuid_transfer 失败: {e}")
+
+    async def _wait_for_bridge(self, call_uuid: str, timeout: float = 60.0) -> bool:
+        """轮询等待通道桥接完成。返回 True=已桥接，False=超时。
+
+        只检查 BRIDGE_UUID — 这是桥接完成的唯一可靠标志。
+        CS_EXCHANGE_MEDIA 可能是振铃/early media，不代表已桥接。
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                dump = await self.api(f"uuid_dump {call_uuid}")
+                if dump and "-ERR" not in dump and "BRIDGE_UUID" in dump:
+                    logger.info(f"[{call_uuid[:8]}] 检测到 BRIDGE_UUID，桥接完成")
+                    return True
+            except Exception as e:
+                logger.debug(f"[{call_uuid[:8]}] 轮询桥接状态失败: {e}")
+            await asyncio.sleep(1)
+        return False
+
+    def _is_internal_extension(self, phone: str) -> bool:
+        """判断是否为内部分机号码"""
+        normalized = (phone or "").strip()
+        return bool(INTERNAL_EXTENSION_RE.fullmatch(normalized))
+
+    async def get_aleg_uuid(self, call_uuid: str) -> Optional[str]:
+        """获取 A-leg UUID（用于 A-leg 录音路径查询）"""
+        return self._aleg_uuids.get(call_uuid)
 
     async def _wait_and_start_ai(self, call_uuid: str, phone: str, task_id: str, script_id: str, target_type: str):
         """
@@ -685,11 +792,11 @@ class AsyncESLPool:
         ws_url = f"ws://backend:8765/{answered_uuid}"
         socket_addr = "backend:9999 async full"
 
-        # 1. 启动 mod_audio_stream
+        # 1. 启动 mod_audio_stream (stereo 模式)
         try:
-            result = await self.api(f"uuid_audio_stream {answered_uuid} start {ws_url} mono 8000")
+            result = await self.api(f"uuid_audio_stream {answered_uuid} start {ws_url} stereo 8000")
             if result.strip().startswith("+OK"):
-                logger.info(f"[{call_uuid[:8]}] uuid_audio_stream 启动成功: {ws_url}")
+                logger.info(f"[{call_uuid[:8]}] uuid_audio_stream(stereo) 启动成功: {ws_url}")
             else:
                 logger.warning(f"[{call_uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}")
         except Exception as e:
@@ -773,6 +880,7 @@ class ESLSocketCallSession:
         self._audio_mode: str = "unknown"  # "websocket" | "file_poll" | "custom"
         self._audio_started: bool = False  # 防止重复启动 uuid_audio_stream
         self._active_uuid: Optional[str] = None  # CHANNEL_ANSWER 中捕获的实际通话 UUID
+        self._aleg_uuid: Optional[str] = None  # sofia A-leg UUID (bridge_partner)
 
     @property
     def uuid(self) -> Optional[str]:
@@ -806,56 +914,232 @@ class ESLSocketCallSession:
             if k.startswith("variable_"):
                 self._channel_vars[k[9:]] = v
 
+        # 通过 uuid_dump 获取完整 channel 信息，查找 A-leg UUID
+        if self.esl_pool:
+            try:
+                dump = await self.esl_pool.api(f"uuid_dump {self._uuid}")
+                import re
+                for var in ("other_loopback_leg_uuid", "signal_bond", "bridge_partner_uuid_str"):
+                    pattern = rf"Variable: {var}: ([\w-]+)"
+                    match = re.search(pattern, dump)
+                    if match and match.group(1) not in ("-ERR", "_undef_"):
+                        self._channel_vars[var] = match.group(1)
+                        logger.debug(f"[{self._uuid}] uuid_dump {var}={match.group(1)[:8]}...")
+            except Exception as e:
+                logger.debug(f"[{self._uuid}] uuid_dump 查询失败: {e}")
+
         logger.info(
             f"ESL Outbound 握手 uuid={self._uuid} "
             f"task={self._channel_vars.get('task_id','?')} "
-            f"script={self._channel_vars.get('script_id','?')}"
+            f"script={self._channel_vars.get('script_id','?')} "
+            f"orig_uuid={self._channel_vars.get('origination_uuid','?')} "
+            f"export_orig_uuid={self._channel_vars.get('export_origination_uuid','?')}"
         )
+        # 调试：打印所有 UUID 相关的 channel vars
+        uuid_keys = [k for k in self._channel_vars if 'uuid' in k.lower() or 'bond' in k.lower() or 'partner' in k.lower() or 'loopback' in k.lower() or 'bridge' in k.lower()]
+        if uuid_keys:
+            logger.info(f"[{self._uuid}] UUID 相关 channel_vars: { {k: self._channel_vars[k][:16] if len(self._channel_vars[k]) > 16 else self._channel_vars[k] for k in uuid_keys} }")
+
+        # 尽早发现 A-leg UUID（sofia 用户侧），确保 TTS 能送到用户电话
+        await self._discover_aleg_uuid()
+
+        # ★ audio_stream 现在由 dialplan 的 audio_stream 应用启动（AI_Handler 扩展），
+        #   不再需要从 ESL API 调用 uuid_audio_stream。
+        #   如果 dialplan 未设置 audio_stream（如 PSTN 外呼），
+        #   start_audio_capture() 会作为 fallback 处理。
 
         # 订阅此通话所有事件
         await self._send("myevents\n\n")
         await self._read_event()
         await self._send("divert_events on\n\n")
 
-        # 在 socket 控制下启动 uuid_audio_stream
-        # 关键：stream 需要放在用户音频流经的通道上才能捕获人声
-        #
-        # 音频路径分析：
-        #   sofia(A-leg, 用户麦克风) ↔ loopback-a ↔ loopback-b(socket)
-        #
-        # 测试结论：
-        # - B-leg (loopback-b): 只有 TTS 期间有音频，之后全是静音
-        # - sofia A-leg: 桥接时媒体路径可能被锁定，stream 也是静音
-        # - loopback-a: 理论上桥接两边的音频都流经此通道
-        if self.esl_pool and self.ws_server:
-            # 按优先级尝试不同 UUID：
-            # 1. other_loopback_leg_uuid: loopback-a 通道（桥接音频都流经此）
-            # 2. signal_bond: 桥接对端
-            # 3. 当前通道 UUID（降级方案）
-            stream_uuid = (
-                self._channel_vars.get("other_loopback_leg_uuid")
-                or self._channel_vars.get("signal_bond")
-                or self._uuid
+        return data
+
+    async def _early_start_audio_stream(self):
+        """在 connect() 中提前启动 uuid_audio_stream（幂等）。
+
+        挂载在 B-leg（当前 socket 通道）上，
+        后续 TTS uuid_broadcast 的音频会被 audio_stream 实时捕获。
+        这确保 audio_stream 在 greeting 播放前已就绪。
+        """
+        if self._audio_started or not self._uuid:
+            return
+        if not self.ws_server or not self.esl_pool:
+            logger.debug(f"[{self._uuid}] ws_server 或 esl_pool 不可用，跳过早期 audio_stream")
+            return
+
+        try:
+            ws_url = f"ws://backend:8765/{self._uuid}"
+            # 使用 read 模式：只捕获从用户方向来的音频（用户语音 → FreeSWITCH）
+            # 不用 mixed（默认），避免 TTS 回声混入
+            result = await self.esl_pool.api(
+                f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
             )
-            ws_url = f"ws://backend:8765/{stream_uuid}"
+            if result.strip().startswith("+OK"):
+                logger.info(f"[{self._uuid}] 早期 uuid_audio_stream 启动成功: {ws_url}")
+                self._audio_started = True
+                self._audio_mode = "websocket"
+                # 预先注册 queue，避免 start_audio_capture 重复启动
+                if self.ws_server:
+                    try:
+                        self._audio_queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0) or self._audio_queue
+                    except Exception:
+                        pass
+            else:
+                logger.debug(f"[{self._uuid}] 早期 uuid_audio_stream 返回: {result.strip()[:200]}")
+        except Exception as e:
+            logger.debug(f"[{self._uuid}] 早期 uuid_audio_stream 失败: {e}")
+
+    async def _discover_aleg_uuid(self):
+        """尽早发现用于 TTS uuid_broadcast 的目标 UUID。
+
+        bridge(loopback/AI_CALL) 架构下：
+        - sofia A-leg (用户电话) — 在 bridge 中 RTP 被旁路
+        - loopback-a (桥接端点) — 和 sofia A-leg 交换媒体
+        - loopback-b (socket 通道) — 当前 socket 所在的通道
+
+        TTS 必须广播到 loopback-a，因为它才是和 sofia A-leg
+        直接交换媒体的端点。广播到 sofia A-leg 在 bridge 中不生效。
+        """
+        if self._aleg_uuid:
+            return
+
+        aleg_uuid = None
+
+        # 1. other_loopback_from_uuid — sofia A-leg UUID（uuid_displace 的正确目标）
+        #    uuid_displace 必须写到 sofia A-leg，用户电话才能听到 TTS
+        aleg_uuid = self._channel_vars.get("other_loopback_from_uuid", "")
+        if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+            logger.info(f"[{self._uuid}] 从 other_loopback_from_uuid 找到 sofia A-leg: {aleg_uuid[:8]}...")
+
+        # 2. export_origination_uuid — sofia A-leg UUID
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("export_origination_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                logger.info(f"[{self._uuid}] 从 export_origination_uuid 找到 sofia A-leg: {aleg_uuid[:8]}...")
+
+        # 3. origination_uuid — sofia A-leg UUID
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("origination_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                logger.info(f"[{self._uuid}] 从 origination_uuid 找到 A-leg: {aleg_uuid[:8]}...")
+
+        # 4. signal_bond — 桥接对端
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("signal_bond", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                logger.info(f"[{self._uuid}] 从 signal_bond 找到桥接对端: {aleg_uuid[:8]}...")
+
+        # 5. other_loopback_leg_uuid — loopback-a（fallback，仅在以上都找不到时用）
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("other_loopback_leg_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                logger.warning(f"[{self._uuid}] 只能用 other_loopback_leg_uuid (loopback-a): {aleg_uuid[:8]}... uuid_displace 可能不生效")
+
+        # 6. 其他 channel_vars
+        if not aleg_uuid:
+            for var in ("asr_aleg_uuid", "bridge_partner_uuid_str", "signal_bond",
+                        "other_loopback_leg_uuid"):
+                val = self._channel_vars.get(var, "")
+                if val and val not in ("-ERR", "_undef_"):
+                    aleg_uuid = val
+                    logger.info(f"[{self._uuid}] 从 {var} 找到 A-leg: {aleg_uuid[:8]}...")
+                    break
+
+        # 5. 通过 uuid_getvar 查询（bridge 建立后才有值）
+        if not aleg_uuid and self.esl_pool:
+            for var in ("bridge_partner_uuid_str", "signal_bond"):
+                try:
+                    result = await self.esl_pool.api(f"uuid_getvar {self._uuid} {var}")
+                    val = result.strip()
+                    if val and val not in ("-ERR", "_undef_"):
+                        aleg_uuid = val
+                        logger.info(f"[{self._uuid}] 从 uuid_getvar {var} 找到 A-leg: {aleg_uuid[:8]}...")
+                        break
+                except Exception:
+                    pass
+
+        if aleg_uuid:
+            self._aleg_uuid = aleg_uuid
+            logger.info(f"[{self._uuid}] A-leg UUID 已发现: {aleg_uuid[:8]}...")
+        else:
+            logger.debug(f"[{self._uuid}] 暂未发现 A-leg UUID，稍后 start_audio_capture 会重试")
+
+    async def _start_audio_stream_bleg(self):
+        """在 B-leg 上启动 uuid_audio_stream（已知只能捕获 TTS 回声）"""
+        ws_url = f"ws://backend:8765/{self._uuid}"
+        try:
+            result = await self.esl_pool.api(
+                f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
+            )
+            if result.strip().startswith("+OK"):
+                logger.info(f"[{self._uuid[:8]}] uuid_audio_stream(mono) on B-leg: {ws_url}")
+                self._audio_started = True
+                self._audio_mode = "websocket"
+            else:
+                logger.warning(f"[{self._uuid[:8]}] B-leg uuid_audio_stream 返回: {result.strip()[:200]}")
+        except Exception as e:
+            logger.warning(f"[{self._uuid[:8]}] B-leg uuid_audio_stream 失败: {e}")
+
+    async def _start_audio_stream_on_aleg(self):
+        """
+        在 sofia A-leg 上启动 uuid_audio_stream 捕获用户语音。
+        B-leg 的 socket 模式下无法捕获用户语音（read 被 socket 截获）。
+
+        关键：必须在 bridge 建立后才能获取 A-leg UUID。
+        如果 bridge 未建立，返回 False 让调用方延迟重试。
+        """
+        if not self.esl_pool or not self.ws_server:
+            return False
+
+        a_leg_uuid = None
+
+        # 方式 1：通过 uuid_getvar 获取 bridge_partner_uuid_str（bridge 建立后才有值）
+        try:
+            result = await self.esl_pool.api(
+                f"uuid_getvar {self._uuid} bridge_partner_uuid_str"
+            )
+            val = result.strip()
+            if val and val != "-ERR" and val != "_undef_":
+                a_leg_uuid = val
+                logger.info(f"[{self._uuid[:8]}] 通过 bridge_partner_uuid_str 找到 A-leg: {a_leg_uuid[:8]}")
+        except Exception as e:
+            logger.debug(f"[{self._uuid[:8]}] bridge_partner_uuid_str 查询失败: {e}")
+
+        # 方式 2：通过 uuid_getvar 获取 signal_bond
+        if not a_leg_uuid:
             try:
                 result = await self.esl_pool.api(
-                    f"uuid_audio_stream {stream_uuid} start {ws_url} mono 8000"
+                    f"uuid_getvar {self._uuid} signal_bond"
                 )
-                if result.strip().startswith("+OK"):
-                    logger.info(
-                        f"[{self._uuid[:8]}] uuid_audio_stream 启动成功 on {stream_uuid[:8]}: {ws_url}"
-                    )
-                else:
-                    logger.warning(
-                        f"[{self._uuid[:8]}] uuid_audio_stream 返回: {result.strip()[:200]}"
-                    )
+                val = result.strip()
+                if val and val != "-ERR" and val != "_undef_":
+                    a_leg_uuid = val
+                    logger.info(f"[{self._uuid[:8]}] 通过 signal_bond 找到 A-leg: {a_leg_uuid[:8]}")
             except Exception as e:
-                logger.warning(
-                    f"[{self._uuid[:8]}] uuid_audio_stream 失败（将降级文件轮询）: {e}"
-                )
+                logger.debug(f"[{self._uuid[:8]}] signal_bond 查询失败: {e}")
 
-        return data
+        if not a_leg_uuid:
+            logger.debug(f"[{self._uuid[:8]}] Bridge 尚未建立，稍后重试")
+            return False
+
+        # 存储 A-leg UUID 供后续使用
+        self._aleg_uuid = a_leg_uuid
+        ws_url = f"ws://backend:8765/{a_leg_uuid}"
+        try:
+            result = await self.esl_pool.api(
+                f"uuid_audio_stream {a_leg_uuid} start {ws_url} mono 8000"
+            )
+            if result.strip().startswith("+OK"):
+                logger.info(f"[{self._uuid[:8]}] uuid_audio_stream(mono) on A-leg {a_leg_uuid[:8]}")
+                self._audio_started = True
+                self._audio_mode = "websocket"
+                return True
+            else:
+                logger.warning(f"[{self._uuid[:8]}] A-leg uuid_audio_stream 返回: {result.strip()[:200]}")
+        except Exception as e:
+            logger.warning(f"[{self._uuid[:8]}] A-leg uuid_audio_stream 失败: {e}")
+        return False
 
     # ── 通话控制 ──────────────────────────────────────────────
 
@@ -880,52 +1164,90 @@ class ESLSocketCallSession:
         return event_uuid
 
     async def play(self, audio_path: str, timeout: float = 60.0):
-        """播放音频：通过 ESL Inbound pool 的 uuid_broadcast API 播放
+        """播放音频。
 
-        sendmsg execute playback 在 Outbound socket 模式下有编解码/媒体路径问题，
-        改用 uuid_broadcast 更可靠。
+        bridge(loopback/AI_CALL) 架构下：
+        - Outbound socket 在 loopback-b 上
+        - 媒体路径：sofia A-leg ↔ loopback-a ↔ loopback-b(socket)
+
+        策略：使用 sofia A-leg UUID 的 uuid_displace（socket 接管后有效）。
+        首次播放需等待 socket(async full) 完全接管媒体路径。
         """
         import os
-        if not self.esl_pool:
-            # 降级：使用 sendmsg execute
-            logger.warning(f"[{self._uuid}] ESL pool 不可用，降级 sendmsg execute playback")
-            self._playback_done.clear()
-            await self.execute("playback", audio_path)
-            try:
-                await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
-                await self.stop_playback()
-            return
-
-        # 计算播放时长（用于等待）
+        # 计算播放时长
         try:
             file_size = os.path.getsize(audio_path)
-            # 8000Hz 16bit mono WAV: 44 header + 16000 bytes/sec
             audio_bytes = max(0, file_size - 44)
             estimated_duration = audio_bytes / 16000.0 if audio_bytes > 0 else 1.0
         except Exception:
             estimated_duration = 3.0
 
-        target_uuid = self._active_uuid or self._uuid
-        try:
-            result = await self.esl_pool.api(
-                f"uuid_broadcast {target_uuid} {audio_path} both"
-            )
-            logger.info(f"[{self._uuid}] uuid_broadcast({target_uuid}) 结果: {result.strip()[:100]}")
-        except Exception as e:
-            logger.error(f"[{self._uuid}] uuid_broadcast 失败: {e}，降级 sendmsg")
-            self._playback_done.clear()
-            await self.execute("playback", audio_path)
-            try:
-                await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
-                await self.stop_playback()
-            return
+        # 查找 sofia A-leg UUID（用于 uuid_displace 目标）
+        # 优先从 _channel_vars 直接获取，避免 uuid_dump 正则匹配失败
+        target_uuid = None
+        for var in ("other_loopback_from_uuid", "export_origination_uuid", "origination_uuid"):
+            val = self._channel_vars.get(var, "")
+            if val and val not in ("-ERR", "_undef_"):
+                target_uuid = val
+                logger.info(f"[{self._uuid}] 从 _channel_vars.{var} 找到 sofia A-leg: {target_uuid[:8]}...")
+                break
 
-        # 等待播放完成
-        await asyncio.sleep(estimated_duration)
+        # 如果 _channel_vars 没有，再尝试 uuid_dump
+        if not target_uuid and self.esl_pool:
+            try:
+                dump = await self.esl_pool.api(f"uuid_dump {self._uuid}")
+                import re
+                for var in ("other_loopback_from_uuid", "export_origination_uuid", "origination_uuid"):
+                    pattern = rf"Variable: {var}: ([\w-]+)"
+                    match = re.search(pattern, dump)
+                    if match and match.group(1) not in ("-ERR", "_undef_"):
+                        target_uuid = match.group(1)
+                        logger.info(f"[{self._uuid}] 从 uuid_dump {var} 找到 sofia A-leg: {target_uuid[:8]}...")
+                        break
+            except Exception as e:
+                logger.debug(f"[{self._uuid}] uuid_dump 查询失败: {e}")
+
+        if not target_uuid:
+            target_uuid = self._aleg_uuid or self._uuid
+
+        # 等待 socket(async full) 完全接管媒体路径
+        # 首次播放（开场白）需要更长等待，后续播放用较短延迟
+        if target_uuid and target_uuid != self._uuid:
+            if not hasattr(self, '_play_count'):
+                self._play_count = 0
+            if self._play_count == 0:
+                logger.info(f"[{self._uuid}] 首次播放，等待 socket 接管媒体路径（1秒）...")
+                await asyncio.sleep(1)
+            else:
+                logger.info(f"[{self._uuid}] 等待 socket 接管媒体路径（1秒）...")
+                await asyncio.sleep(1)
+            self._play_count += 1
+
+        if self.esl_pool and target_uuid and target_uuid != self._uuid:
+            # 使用 uuid_displace 替换 sofia A-leg 的写入媒体流
+            try:
+                result = await self.esl_pool.api(
+                    f"uuid_displace {target_uuid} start {audio_path} write"
+                )
+                logger.info(f"[{self._uuid}] uuid_displace({target_uuid[:8]}, write) 结果: {result.strip()[:100]}")
+                await asyncio.sleep(estimated_duration + 0.5)
+                # 停止 displace
+                try:
+                    await self.esl_pool.api(f"uuid_displace {target_uuid} stop")
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.warning(f"[{self._uuid}] uuid_displace 失败: {e}，降级 execute")
+
+        # 降级：通过 Outbound socket 的 execute playback
+        self._playback_done.clear()
+        await self.execute("playback", audio_path)
+        try:
+            await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
+            await self.stop_playback()
 
     async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
         """
@@ -1020,51 +1342,150 @@ class ESLSocketCallSession:
     async def start_audio_capture(self) -> asyncio.Queue:
         """开始捕获通话音频，返回 PCM 数据队列
 
-        优先通过 ESL API 的 uuid_audio_stream 启动实时音频流（mod_audio_stream），
-        降级为文件轮询（uuid_record 录音）。
+        桥接架构：sofia A-leg (用户电话) ↔ loopback B-leg (AI socket)
+
+        方案：
+          1. 找到 A-leg UUID，查找 A-leg 录音文件
+          2. 如果 A-leg 文件不存在，在 A-leg 上启动 uuid_record
+          3. 降级：在 B-leg 上启动 uuid_record
         """
+        import os
+
         if not self._uuid:
             logger.warning("无法启动音频捕获: UUID 为空")
             self._audio_mode = "none"
             return asyncio.Queue()
 
-        # 幂等：如果已经启动成功，直接返回音频队列
+        # 幂等：如果已经启动，直接返回
         if self._audio_started and self._audio_mode != "none":
-            logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}，跳过重复启动")
+            logger.debug(f"[{self._uuid}] 音频采集已启动，模式={self._audio_mode}")
             return self._audio_queue
 
-        # 方案 1：通过 ESL API 启动 mod_audio_stream 实时音频流
-        if self.esl_pool and self.ws_server:
+        asr_path = None
+
+        # 方案 1：找到 sofia A-leg UUID（用户语音来源：RTP 从用户电话传入）
+        # 优先级：
+        #   1. export_origination_uuid — sofia A-leg UUID（通过 originate export 传递）
+        #   2. other_loopback_from_uuid — sofia A-leg UUID（loopback 自动设置）
+        #   3. origination_uuid — dialplan 中通过 set 恢复
+        #   4. pool _aleg_uuids 映射 — 由 _wait_and_start_ai_from_queue 记录
+        #   5. other_loopback_leg_uuid — loopback A-leg UUID（备用）
+        #   6. uuid_getvar 查询
+        aleg_uuid = None
+        aleg_type = ""
+
+        # 1. export_origination_uuid = sofia A-leg UUID（最可靠，直接录用户 RTP）
+        aleg_uuid = self._channel_vars.get("export_origination_uuid", "")
+        if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+            aleg_type = "sofia"
+            logger.info(f"[{self._uuid}] 从 export_origination_uuid 找到 sofia A-leg: {aleg_uuid[:8]}...")
+
+        # 1b. other_loopback_from_uuid = sofia A-leg UUID
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("other_loopback_from_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                aleg_type = "sofia"
+                logger.info(f"[{self._uuid}] 从 other_loopback_from_uuid 找到 sofia A-leg: {aleg_uuid[:8]}...")
+
+        # 1c. origination_uuid（dialplan 中通过 set 恢复）
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("origination_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                aleg_type = "orig"
+                logger.info(f"[{self._uuid}] 从 origination_uuid 找到 A-leg: {aleg_uuid[:8]}...")
+
+        # 2. 通过 pool 映射
+        if not aleg_uuid and self.esl_pool:
+            for key in ("export_origination_uuid", "origination_uuid"):
+                orig_uuid = self._channel_vars.get(key, "")
+                if orig_uuid:
+                    aleg_uuid = await self.esl_pool.get_aleg_uuid(orig_uuid)
+                    if aleg_uuid:
+                        aleg_type = f"pool({key})"
+                        logger.info(f"[{self._uuid}] 从 pool 映射({key})找到 A-leg: {aleg_uuid[:8]}...")
+                        break
+
+        # 3. other_loopback_leg_uuid（loopback A-leg，备用）
+        if not aleg_uuid:
+            aleg_uuid = self._channel_vars.get("other_loopback_leg_uuid", "")
+            if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+                aleg_type = "loopback"
+                logger.info(f"[{self._uuid}] 从 other_loopback_leg_uuid 找到 loopback A-leg: {aleg_uuid[:8]}...")
+
+        # 4. 从 channel_vars 查询其他变量
+        if not aleg_uuid and self.esl_pool:
+            for var in ("asr_aleg_uuid", "bridge_partner_uuid_str", "signal_bond"):
+                val = self._channel_vars.get(var, "")
+                if val and val not in ("-ERR", "_undef_"):
+                    aleg_uuid = val
+                    logger.info(f"[{self._uuid}] 从 channel var {var} 找到 A-leg: {aleg_uuid[:8]}...")
+                    break
+
+        # 5. 通过 uuid_getvar 查询
+        if not aleg_uuid and self.esl_pool:
+            for var in ("other_loopback_leg_uuid", "signal_bond", "bridge_partner_uuid_str"):
+                try:
+                    result = await self.esl_pool.api(f"uuid_getvar {self._uuid} {var}")
+                    val = result.strip()
+                    if val and val not in ("-ERR", "_undef_"):
+                        aleg_uuid = val
+                        logger.info(f"[{self._uuid}] 从 uuid_getvar {var} 找到 A-leg: {aleg_uuid[:8]}...")
+                        break
+                except Exception as e:
+                    logger.debug(f"[{self._uuid}] {var} 查询失败: {e}")
+
+        if aleg_uuid:
+            self._aleg_uuid = aleg_uuid
+
+        # ★ 优先检查 WebSocket audio_stream 是否已启动
+        #    如果 WebSocket 连接已建立，直接使用已有的 queue
+        if self.ws_server and self.ws_server.stats.get("connections_active", 0) > 0:
+            queue = await self.ws_server.get_session_queue(self._uuid, timeout=2.0)
+            if queue is not None:
+                logger.info(f"[{self._uuid}] 检测到 dialplan audio_stream 已就绪，直接使用")
+                self._audio_started = True
+                self._audio_mode = "websocket"
+                return queue
+
+        # 尝试 uuid_audio_stream 实时推送（适用于 dialplan 未设置的场景）
+        if self.ws_server and self.esl_pool:
             try:
-                target_uuid = self._active_uuid or self._uuid
-                ws_url = f"ws://backend:8765/{target_uuid}"
+                ws_url = f"ws://backend:8765/{self._uuid}"
                 result = await self.esl_pool.api(
-                    f"uuid_audio_stream {target_uuid} start {ws_url} mono 8000"
+                    f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
                 )
                 if result.strip().startswith("+OK"):
-                    ws_queue = await self.ws_server.get_session_queue(target_uuid, timeout=5.0)
-                    if ws_queue is not None:
-                        logger.info(
-                            f"[{self._uuid}] 音频采集: mod_audio_stream WebSocket (ESL API), "
-                            f"target={target_uuid}"
-                        )
-                        self._audio_mode = "websocket"
-                        self._audio_started = True
-                        return ws_queue
-                    logger.warning(f"[{self._uuid}] WebSocket 会话未建立，降级文件轮询")
+                    logger.info(f"[{self._uuid}] uuid_audio_stream 启动成功: {ws_url}")
+                    self._audio_started = True
+                    self._audio_mode = "websocket"
+                    queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
+                    return queue or self._audio_queue
                 else:
-                    logger.warning(f"[{self._uuid}] uuid_audio_stream 未返回 +OK: {result.strip()[:200]}")
+                    logger.debug(f"[{self._uuid}] uuid_audio_stream 返回: {result.strip()[:200]}")
             except Exception as e:
-                logger.warning(f"[{self._uuid}] uuid_audio_stream 失败: {e}")
+                logger.debug(f"[{self._uuid}] uuid_audio_stream 失败: {e}")
 
-        # 方案 2：降级 — 文件轮询（用 uuid_record 启动录音）
-        asr_path = f"/recordings/asr_{self._uuid}.raw"
-        if self.esl_pool:
+        # 降级：文件轮询
+        logger.warning(f"[{self._uuid}] uuid_audio_stream 不可用，降级文件轮询")
+
+        # 使用 B-leg 的 record_session WAV 文件（dialplan 已启动）
+        wav_path = f"/recordings/{self._uuid}.wav"
+        if os.path.exists(wav_path):
+            asr_path = wav_path
+            logger.info(f"[{self._uuid}] 使用 B-leg record_session WAV: {asr_path}")
+        elif self.esl_pool:
             try:
-                result = await self.esl_pool.api(f"uuid_record {self._uuid} start {asr_path}")
-                logger.info(f"[{self._uuid}] uuid_record 降级: {result.strip()[:100]}")
+                raw_path = f"/recordings/asr_{self._uuid}.raw"
+                result = await self.esl_pool.api(
+                    f"uuid_record {self._uuid} start {raw_path}"
+                )
+                if result.strip().startswith("+OK"):
+                    asr_path = raw_path
+                    logger.info(f"[{self._uuid}] B-leg uuid_record 启动: {asr_path}")
+                else:
+                    logger.warning(f"[{self._uuid}] B-leg uuid_record 返回: {result.strip()[:200]}")
             except Exception as e:
-                logger.warning(f"[{self._uuid}] uuid_record 失败: {e}")
+                logger.warning(f"[{self._uuid}] B-leg uuid_record 失败: {e}")
 
         self._audio_mode = "file_poll"
         self._audio_started = True
@@ -1086,7 +1507,13 @@ class ESLSocketCallSession:
             logger.warning(f"[{self._uuid}] 音频文件未创建: {path}")
             return
 
-        offset = 0
+        # WAV 文件需要跳过 44 字节头
+        is_wav = path.endswith(".wav")
+        header_offset = 44 if is_wav else 0
+        offset = header_offset
+        if is_wav:
+            logger.info(f"[{self._uuid}] 检测到 WAV 文件，跳过 {header_offset} 字节头")
+
         while self._connected:
             try:
                 current_size = os.path.getsize(path)
@@ -1103,6 +1530,60 @@ class ESLSocketCallSession:
             except Exception as e:
                 logger.error(f"[{self._uuid}] 音频文件读取失败: {e}")
                 await asyncio.sleep(0.1)
+
+        # raw PCM 文件才需要转换为 WAV；WAV 文件已经是有效格式
+        if not is_wav:
+            await self._convert_raw_to_wav(path)
+
+    async def _relay_ws_audio(self, ws_queue: asyncio.Queue):
+        """从 WebSocket 队列消费音频帧，送入 ASR 音频队列
+
+        由 uuid_audio_stream 在 sofia A-leg 上启动后，FreeSWITCH 通过
+        mod_audio_stream 将 RTP 音频帧推送到 WebSocket 服务器。
+        此 task 负责从 ws_queue 取出帧并放入 self._audio_queue。
+        """
+        frame_count = 0
+        try:
+            while self._connected:
+                try:
+                    frame = await asyncio.wait_for(ws_queue.get(), timeout=30.0)
+                    frame_count += 1
+                    await self._safe_put(self._audio_queue, frame)
+                    if frame_count % 100 == 0:
+                        logger.debug(f"[{self._uuid}] 已通过 WebSocket 转发 {frame_count} 帧用户语音")
+                except asyncio.TimeoutError:
+                    # 30s 没有音频，可能是通话结束或 stream 停止
+                    logger.debug(f"[{self._uuid}] WebSocket 音频队列超时，共 {frame_count} 帧")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[{self._uuid}] WebSocket 音频中继异常: {e}")
+        logger.info(f"[{self._uuid}] WebSocket 音频中继结束，共转发 {frame_count} 帧")
+
+    @staticmethod
+    async def _convert_raw_to_wav(raw_path: str):
+        """将 raw PCM 文件转为 WAV 格式（16bit, 8kHz, mono）"""
+        import os
+        import wave
+
+        if not raw_path or not raw_path.endswith(".raw") or not os.path.exists(raw_path):
+            return
+
+        wav_path = raw_path[:-4] + ".wav"
+        try:
+            pcm_data = open(raw_path, "rb").read()
+            if not pcm_data:
+                return
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(8000)
+                wf.writeframes(pcm_data)
+            duration = len(pcm_data) / 16000  # 8000Hz × 2 bytes = 16000 bytes/s
+            logger.info(f"[{os.path.basename(raw_path)}] WAV 转换: {wav_path} ({duration:.1f}s, {len(pcm_data)} bytes)")
+        except Exception as e:
+            logger.warning(f"[{os.path.basename(raw_path)}] WAV 转换失败: {e}")
 
     # ── 事件主循环 ────────────────────────────────────────────
 

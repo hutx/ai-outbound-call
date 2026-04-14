@@ -10,22 +10,24 @@
        ============================================================ -->
   <context name="internal">
 
-    <!-- AI 外呼处理：当 ai_agent=true 且目标是明确的 AI 扩展时 -->
-    <!-- 排除普通分机号（10xx），让它们走 Local_Extension 正常振铃 -->
-    <extension name="AI_Agent_Call">
-      <condition field="destination_number" expression="^(AI_CALL|2000|3000)$" break="never"/>
-      <condition field="${ai_agent}" expression="^true$" break="on-true">
+    <!-- ============================================================ -->
+    <!-- 通用 AI 扩展已移至 ai_call_handler (default.xml loopback) -->
+
+    <!-- AI_Handler：&park() + uuid_transfer 入口
+         无 bridge → 无 RTP 旁路 → TTS 能正确播放
+         socket(async full) 建立 ESL Outbound 连接，捕获音频 + 播放 TTS -->
+    <extension name="AI_Handler">
+      <condition field="destination_number" expression="^9998$">
         <action application="answer" />
-        <action application="sleep" data="500" />
+        <action application="sleep" data="200" />
         <action application="set" data="RECORD_STEREO=false" />
         <action application="set" data="media_bug_answer_req=true" />
         <action application="set" data="record_file=/recordings/${uuid}.wav" />
         <action application="record_session" data="/recordings/${uuid}.wav" />
-        <action application="socket" data="backend:9999 async full" />
+        <action application="socket"
+          data="backend:9999 async full" />
       </condition>
     </extension>
-
-    <!-- 通用 AI 扩展已移至 internal_ai_call_handler (default.xml) -->
 
     <!-- 内部直拨：分机 1000-1099 -->
     <extension name="Local_Extension">
@@ -125,8 +127,8 @@
       <condition field="destination_number" expression="^alarm$|^3322$" />
       <action application="answer" />
       <action application="sleep" data="1000" />
-      <action application="playback" data="alarm-message.wav" />
-      <action application="log" data="ALARM MESSAGE PLAYED FOR ${caller_id_number}" />
+        <action application="playback" data="alarm-message.wav" />
+        <action application="log" data="ALARM MESSAGE PLAYED FOR ${caller_id_number}" />
     </extension>
 
     <!-- 电话簿 -->

@@ -40,7 +40,7 @@ class FreeSwitchConfig:
     # SIP Gateway 名称（sofia.conf.xml 中配置的 gateway name）
     gateway: str = "carrier_trunk"
     # 内部分机呼叫时使用的目录域
-    internal_domain: str = "$${local_ip_v4}"
+    internal_domain: str = "192.168.5.15"
     # 外呼超时秒数（30s 无人接听则放弃）
     originate_timeout: int = 30
     # 录音存储路径

@@ -73,7 +73,7 @@
              FreeSWITCH 主动连接后端的 ESL Socket 服务器
              async = 异步模式（FS 可以继续处理其他事件）
              full  = 完整事件模式（接收所有事件） -->
-        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async full"/>
+        <action application="socket" data="$${backend_socket_host}:$${backend_socket_port} async"/>
 
         <!-- socket 返回后（CallAgent 挂断或异常），执行清理 -->
         <action application="hangup" data="NORMAL_CLEARING"/>

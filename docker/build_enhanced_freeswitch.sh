@@ -21,12 +21,12 @@ echo "📁 项目根目录: $PROJECT_ROOT"
 echo "📦 Docker 目录: $DOCKER_DIR"
 
 # 构建镜像
-IMAGE_NAME="freeswitch-ai"
+IMAGE_NAME="freeswitch-audio"
 TAG="latest"
 
 echo "🔨 构建 $IMAGE_NAME:$TAG 镜像..." 
 cd $DOCKER_DIR
-docker build -f Dockerfile.freeswitch-ai -t $IMAGE_NAME:$TAG --platform linux/amd64 .
+docker build -f Dockerfile.freeswitch.audio -t $IMAGE_NAME:$TAG --platform linux/amd64 .
 
 if [ $? -eq 0 ]; then
     echo "✅ 镜像构建成功: $IMAGE_NAME:$TAG"

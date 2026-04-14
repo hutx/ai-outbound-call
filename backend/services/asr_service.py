@@ -7,6 +7,7 @@ import logging
 import json
 import struct
 import time
+import uuid
 import wave
 import io
 from abc import ABC, abstractmethod
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_dashscope_asr():
-    """按需加载百炼 ASR 依赖，避免 mock 模式在导入阶段失败。"""
+    """按需加载百炼 ASR 依赖（保留兼容，已不再使用 SDK）。"""
     try:
         import dashscope
         from dashscope.audio.asr import Recognition, RecognitionResult
@@ -707,150 +708,253 @@ class MockASRClient(BaseASR):
 
 class BailianASRClient(BaseASR):
     """
-    阿里云百炼平台 ASR 语音识别服务
+    阿里云百炼平台 ASR 语音识别服务 — 原生 WebSocket API
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    使用 dashscope.audio.asr.Recognition SDK
-    文档：https://help.aliyun.com/zh/model-studio/fun-asr-realtime-python-sdk
+    使用百炼 WebSocket 协议（非 dashscope SDK），完全可控音频发送时序。
+    文档：https://help.aliyun.com/zh/model-studio/fun-asr-realtime-websocket
+
+    协议流程：
+      Client → Server : JSON (run-task)
+      Server → Client : JSON (task-started)
+      Client → Server : Binary (PCM audio frames)
+      Server → Client : JSON (task-result) ← 中间/最终结果
+      Client → Server : JSON (finish-task)
+      Server → Client : JSON (task-finished)
     """
 
-    def __init__(self, cfg: ASRConfig):
-        self._dashscope, self._Recognition, self._RecognitionResult = _load_dashscope_asr()
-        self.model_name = cfg.bailian_asr_model or "paraformer-v2"
-        self.sample_rate = cfg.sample_rate
-        self.vad_silence_ms = cfg.vad_silence_ms
+    WS_URI = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/"
 
-        # 设置 dashscope API Key
-        api_key = cfg.bailian_access_token or ""
-        logger.info(f"百炼 ASR: API Key → {api_key[:10]}****" if api_key else "百炼 ASR: API Key 为空")
-        if not api_key:
-            logger.error("百炼 ASR: BAILIAN_ACCESS_TOKEN 未配置")
-        self._dashscope.api_key = api_key
+    def __init__(self, cfg: ASRConfig):
+        self.api_key = cfg.bailian_access_token
+        self.model_name = cfg.bailian_asr_model or "paraformer-realtime-v1"
+        self.sample_rate = cfg.sample_rate
 
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None]
     ) -> AsyncGenerator[ASRResult, None]:
-        if not self._dashscope.api_key:
-            logger.error("百炼 ASR: API Key 为空")
+        if not self.api_key:
+            logger.error("百炼 ASR: BAILIAN_ACCESS_TOKEN 未配置")
             yield ASRResult(text="", is_final=True)
             return
 
+        # 调试：保存 ASR 输入原始音频到 WAV 文件
+        import os
+        import time as _time
+        dump_dir = "/recordings/debug"
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(dump_dir, f"asr_input_{int(_time.time())}_{uuid.uuid4().hex[:6]}.wav")
+        dump_pcm = b""
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        task_id = uuid.uuid4().hex
+
         try:
-            result_queue: asyncio.Queue = asyncio.Queue()
-            final_text: str = ""
-            loop = asyncio.get_event_loop()
-            audio_sent: bool = False
-            total_bytes_sent: int = 0  # 统计发送的音频总字节数
+            async with websockets.connect(
+                self.WS_URI,
+                extra_headers=headers,
+                ping_interval=None,
+                max_size=4 * 1024 * 1024,
+            ) as ws:
+                # 1. 发送 run-task 请求
+                run_task = {
+                    "header": {
+                        "action": "run-task",
+                        "task_id": task_id,
+                        "streaming": "duplex",
+                    },
+                    "payload": {
+                        "model": self.model_name,
+                        "task_group": "audio",
+                        "task": "asr",
+                        "function": "recognition",
+                        "input": {},
+                        "parameters": {
+                            "sample_rate": self.sample_rate,
+                            "format": "pcm",
+                        },
+                    },
+                }
+                await ws.send(json.dumps(run_task))
+                logger.info(
+                    f"百炼 ASR: run-task sent, model={self.model_name}, "
+                    f"sample_rate={self.sample_rate}"
+                )
 
-            # 创建回调对象
-            class _Callback:
-                def on_open(self):
-                    with open("/tmp/asr_debug.log", "a") as f:
-                        f.write(f"[{time.time():.3f}] on_open\n")
-                    logger.info(f"百炼 ASR: on_open")
-                    loop.call_soon_threadsafe(result_queue.put_nowait, "connected")
+                # 2. 等待 task-started 确认（服务器用 event 字段，不是 action）
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
+                event = resp.get("header", {}).get("event", "")
+                if event != "task-started":
+                    logger.error(
+                        f"百炼 ASR: 预期 task-started, 收到 {event!r}, "
+                        f"完整响应: {json.dumps(resp, ensure_ascii=False)[:500]}"
+                    )
+                    yield ASRResult(text="", is_final=True)
+                    return
+                logger.debug(f"百炼 ASR: task-started, task_id={task_id}")
 
-                def on_event(self, result):
-                    with open("/tmp/asr_debug.log", "a") as f:
-                        f.write(f"[{time.time():.3f}] on_event: {result}\n")
-                    nonlocal final_text
-                    sentence = result.get_sentence()
-                    if not sentence or not isinstance(sentence, dict):
-                        return
-                    text = sentence.get("text", "").strip()
-                    is_final = self._RecognitionResult.is_sentence_end(sentence)
-                    if text:
-                        final_text = text
-                        with open("/tmp/asr_debug.log", "a") as f:
-                            f.write(f"[{time.time():.3f}]  → text={text!r} is_final={is_final}\n")
-                        loop.call_soon_threadsafe(
-                            result_queue.put_nowait,
-                            ASRResult(text=text, is_final=is_final),
-                        )
+                # 3. 包装音频生成器以捕获原始 PCM
+                async def _captured_audio_gen():
+                    nonlocal dump_pcm
+                    async for chunk in audio_gen:
+                        dump_pcm += chunk
+                        yield chunk
 
-                def on_complete(self):
-                    with open("/tmp/asr_debug.log", "a") as f:
-                        f.write(f"[{time.time():.3f}] on_complete\n")
-                    logger.info("百炼 ASR: on_complete")
-                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
+                # 4. 并发：发送音频 + 接收结果
+                send_task = asyncio.create_task(
+                    self._send_audio(ws, _captured_audio_gen(), task_id)
+                )
 
-                def on_close(self):
-                    with open("/tmp/asr_debug.log", "a") as f:
-                        f.write(f"[{time.time():.3f}] on_close\n")
-
-                def on_error(self, result):
-                    with open("/tmp/asr_debug.log", "a") as f:
-                        f.write(f"[{time.time():.3f}] on_error: {result}\n")
-                    err_msg = str(result)
-                    if "NO_VALID_AUDIO" in err_msg:
-                        logger.debug(f"百炼 ASR: 无有效音频输入")
-                    else:
-                        logger.error(f"百炼 ASR 错误: {result}")
-                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
-
-            callback = _Callback()
-            with open("/tmp/asr_debug.log", "a") as f:
-                f.write(f"[{time.time():.3f}] Creating Recognition: model={self.model_name}, sample_rate={self.sample_rate}, format=pcm\n")
-            logger.info(f"百炼 ASR: 创建 Recognition, model={self.model_name}, sample_rate={self.sample_rate}")
-            recognition = self._Recognition(
-                model=self.model_name,
-                callback=callback,
-                format="pcm",
-                sample_rate=self.sample_rate,
-            )
-
-            with open("/tmp/asr_debug.log", "a") as f:
-                f.write(f"[{time.time():.3f}] Calling recognition.start()\n")
-            recognition.start()
-
-            # 并发：发送音频帧 + 接收结果
-            async def _send_frames():
-                nonlocal audio_sent, total_bytes_sent
-                chunk_count = 0
-                async for chunk in audio_gen:
-                    if not chunk:
-                        break
-                    chunk_count += 1
-                    total_bytes_sent += len(chunk)
-                    recognition.send_audio_frame(chunk)
-                    audio_sent = True
-                logger.info(f"百炼 ASR: 发送完毕, {chunk_count} 帧, {total_bytes_sent} bytes")
-                if audio_sent:
-                    recognition.stop()
-                else:
-                    logger.warning("百炼 ASR: 无音频输入，直接完成")
-                    loop.call_soon_threadsafe(result_queue.put_nowait, None)
-
-            send_task = asyncio.create_task(_send_frames())
-
-            try:
-                # 从队列中 yield 结果
-                while True:
-                    try:
-                        item = await asyncio.wait_for(
-                            result_queue.get(), timeout=15.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"百炼 ASR 接收超时 (audio_sent={audio_sent}, bytes={total_bytes_sent})")
+                async for result in self._recv_results(ws, task_id):
+                    yield result
+                    if result.is_final:
                         break
 
-                    if item is None:
-                        break
-                    if item == "connected":
-                        # on_open 信号，跳过
-                        continue
-                    yield item
-            except GeneratorExit:
-                logger.debug("百炼 ASR: 生成器被提前退出")
-            finally:
-                # 确保 _send_frames 被取消且 recognition.stop() 被调用
-                if not send_task.done():
-                    send_task.cancel()
+                # 4. 清理发送任务
+                send_task.cancel()
                 await asyncio.gather(send_task, return_exceptions=True)
 
-        except Exception as e:
-            logger.error(f"百炼 ASR 处理异常: {e}", exc_info=True)
+        except asyncio.TimeoutError:
+            logger.error("百炼 ASR: 等待 task-started 超时")
             yield ASRResult(text="", is_final=True)
+        except (
+            websockets.exceptions.WebSocketException,
+            OSError,
+            ConnectionRefusedError,
+        ) as e:
+            logger.error(f"百炼 ASR WebSocket 连接失败: {e}")
+            yield ASRResult(text="", is_final=True)
+        except Exception as e:
+            logger.error(f"百炼 ASR 未知异常: {e}", exc_info=True)
+            yield ASRResult(text="", is_final=True)
+        finally:
+            # 将原始 PCM 转为 WAV 方便本地播放分析
+            if dump_pcm:
+                try:
+                    with wave.open(dump_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(self.sample_rate)
+                        wf.writeframes(dump_pcm)
+                    dur = len(dump_pcm) / (self.sample_rate * 2)
+                    logger.info(f"百炼 ASR 音频已保存: {dump_path} ({len(dump_pcm)} bytes, {dur:.1f}s)")
+                except Exception as e:
+                    logger.warning(f"百炼 ASR WAV 保存失败: {e}")
+
+    async def _send_audio(self, ws, audio_gen, task_id: str):
+        """
+        分块发送 PCM 音频数据。
+        帧大小：100ms 对应字节数（8000Hz=1600 bytes, 16000Hz=3200 bytes）。
+        发送速率与录音速率一致（实时倍速）。
+        """
+        frame_ms = 100
+        frame_size = int(self.sample_rate * frame_ms / 1000 * 2)  # 16bit mono
+        frame_interval = frame_ms / 1000.0
+        buffer = b""
+
+        try:
+            async for chunk in audio_gen:
+                if not chunk:
+                    break
+                buffer += chunk
+                while len(buffer) >= frame_size:
+                    frame = buffer[:frame_size]
+                    buffer = buffer[frame_size:]
+                    await ws.send(frame)  # Binary frame
+                    await asyncio.sleep(frame_interval)
+
+            # 发送剩余不足一帧的数据
+            if buffer:
+                await ws.send(buffer)
+
+            # 发送 finish-task 结束信号
+            finish_task = {
+                "header": {
+                    "action": "finish-task",
+                    "task_id": task_id,
+                    "streaming": "duplex",
+                },
+                "payload": {"input": {}},
+            }
+            await ws.send(json.dumps(finish_task))
+            logger.debug(f"百炼 ASR: finish-task sent, task_id={task_id}")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"百炼 ASR 音频发送异常: {e}")
+
+    async def _recv_results(self, ws, task_id: str):
+        """
+        接收服务端推送的识别结果。
+        服务器使用 header.event 字段（不是 action）：
+          result-generated  识别结果（中间/最终）
+          task-finished     任务完成
+        payload.output.type 区分中间/最终：
+          sentence-synthesis  中间结果（刷新中）
+          sentence-end        最终结果（句子结束）
+        """
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                msg = json.loads(raw)
+                header = msg.get("header", {})
+                event = header.get("event", "")
+
+                if event == "result-generated":
+                    payload = msg.get("payload", {})
+                    output = payload.get("output", {})
+                    sentence = output.get("sentence", {})
+                    result_type = output.get("type", "")
+                    text = sentence.get("text", "").strip()
+
+                    # sentence-end = 最终结果, sentence-synthesis = 中间结果
+                    is_final = (result_type == "sentence-end")
+
+                    if text:
+                        if is_final:
+                            orig = output.get("original_text", text)
+                            logger.debug(f"百炼 ASR 最终结果: {orig!r}")
+                        yield ASRResult(text=text, is_final=is_final)
+
+                elif event == "task-finished":
+                    # task-finished 后可能还有最终的 sentence-end 结果
+                    # 多等 2 秒看是否有最终结果
+                    try:
+                        raw2 = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        if isinstance(raw2, bytes):
+                            raw2 = raw2.decode("utf-8")
+                        msg2 = json.loads(raw2)
+                        header2 = msg2.get("header", {})
+                        event2 = header2.get("event", "")
+
+                        if event2 == "result-generated":
+                            payload2 = msg2.get("payload", {})
+                            output2 = payload2.get("output", {})
+                            sentence2 = output2.get("sentence", {})
+                            result_type2 = output2.get("type", "")
+                            text2 = sentence2.get("text", "").strip()
+                            is_final2 = (result_type2 == "sentence-end")
+                            if text2:
+                                if is_final2:
+                                    orig2 = output2.get("original_text", text2)
+                                    logger.debug(f"百炼 ASR 最终结果(task-finished后): {orig2!r}")
+                                yield ASRResult(text=text2, is_final=is_final2)
+                    except asyncio.TimeoutError:
+                        pass
+                    logger.debug(f"百炼 ASR: task-finished, task_id={task_id}")
+                    return
+
+                elif event == "task-failed":
+                    err = msg.get("payload", {}).get("output", header)
+                    logger.error(f"百炼 ASR task-failed: {err}")
+                    return
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"百炼 ASR 结果接收异常: {e}")
 
 
 def create_asr_client(cfg: Optional[ASRConfig] = None) -> BaseASR:
