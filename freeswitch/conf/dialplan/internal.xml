@@ -29,7 +29,26 @@
       </condition>
     </extension>
 
+    <!-- AI 外呼 A-leg：录制用户语音 → 桥接到 AI_Handler (loopback)
+         record_session 在 bridge 之前执行，确保捕获用户 RTP 音频
+         录制到 /recordings/{sofia_a_leg_uuid}.wav -->
+    <extension name="AI_Caller">
+      <condition field="destination_number" expression="^9997$">
+        <action application="answer" />
+        <action application="sleep" data="200" />
+        <action application="set" data="RECORD_STEREO=false" />
+        <action application="set" data="media_bug_answer_req=true" />
+        <action application="set" data="record_file=/recordings/${uuid}.wav" />
+        <action application="record_session" data="/recordings/${uuid}.wav" />
+        <action application="sleep" data="300" />
+        <action application="set" data="ai_caller=true" />
+        <action application="bridge" data="loopback/AI_CALL" />
+      </condition>
+    </extension>
+
     <!-- 内部直拨：分机 1000-1099 -->
+    <!-- ★ AI 外呼也走此扩展（拨打用户分机），record_session 在 bridge 之前启动，
+         确保 media_bug 捕获用户 RTP 音频（非静音） -->
     <extension name="Local_Extension">
       <condition field="destination_number" expression="^(10\d{2})$">
         <action application="export" data="dialed_extension=$1" />
@@ -39,6 +58,11 @@
         <action application="set" data="transfer_ringback=${us-ring}" />
         <action application="set" data="call_timeout=30" />
         <action application="set" data="hangup_after_bridge=true" />
+        <!-- ★ AI 外呼音频采集：bridge 之前启动 record_session，录制用户语音 -->
+        <action application="set" data="RECORD_STEREO=false" />
+        <action application="set" data="media_bug_answer_req=true" />
+        <action application="set" data="record_file=/recordings/${uuid}.wav" />
+        <action application="record_session" data="/recordings/${uuid}.wav" />
         <action application="bridge" data="user/${dialed_extension}@${sip_domain}" />
       </condition>
     </extension>
