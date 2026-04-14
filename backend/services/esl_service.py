@@ -139,10 +139,11 @@ class AsyncESLConnection:
             # ★ 关键：在 sofia A-leg 上启动 audio_stream（不是 loopback B-leg）
             # sofia A-leg 是用户语音通过 RTP 进入的地方，loopback B-leg 的
             # read 方向在 bridge 中捕获不到 sofia 侧的用户语音。
-            # answer() → execute_on_bridge('audio_stream ...') → bridge(loopback/AI_CALL)
+            # answer() → bridge(loopback/AI_CALL)
+            # audio_stream 由 CallAgent._start_audio_stream_on_aleg() 在 sofia A-leg 上启动
             cmd = (
                 f"originate {{{channel_vars}}}{endpoint} "
-                f"&answer(),execute_on_bridge('audio_stream ws://backend:8765/{call_uuid} mixed 20'),bridge(loopback/AI_CALL)"
+                f"&bridge(loopback/AI_CALL)"
             )
         else:
             # PSTN 外呼：通过运营商网关导出，接通后 uuid_transfer 到 AI_Handler
@@ -1454,23 +1455,24 @@ class ESLSocketCallSession:
                 self._audio_mode = "websocket"
                 return queue
 
-        # 尝试 uuid_audio_stream 实时推送（适用于 dialplan 未设置的场景）
-        if self.ws_server and self.esl_pool:
+        # 尝试在 sofia A-leg 上启动 uuid_audio_stream 实时推送
+        if self.ws_server and self.esl_pool and aleg_uuid:
             try:
-                ws_url = f"ws://backend:8765/{self._uuid}"
+                ws_url = f"ws://backend:8765/{aleg_uuid}"
                 result = await self.esl_pool.api(
-                    f"uuid_audio_stream {self._uuid} start {ws_url} mono 8000"
+                    f"uuid_audio_stream {aleg_uuid} start {ws_url} mono 8000"
                 )
                 if result.strip().startswith("+OK"):
-                    logger.info(f"[{self._uuid}] uuid_audio_stream 启动成功: {ws_url}")
+                    logger.info(f"[{self._uuid}] uuid_audio_stream on sofia A-leg ({aleg_uuid[:8]}): {ws_url}")
                     self._audio_started = True
                     self._audio_mode = "websocket"
-                    queue = await self.ws_server.get_session_queue(self._uuid, timeout=5.0)
+                    # 使用 aleg_uuid 查找 WebSocket 连接
+                    queue = await self.ws_server.get_session_queue(aleg_uuid, timeout=5.0)
                     return queue or self._audio_queue
                 else:
-                    logger.debug(f"[{self._uuid}] uuid_audio_stream 返回: {result.strip()[:200]}")
+                    logger.debug(f"[{self._uuid}] A-leg uuid_audio_stream 返回: {result.strip()[:200]}")
             except Exception as e:
-                logger.debug(f"[{self._uuid}] uuid_audio_stream 失败: {e}")
+                logger.debug(f"[{self._uuid}] A-leg uuid_audio_stream 失败: {e}")
 
         # 降级：文件轮询
         logger.warning(f"[{self._uuid}] uuid_audio_stream 不可用，降级文件轮询")
