@@ -804,7 +804,7 @@ class BailianASRClient(BaseASR):
                         if is_final:
                             logger.info(f"百炼 ASR 最终结果: {text!r}")
                         else:
-                            logger.debug(f"百炼 ASR 中间结果: {text!r}")
+                            logger.info(f"百炼 ASR 中间结果: {text!r}")
                         try:
                             result_queue.put_nowait(ASRResult(text=text, is_final=is_final))
                         except _queue.Full:
@@ -847,14 +847,18 @@ class BailianASRClient(BaseASR):
         async def _send_audio():
             """逐帧发送音频数据"""
             nonlocal dump_pcm
-            frame_ms = 100
+            # 40ms 帧：更适合实时通话，比 60ms 更早发送音频给服务端
+            frame_ms = 40
             # ★ 使用 16kHz 计算帧大小
-            frame_size = int(self.SEND_SAMPLE_RATE * frame_ms / 1000 * 2)  # 3200 bytes @ 16kHz
+            frame_size = int(self.SEND_SAMPLE_RATE * frame_ms / 1000 * 2)  # 1280 bytes @ 16kHz
             buffer = b""
             total_sent = 0
             frame_count = 0
             input_chunk_count = 0
             total_input_bytes = 0
+            upsample_count = 0
+            # 前 5 帧的 RMS 统计，用于诊断音频质量
+            first_frames_rms = []
 
             try:
                 async for chunk in audio_gen:
@@ -868,6 +872,7 @@ class BailianASRClient(BaseASR):
                     # ★ 上采样 8k → 16k
                     if self.input_sample_rate < self.SEND_SAMPLE_RATE:
                         chunk_16k = self._upsample_8k_to_16k(chunk)
+                        upsample_count += 1
                     else:
                         chunk_16k = chunk
                     buffer += chunk_16k
@@ -875,6 +880,15 @@ class BailianASRClient(BaseASR):
                     while len(buffer) >= frame_size:
                         frame = buffer[:frame_size]
                         buffer = buffer[frame_size:]
+
+                        # 前 5 帧计算 RMS 用于诊断
+                        if len(first_frames_rms) < 5:
+                            import struct as _struct
+                            n = len(frame) // 2
+                            samples = _struct.unpack(f'<{n}h', frame)
+                            rms = int(sum(s * s for s in samples) / max(n, 1)) ** 0.5
+                            first_frames_rms.append(rms)
+
                         recognition.send_audio_frame(frame)
                         total_sent += len(frame)
                         frame_count += 1
@@ -885,11 +899,14 @@ class BailianASRClient(BaseASR):
                     total_sent += len(buffer)
                     frame_count += 1
 
+                total_input_ms = total_input_bytes / (self.input_sample_rate * 2) * 1000
+                total_sent_ms = total_sent / (self.SEND_SAMPLE_RATE * 2) * 1000
                 logger.info(
                     f"百炼 ASR: 音频发送完毕, "
-                    f"输入 {input_chunk_count} chunks / {total_input_bytes} bytes, "
-                    f"发送 {frame_count} 帧 / {total_sent} bytes "
-                    f"({total_sent / (self.input_sample_rate * 2) * 1000:.0f}ms)"
+                    f"输入 {input_chunk_count} chunks / {total_input_bytes} bytes ({total_input_ms:.0f}ms @ {self.input_sample_rate}Hz), "
+                    f"上采样 {upsample_count}/{input_chunk_count}, "
+                    f"发送 {frame_count} 帧 / {total_sent} bytes ({total_sent_ms:.0f}ms @ {self.SEND_SAMPLE_RATE}Hz), "
+                    f"前 5 帧 RMS: {first_frames_rms}"
                 )
 
             except asyncio.CancelledError:
@@ -913,12 +930,14 @@ class BailianASRClient(BaseASR):
             yield ASRResult(text="", is_final=True)
             return
 
-        logger.info(f"百炼 ASR: 识别会话已启动, model={self.model_name}")
+        logger.info(f"百炼 ASR: 识别会话已启动, model={self.model_name}, 输入采样率={self.input_sample_rate}Hz → {self.SEND_SAMPLE_RATE}Hz")
 
         # 并发发送音频 + 接收结果
         send_task = asyncio.create_task(_send_audio())
 
         # 从队列中 yield 结果
+        result_count = 0
+        t0 = time.time()
         while True:
             try:
                 item = await asyncio.wait_for(
@@ -926,11 +945,13 @@ class BailianASRClient(BaseASR):
                     timeout=20.0,
                 )
             except asyncio.TimeoutError:
-                logger.warning("百炼 ASR 接收超时")
+                elapsed = time.time() - t0
+                logger.warning(f"百炼 ASR 接收超时 (已等待 {elapsed:.1f}s)")
                 break
 
             if item is None:  # 哨兵，转写完成
                 break
+            result_count += 1
             yield item
             if item.is_final:
                 final_text = item.text
@@ -943,6 +964,12 @@ class BailianASRClient(BaseASR):
                 logger.warning(f"百炼 ASR stop 异常: {e}")
 
         await loop.run_in_executor(None, _stop_recognition)
+
+        elapsed = time.time() - t0
+        logger.info(
+            f"百炼 ASR: 识别会话结束, 总耗时 {elapsed:.1f}s, "
+            f"产出 {result_count} 条结果, 最终文本={final_text!r}"
+        )
 
         # 清理发送任务
         send_task.cancel()

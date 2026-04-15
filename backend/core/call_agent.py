@@ -39,9 +39,8 @@ LLM_TIMEOUT = 30.0
 # TTS 超时（秒）
 TTS_TIMEOUT = 10.0
 # ASR 单句最长等待（秒）
-# ★ 优化：12s → 30s，文件轮询模式下录音开头可能有较长静音（TTS 准备期），
-#    用户可能在 15-20 秒后才开始说话，12s 太短导致 ASR 在到达语音段前就超时
-ASR_TIMEOUT = 30.0
+# 15s 足够覆盖正常一句话，同时避免识别链路长时间挂起。
+ASR_TIMEOUT = 15.0
 
 
 class AudioStreamAdapter:
@@ -87,15 +86,15 @@ class AudioStreamAdapter:
         self._speech_ms = 0.0
         self._max_rms = 0
         # ★ 连续语音检测：防止前几个噪音 chunk 误触发 _started_speaking
-        #    需要连续 5 个语音 chunk（100ms 持续语音）才认为用户真正开始说话
+        #    需要连续 2 个语音帧（40ms 持续语音）才认为用户真正开始说话
         self._consecutive_speech_frames = 0
-        self._speech_onset_threshold = 5  # 5 帧 = 100ms
+        self._speech_onset_threshold = 2  # 2 帧 = 40ms
         self._vad = SimpleVAD(
             sample_rate=8000,
-            frame_ms=20,
+            frame_ms=40,              # 40ms 帧：比 20ms 更稳定的能量检测
             energy_threshold=120,     # 降低阈值：文件轮询的音频能量较低（max_rms≈134），需确保能触发语音检测
             speech_min_frames=1,
-            silence_min_frames=max(1, int(vad_silence_ms / 20)),
+            silence_min_frames=max(1, int(vad_silence_ms / 40)),
         )
 
     def stop(self):
@@ -109,6 +108,13 @@ class AudioStreamAdapter:
             "max_rms": self._max_rms,
             "speech_detected": self._speech_chunks > 0,
         }
+
+    def should_commit_intermediate(self) -> bool:
+        """本地 VAD 已明显判定句尾时，允许提前提交最后一条中间结果。"""
+        if not self._started_speaking:
+            return False
+        threshold_ms = max(150.0, min(280.0, self._vad_silence_ms * 0.4))
+        return self._silence_ms >= threshold_ms
 
     @staticmethod
     def _chunk_duration_ms(chunk: bytes, sample_rate: int = 8000) -> float:
@@ -447,6 +453,13 @@ class CallAgent:
                         logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
                         # 通话场景中，一句话即为一轮对话，拿到 is_final 后立即退出
                         # 避免前端持续送音频导致 VAD 无法触发、ASR 无限识别多句
+                        break
+                    if result.text and adapter.should_commit_intermediate():
+                        final_text = result.text
+                        logger.info(
+                            f"[{self.ctx.uuid}] ASR 早提交中间结果 {result.text!r} "
+                            f"(silence_ms={adapter._silence_ms:.0f})"
+                        )
                         break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
