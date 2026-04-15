@@ -87,7 +87,7 @@ class AudioStreamAdapter:
         self._vad = SimpleVAD(
             sample_rate=8000,
             frame_ms=20,
-            energy_threshold=250,
+            energy_threshold=120,     # 降低阈值：文件轮询的音频能量较低（max_rms≈134），需确保能触发语音检测
             speech_min_frames=1,
             silence_min_frames=max(1, int(vad_silence_ms / 20)),
         )

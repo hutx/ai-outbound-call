@@ -65,19 +65,15 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.freeswitch.audio
     #
-    # ★ 推荐镜像：drachtio/freeswitch-modules（含常用模块，开箱即用）
-    #   备选：signalwire/freeswitch:1.10.10（官方，更新，但部分模块需手动安装）
+    # ★ FreeSWITCH 镜像（含 mod_audio_fork）
+    #   RTP 端口范围由 vars.xml 中的 rtp_start_port / rtp_end_port 控制
     #
-    image: srt2011/freeswitch-mod-audio-fork:latest  
-    # image: safarov/freeswitch:latest
-    # image: rocketchat/freeswitch:latest
-    # image: ghcr.io/patrickbaus/freeswitch-docker:master
-    # image: ccr.ccs.tencentyun.com/xswitch/xswitch-free:latest
+    image: srt2011/freeswitch-mod-audio-fork:latest
     container_name: outbound_freeswitch
     restart: unless-stopped
     #
     # ★ 桥接网络 + 端口映射
-    # rtp-ip 使用 $${local_ip_v4}（192.168.5.15），SDP 中正确显示宿主机 IP
+    # RTP 范围 20000-21000（1001个端口，约500路并发），确保完全覆盖 vars.xml 配置
     #
     ports:
       - "8021:8021"
@@ -86,7 +82,7 @@ services:
       - "5060:5060/udp"
       - "5080:5080"
       - "5080:5080/udp"
-      - "16384-32768:16384-32768/udp"
+      - "16384-17384:16384-17384/udp"
     volumes:
       # ★ 只挂载 autoload_configs 和 dialplan，其余用镜像内置默认值
       #   挂载整个 /usr/local/freeswitch/conf 会覆盖镜像内的 ivr/sounds 等必要文件
@@ -99,6 +95,7 @@ services:
       - ../freeswitch/conf/autoload_configs/logfile.conf.xml:/usr/local/freeswitch/conf/autoload_configs/logfile.conf.xml:ro
       - ../freeswitch/conf/autoload_configs/audio_fork.conf.xml:/usr/local/freeswitch/conf/autoload_configs/audio_fork.conf.xml:ro
       - ../freeswitch/conf/autoload_configs/local_stream.conf.xml:/usr/local/freeswitch/conf/autoload_configs/local_stream.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/switch.conf.xml:/usr/local/freeswitch/conf/autoload_configs/switch.conf.xml:ro
       - ../freeswitch/conf/sip_profiles:/usr/local/freeswitch/conf/sip_profiles:ro
       - ../freeswitch/conf/dialplan/outbound.xml:/usr/local/freeswitch/conf/dialplan/outbound.xml:ro
       - ../freeswitch/conf/dialplan/internal.xml:/usr/local/freeswitch/conf/dialplan/internal.xml:ro
