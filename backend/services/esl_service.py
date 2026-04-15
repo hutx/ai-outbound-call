@@ -126,7 +126,8 @@ class AsyncESLConnection:
             f"script_id={script_id},"
             f"origination_caller_id_number={caller_id},"
             f"originate_timeout={originate_timeout},"
-            f"proxy_media=true"
+            f"proxy_media=true,"
+            f"bypass_media=false"
         )
 
         endpoint, endpoint_type, ext_num = self._build_originate_target(
@@ -138,9 +139,9 @@ class AsyncESLConnection:
         if endpoint_type == "internal_extension":
             # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
             # audio_stream 通过 uuid_audio_stream API 在 B-leg socket 连接后启动
-            # proxy_media=true 确保 RTP 经过 FreeSWITCH 软件层，mod_audio_stream 能捕获音频
+            # proxy_media=true + bypass_media=false 确保 RTP 经过 FreeSWITCH 软件层
             cmd = (
-                f"originate {{{simple_vars},proxy_media=true}}{endpoint} "
+                f"originate {{{simple_vars}}}{endpoint} "
                 f"&bridge(loopback/AI_CALL)"
             )
         else:

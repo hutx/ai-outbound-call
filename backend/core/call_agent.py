@@ -467,7 +467,7 @@ class CallAgent:
             async for chunk in audio_gen:
                 yield chunk
 
-        async for result in self.asr.recognize_stream(_gen_with_timeout()):
+        async for result in self.asr.recognize_stream(_gen_with_timeout(), call_uuid=self.ctx.uuid):
             yield result
 
     async def _tts_stream_with_timeout(self, text: str) -> AsyncGenerator[bytes, None]:
