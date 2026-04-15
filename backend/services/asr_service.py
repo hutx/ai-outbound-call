@@ -48,16 +48,18 @@ class BaseASR(ABC):
 
     @abstractmethod
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         """
         流式识别
         输入: 音频数据生成器（PCM bytes）
         输出: 识别结果生成器
+        call_uuid: 通话 UUID（用于音频文件命名，便于追溯）
         """
         pass
 
-    async def recognize_once(self, audio_data: bytes) -> str:
+    async def recognize_once(self, audio_data: bytes, call_uuid: Optional[str] = None) -> str:
         """
         一次性识别（非流式）
         输入: 完整音频 bytes
@@ -69,7 +71,7 @@ class BaseASR(ABC):
             yield audio_data
             yield b""  # 结束信号
 
-        async for result in self.recognize_stream(_gen()):
+        async for result in self.recognize_stream(_gen(), call_uuid=call_uuid):
             if result.is_final:
                 results.append(result.text)
 
@@ -95,7 +97,8 @@ class FunASRClient(BaseASR):
         self._ws_uri = f"ws://{self.host}:{self.port}"
 
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         """
         FunASR WebSocket 流式识别
@@ -212,7 +215,8 @@ class XunfeiASRClient(BaseASR):
         return f"{base_url}?{urlencode(params)}"
 
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         """讯飞流式识别"""
         uri = self._build_auth_url()
@@ -450,7 +454,8 @@ class AliASRClient(BaseASR):
     # ── 实时转写主逻辑 ────────────────────────────────────────
 
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         """
         阿里云 NLS 实时语音转写（WebSocket 流式）
@@ -693,7 +698,8 @@ class MockASRClient(BaseASR):
         self._idx = 0
 
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         # 消耗音频流
         async for _ in audio_gen:
@@ -725,26 +731,34 @@ class BailianASRClient(BaseASR):
 
     WS_URI = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/"
 
+    # 音频发送完毕后等待 ASR 服务端处理的时间（秒）
+    # 太短：服务端来不及产出 sentence-end 最终结果
+    # 太长：用户感知延迟增加
+    POST_AUDIO_WAIT_S = 2.0
+
     def __init__(self, cfg: ASRConfig):
         self.api_key = cfg.bailian_access_token
         self.model_name = cfg.bailian_asr_model or "paraformer-realtime-v1"
         self.sample_rate = cfg.sample_rate
 
     async def recognize_stream(
-        self, audio_gen: AsyncGenerator[bytes, None]
+        self, audio_gen: AsyncGenerator[bytes, None],
+        call_uuid: Optional[str] = None,
     ) -> AsyncGenerator[ASRResult, None]:
         if not self.api_key:
             logger.error("百炼 ASR: BAILIAN_ACCESS_TOKEN 未配置")
             yield ASRResult(text="", is_final=True)
             return
 
-        # 调试：保存 ASR 输入原始音频到 WAV 文件
+        # 保存每次 ASR 调用的原始音频，便于排查问题
         import os
+        import re
         import time as _time
+
         dump_dir = "/recordings/debug"
         os.makedirs(dump_dir, exist_ok=True)
-        dump_path = os.path.join(dump_dir, f"asr_input_{int(_time.time())}_{uuid.uuid4().hex[:6]}.wav")
         dump_pcm = b""
+        final_text = ""  # 用于命名
 
         headers = {"Authorization": f"Bearer {self.api_key}"}
         task_id = uuid.uuid4().hex
@@ -808,7 +822,7 @@ class BailianASRClient(BaseASR):
                 async for result in self._recv_results(ws, task_id):
                     yield result
                     if result.is_final:
-                        break
+                        final_text = result.text
 
                 # 4. 清理发送任务
                 send_task.cancel()
@@ -828,16 +842,24 @@ class BailianASRClient(BaseASR):
             logger.error(f"百炼 ASR 未知异常: {e}", exc_info=True)
             yield ASRResult(text="", is_final=True)
         finally:
-            # 将原始 PCM 转为 WAV 方便本地播放分析
+            # 将原始 PCM 转为 WAV，文件名包含 call_uuid 和识别结果
             if dump_pcm:
                 try:
+                    dur = len(dump_pcm) / (self.sample_rate * 2)
+                    text_tag = re.sub(r'[^\w\u4e00-\u9fff]', '', final_text)[:20] if final_text else "silent"
+                    prefix = call_uuid[:8] if call_uuid else f"asr_{int(_time.time())}"
+                    dump_path = os.path.join(
+                        dump_dir, f"asr_{prefix}_{text_tag}_{uuid.uuid4().hex[:4]}.wav"
+                    )
                     with wave.open(dump_path, "wb") as wf:
                         wf.setnchannels(1)
                         wf.setsampwidth(2)
                         wf.setframerate(self.sample_rate)
                         wf.writeframes(dump_pcm)
-                    dur = len(dump_pcm) / (self.sample_rate * 2)
-                    logger.info(f"百炼 ASR 音频已保存: {dump_path} ({len(dump_pcm)} bytes, {dur:.1f}s)")
+                    logger.info(
+                        f"百炼 ASR 音频已保存: {dump_path} "
+                        f"({len(dump_pcm)} bytes, {dur:.1f}s, text='{final_text}')"
+                    )
                 except Exception as e:
                     logger.warning(f"百炼 ASR WAV 保存失败: {e}")
 
@@ -867,6 +889,15 @@ class BailianASRClient(BaseASR):
             if buffer:
                 await ws.send(buffer)
 
+            # 等待 ASR 服务端处理完已发送的音频
+            # 百炼 ASR 需要时间来处理音频并生成 sentence-end 最终结果
+            # 太早发送 finish-task 会导致服务端来不及产出最终结果
+            await asyncio.sleep(self.POST_AUDIO_WAIT_S)
+            logger.debug(
+                f"百炼 ASR: 等待 {self.POST_AUDIO_WAIT_S}s 后发送 finish-task, "
+                f"task_id={task_id}"
+            )
+
             # 发送 finish-task 结束信号
             finish_task = {
                 "header": {
@@ -877,7 +908,7 @@ class BailianASRClient(BaseASR):
                 "payload": {"input": {}},
             }
             await ws.send(json.dumps(finish_task))
-            logger.debug(f"百炼 ASR: finish-task sent, task_id={task_id}")
+            logger.info(f"百炼 ASR: finish-task sent, task_id={task_id}")
 
         except asyncio.CancelledError:
             pass
@@ -919,10 +950,12 @@ class BailianASRClient(BaseASR):
                         yield ASRResult(text=text, is_final=is_final)
 
                 elif event == "task-finished":
-                    # task-finished 后可能还有最终的 sentence-end 结果
-                    # 多等 2 秒看是否有最终结果
+                    # _send_audio 已在发送 finish-task 前等待 POST_AUDIO_WAIT_S 秒
+                    # 这里只需快速检查是否有残留的最终结果
                     try:
-                        raw2 = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        raw2 = await asyncio.wait_for(
+                            ws.recv(), timeout=0.5
+                        )
                         if isinstance(raw2, bytes):
                             raw2 = raw2.decode("utf-8")
                         msg2 = json.loads(raw2)
@@ -943,7 +976,7 @@ class BailianASRClient(BaseASR):
                                 yield ASRResult(text=text2, is_final=is_final2)
                     except asyncio.TimeoutError:
                         pass
-                    logger.debug(f"百炼 ASR: task-finished, task_id={task_id}")
+                    logger.info(f"百炼 ASR: task-finished, task_id={task_id}")
                     return
 
                 elif event == "task-failed":

@@ -1,0 +1,25 @@
+<configuration name="switch.conf" description="核心开关配置">
+  <settings>
+    <!-- 进程优先级，-19 表示最高优先级（实时通话需要） -->
+    <param name="priority" value="-19"/>
+    <!-- 最大会话数（并发通话上限） -->
+    <param name="max-sessions" value="1000"/>
+    <!-- 每秒最多建立新会话数（防止突发流量打垮系统） -->
+    <param name="sessions-per-second" value="100"/>
+    <!-- 默认拨号超时（秒） -->
+    <param name="default-ring-duration" value="60"/>
+    <!-- RTP 超时（秒），超过此时长无 RTP 包则挂断 -->
+    <param name="rtp-start-timeout-sec" value="300"/>
+    <!-- 媒体超时保护 -->
+    <param name="media-timeout" value="0"/>
+    <!-- 日志级别：DEBUG=7, INFO=6, NOTICE=5, WARNING=4, ERR=3 -->
+    <param name="loglevel" value="info"/>
+    <!-- 控制台日志颜色 -->
+    <param name="colorize-console" value="true"/>
+    <!-- 运行用户（安全建议：不要用 root） -->
+    <!-- <param name="runas-username" value="freeswitch"/> -->
+    <!-- <param name="runas-groupname" value="freeswitch"/> -->
+    <!-- 核心 dump（调试用） -->
+    <param name="dump-cores" value="yes"/>
+  </settings>
+</configuration>
