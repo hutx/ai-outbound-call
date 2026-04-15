@@ -1459,17 +1459,10 @@ class ESLSocketCallSession:
         #    因为该连接可能来自之前的调用或其他来源，无法代表当前通话有音频流。
         logger.info(f"[{self._uuid}] 准备启动 uuid_audio_fork (esl_pool={self.esl_pool is not None}, _audio_started={self._audio_started})")
         if self.esl_pool and not self._audio_started:
-            stream_uuid = aleg_uuid or self._aleg_uuid
-            if not stream_uuid and self._channel_vars:
-                for var in ("other_loopback_from_uuid", "signal_bond"):
-                    val = self._channel_vars.get(var, "")
-                    if val and val not in ("-ERR", "_undef_"):
-                        stream_uuid = val
-                        break
-            if not stream_uuid:
-                stream_uuid = self._uuid
-                logger.warning(f"[{self._uuid}] 未找到 A-leg UUID，降级到 B-leg uuid_audio_fork")
-
+            # ★ 修复：在 loopback B-leg（self._uuid）上调用 uuid_audio_fork
+            #    loopback B-leg 的 read 方向从 bridge 读取 sofia 侧的用户语音，
+            #    media bug 应该能捕获到有效音频（之前 sofia A-leg 只捕获到静音）。
+            stream_uuid = self._uuid
             ws_url = f"ws://backend:8765/{stream_uuid}"
             try:
                 result = await self.esl_pool.api(
@@ -1478,7 +1471,7 @@ class ESLSocketCallSession:
                 result_stripped = result.strip()
                 if result_stripped.startswith("+OK"):
                     logger.info(
-                        f"[{self._uuid}] uuid_audio_fork 启动在 {stream_uuid[:8]}: {ws_url}"
+                        f"[{self._uuid}] uuid_audio_fork 启动在 {stream_uuid[:8]} (loopback B-leg): {ws_url}"
                     )
                     # 等待 WebSocket 连接建立（最多等 5 秒）
                     for attempt in range(50):

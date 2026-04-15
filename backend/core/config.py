@@ -106,7 +106,8 @@ class ASRConfig:
     # 采样率（Hz），FreeSWITCH PCMU/PCMA 默认 8000Hz
     sample_rate: int = 8000
     # VAD 静音检测阈值（ms），超过此时长则认为用户说完
-    vad_silence_ms: int = 500
+    # ★ 优化：300ms → 1000ms，减少用户说话中间短暂停顿导致的误截断
+    vad_silence_ms: int = 1000
 
     def __post_init__(self):
         self.provider = _env("ASR_PROVIDER", self.provider)

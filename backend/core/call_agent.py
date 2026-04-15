@@ -39,7 +39,9 @@ LLM_TIMEOUT = 30.0
 # TTS 超时（秒）
 TTS_TIMEOUT = 10.0
 # ASR 单句最长等待（秒）
-ASR_TIMEOUT = 12.0
+# ★ 优化：12s → 30s，文件轮询模式下录音开头可能有较长静音（TTS 准备期），
+#    用户可能在 15-20 秒后才开始说话，12s 太短导致 ASR 在到达语音段前就超时
+ASR_TIMEOUT = 30.0
 
 
 class AudioStreamAdapter:
@@ -84,6 +86,10 @@ class AudioStreamAdapter:
         self._speech_chunks = 0
         self._speech_ms = 0.0
         self._max_rms = 0
+        # ★ 连续语音检测：防止前几个噪音 chunk 误触发 _started_speaking
+        #    需要连续 5 个语音 chunk（100ms 持续语音）才认为用户真正开始说话
+        self._consecutive_speech_frames = 0
+        self._speech_onset_threshold = 5  # 5 帧 = 100ms
         self._vad = SimpleVAD(
             sample_rate=8000,
             frame_ms=20,
@@ -155,20 +161,36 @@ class AudioStreamAdapter:
                 self._max_rms = max(self._max_rms, rms)
 
                 if has_speech:
-                    self._started_speaking = True
-                    self._silence_ms = 0.0
-                    last_audio_ts = time.time()
+                    self._consecutive_speech_frames += 1
                     self._speech_chunks += 1
                     self._speech_ms += chunk_duration_ms
+
+                    # ★ 关键修复：连续语音帧达到阈值才认为用户真正开始说话
+                    #    防止前几个噪音 chunk（RMS 略高于阈值）误触发
+                    if self._consecutive_speech_frames >= self._speech_onset_threshold:
+                        if not self._started_speaking:
+                            self._started_speaking = True
+                            logger.info(f"[adapter] 用户开始说话（连续 {self._consecutive_speech_frames} 帧语音）")
+                        self._silence_ms = 0.0
+                        last_audio_ts = time.time()
+
                     if self._speech_chunks <= 3:
                         logger.info(f"[adapter] 检测到语音 #{self._speech_chunks}: rms={rms} threshold={self._vad.energy_threshold} chunk={len(chunk)}B duration={chunk_duration_ms:.1f}ms")
                 else:
+                    self._consecutive_speech_frames = 0  # 重置连续计数
                     self._silence_ms += chunk_duration_ms
                     if not self._started_speaking:
-                        # 未检测到语音开始时，连续静音 2 秒后退出（给 TTS 残余音频的时间）
-                        if self._silence_ms >= 2000:
+                        # ★ 优化：初始静音超时从 2s → 15s
+                        #    文件轮询模式下，录音开头可能有较长静音（TTS 准备期），
+                        #    2s 太短导致适配器在收到有效语音前就退出。
+                        #    15s 足够等待文件轮询到达语音段。
+                        if self._silence_ms >= 15000:
                             break
-                        continue
+                        # ★ 关键修复：即使当前帧是静音，也要 yield 给 ASR
+                        #    之前这里有个 continue 导致静音帧不送入 ASR，
+                        #    但如果后续没有语音，adapter 会在 2s 后 break 且不 yield 任何数据，
+                        #    导致 ASR 收到 0 chunks → NO_VALID_AUDIO_ERROR
+                        #    ASR 服务端自己能处理静音音频，不需要我们过滤
 
                 # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
                 should_barge_in = False
@@ -239,6 +261,9 @@ class CallAgent:
         self._script_config = None  # 话术脚本配置，用于获取打断策略
         self._barge_in = asyncio.Event()
         self._barge_in.set()  # 初始置位（表示目前没有在播放）
+        # ★ 优化5：主 ASR 监听就绪信号（由 _say 在 TTS 播放结束前设置）
+        self._main_asr_ready = asyncio.Event()
+        self._main_asr_ready.set()  # 初始置位（第一次监听不需要等待）
         # 最近一次 _say 的打断配置，用于传递给 _listen_user
         self._last_barge_in_config = {
             "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
@@ -383,6 +408,16 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 会话已断开，跳过 ASR")
             return ""
 
+        # ★ 优化5：如果 _say 设置了提前启动信号，等待它
+        if not self._main_asr_ready.is_set():
+            logger.info(f"[{self.ctx.uuid}] 🔊 等待 _say 提前启动 ASR...")
+            try:
+                await asyncio.wait_for(self._main_asr_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.ctx.uuid}] 等待主 ASR 就绪超时，直接启动")
+            # 重置信号，供下次使用
+            self._main_asr_ready.clear()
+
         audio_queue = await self.session.start_audio_capture()
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
@@ -452,6 +487,42 @@ class CallAgent:
             self.ctx.messages.append({"role": "user", "content": final_text})
 
         return final_text
+
+    async def _barge_in_asr_loop_with_queue(self, adapter: AudioStreamAdapter,
+                                             audio_capture_task: asyncio.Task):
+        """后台 ASR 循环，等待音频队列就绪后再开始 barge-in 检测。
+
+        与 _barge_in_asr_loop 的区别：
+        - 接收一个 Task（start_audio_capture），等待其完成后获取真实队列
+        - 不阻塞 TTS 播放
+        """
+        try:
+            # 等待音频采集就绪（最多 10 秒）
+            try:
+                audio_queue = await asyncio.wait_for(audio_capture_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.ctx.uuid}] barge-in 音频采集超时，使用空队列")
+                audio_queue = asyncio.Queue()
+            except Exception as e:
+                logger.warning(f"[{self.ctx.uuid}] barge-in 音频采集异常: {e}，使用空队列")
+                audio_queue = asyncio.Queue()
+
+            # 替换 adapter 的队列
+            adapter._audio_queue = audio_queue
+            logger.info(f"[{self.ctx.uuid}] barge-in 音频队列已就绪, 大小={audio_queue.qsize()}")
+
+            async with asyncio.timeout(ASR_TIMEOUT):
+                async for result in self._asr_with_retry(adapter.stream()):
+                    if result.is_final and result.text:
+                        logger.info(f"[{self.ctx.uuid}] barge-in ASR: {result.text!r}")
+                        if not self._barge_in.is_set():
+                            self._barge_in.set()
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 超时")
+        except Exception as e:
+            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 异常: {e}")
+        finally:
+            adapter.stop()
 
     async def _barge_in_asr_loop(self, adapter: AudioStreamAdapter):
         """
@@ -575,11 +646,9 @@ class CallAgent:
             # ★ 关键修复：在 TTS 播放期间启动后台 ASR 监听
             #    这样用户可以在 TTS 播放期间（除保护期外）打断 AI
             #    后台 ASR 检测到用户语音后会设置 _barge_in 事件
-            logger.info(f"[{self.ctx.uuid}] 启动后台 barge-in ASR 监听")
-            audio_queue = await self.session.start_audio_capture()
-            logger.info(f"[{self.ctx.uuid}] barge-in 音频队列已获取, 大小={audio_queue.qsize()}")
+            #    ★ 启动为后台任务，不阻塞 TTS 播放
             barge_in_adapter = AudioStreamAdapter(
-                audio_queue,
+                asyncio.Queue(),  # 占位队列，后续替换
                 vad_silence_ms=config.asr.vad_silence_ms,
                 barge_in_cb=self._barge_in,
                 barge_in_enabled=barge_in_enabled,
@@ -587,33 +656,19 @@ class CallAgent:
                 protect_start_ms=protect_start_ms,
                 protect_end_ms=protect_end_ms,
             )
+            # 后台启动音频采集（不阻塞 TTS）
+            audio_capture_task = asyncio.create_task(self.session.start_audio_capture())
             # 启动后台 ASR 任务（不阻塞 TTS 播放）
             barge_in_asr_task = asyncio.create_task(
-                self._barge_in_asr_loop(barge_in_adapter)
+                self._barge_in_asr_loop_with_queue(barge_in_adapter, audio_capture_task)
             )
-            logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动")
+            logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动（后台音频采集中）")
 
-            # 收集 TTS 音频
-            pcm_parts = []
-            total_bytes = 0
-            async for chunk in audio_chunks:
-                if chunk:
-                    pcm_parts.append(chunk)
-                    total_bytes += len(chunk)
-                # 每收到一个 TTS chunk 都检查 barge-in
-                if self._barge_in.is_set():
-                    logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，停止 TTS 收集")
-                    barge_in_adapter.stop()
-                    break
-
-            if not pcm_parts:
-                logger.warning(f"[{self.ctx.uuid}] TTS 流式播放收到空音频")
-                barge_in_adapter.stop()
-                return
-
-            from backend.utils.audio import write_wav
+            # ★ 优化4：流式 TTS — 边接收边写文件，消除 join+写文件延迟
             import os
             import tempfile
+            import wave
+            from backend.utils.audio import write_wav
 
             shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
             os.makedirs(shared_dir, exist_ok=True)
@@ -624,19 +679,61 @@ class CallAgent:
             )
             os.close(fd)
 
-            pcm_data = b"".join(pcm_parts)
-            write_wav(temp_path, pcm_data, sample_rate=8000)
-            file_size = os.path.getsize(temp_path)
-            # 估算播放时长（8000Hz 16bit mono = 16000 bytes/sec）
-            estimated_duration = len(pcm_data) / 16000.0
+            # 边接收 TTS chunk 边写入文件
+            # 先用 wave 模块打开文件，然后边接收边写 PCM
+            pcm_size = 0
+            async with asyncio.timeout(60):
+                try:
+                    with wave.open(temp_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(8000)
+                        async for chunk in audio_chunks:
+                            if chunk:
+                                wf.writeframes(chunk)
+                                pcm_size += len(chunk)
+                            # 每收到一个 TTS chunk 都检查 barge-in
+                            if self._barge_in.is_set():
+                                logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，停止 TTS 收集")
+                                barge_in_adapter.stop()
+                                break
+                except StopAsyncIteration:
+                    pass
 
+            if pcm_size == 0:
+                logger.warning(f"[{self.ctx.uuid}] TTS 流式播放收到空音频")
+                barge_in_adapter.stop()
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                return
+
+            estimated_duration = pcm_size / 16000.0  # 8000Hz * 2 bytes = 16000 bytes/s
             logger.info(
                 f"[{self.ctx.uuid}] TTS WAV: {temp_path} "
-                f"({file_size} bytes, ~{estimated_duration:.1f}s)"
+                f"({pcm_size} bytes PCM, ~{estimated_duration:.1f}s)"
             )
 
-            # 通过 outbound session 直接执行 playback（sendmsg execute）
-            await self.session.play(temp_path, timeout=60.0)
+            # ★ 优化5：在 TTS 播放期间提前启动主 ASR 监听
+            #    计算 ASR 提前启动时间（TTS 播放结束前 2 秒）
+            asr_prestart_time = max(0, estimated_duration - 2.0)
+
+            async def _play_with_early_asr():
+                """播放 TTS 并在结束前启动主 ASR 监听。"""
+                play_task = asyncio.create_task(self.session.play(temp_path, timeout=60.0))
+                # 等待预启动时间后标记主 ASR 就绪
+                if asr_prestart_time > 0:
+                    await asyncio.sleep(asr_prestart_time)
+                # 标记主 ASR 可以启动（在 _listen_user 中检查）
+                self._main_asr_ready.set()
+                await play_task
+
+            try:
+                await _play_with_early_asr()
+            except Exception:
+                self._main_asr_ready.set()  # 确保即使播放失败也释放等待
+                raise
 
             logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
 
