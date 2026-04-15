@@ -190,7 +190,15 @@
         <param name="aggressive-nat-detection" value="true"/>
         <param name="local-network-acl" value="loopback.auto"/>
         <param name="disable-srv-lookups" value="true"/>
-        <param name="auto-rtp-bug" value="true"/>
+        <!-- ★ 关闭 auto-rtp-bug — 它会误杀 mod_audio_fork 的 media bug，
+             导致 bridge 后 mod_audio_fork 推送静音。
+             已有 proxy_media=true + bypass_media=false 确保 RTP 经过软件层，
+             不需要 auto-rtp-bug 修复 NAT 问题。 -->
+        <param name="auto-rtp-bug" value="false"/>
+
+        <!-- ★ 确保所有 inbound 通话的 RTP 经过 FreeSWITCH 软件层，
+             使 mod_audio_fork / uuid_audio_fork 能捕获到用户语音 -->
+        <param name="inbound-proxy-media" value="true"/>
 
         <!-- 需要鉴权 -->
         <param name="auth-calls"      value="true"/>

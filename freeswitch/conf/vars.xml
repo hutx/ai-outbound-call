@@ -22,7 +22,7 @@
   <X-PRE-PROCESS cmd="set" data="internal_tls_port=5061" />
   <!-- RTP 端口范围（每路通话占用 2 个端口：RTP + RTCP） -->
   <X-PRE-PROCESS cmd="set" data="rtp_start_port=16384" />
-  <X-PRE-PROCESS cmd="set" data="rtp_end_port=32768" />
+  <X-PRE-PROCESS cmd="set" data="rtp_end_port=17384" />
 
   <!-- ============================================================
        运营商 SIP 网关配置（关键！替换为实际运营商信息）
