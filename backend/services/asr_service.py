@@ -734,7 +734,8 @@ class BailianASRClient(BaseASR):
     # 音频发送完毕后等待 ASR 服务端处理的时间（秒）
     # 太短：服务端来不及产出 sentence-end 最终结果
     # 太长：用户感知延迟增加
-    POST_AUDIO_WAIT_S = 2.0
+    # 3.0s 经验值：短语句（1-3 字）通常 1-2s 可完成最终识别
+    POST_AUDIO_WAIT_S = 3.0
 
     def __init__(self, cfg: ASRConfig):
         self.api_key = cfg.bailian_access_token
@@ -873,6 +874,8 @@ class BailianASRClient(BaseASR):
         frame_size = int(self.sample_rate * frame_ms / 1000 * 2)  # 16bit mono
         frame_interval = frame_ms / 1000.0
         buffer = b""
+        total_sent = 0
+        frame_count = 0
 
         try:
             async for chunk in audio_gen:
@@ -883,17 +886,27 @@ class BailianASRClient(BaseASR):
                     frame = buffer[:frame_size]
                     buffer = buffer[frame_size:]
                     await ws.send(frame)  # Binary frame
+                    total_sent += len(frame)
+                    frame_count += 1
                     await asyncio.sleep(frame_interval)
 
             # 发送剩余不足一帧的数据
             if buffer:
                 await ws.send(buffer)
+                total_sent += len(buffer)
+                frame_count += 1
+
+            logger.info(
+                f"百炼 ASR: 音频发送完毕, task_id={task_id}, "
+                f"共 {frame_count} 帧, {total_sent} bytes ({total_sent/1600*100:.0f}ms)"
+            )
 
             # 等待 ASR 服务端处理完已发送的音频
             # 百炼 ASR 需要时间来处理音频并生成 sentence-end 最终结果
             # 太早发送 finish-task 会导致服务端来不及产出最终结果
+            # 从 2.0s 增加到 3.0s — 短语句（如"怎么操作"）需要 1-2s 处理
             await asyncio.sleep(self.POST_AUDIO_WAIT_S)
-            logger.debug(
+            logger.info(
                 f"百炼 ASR: 等待 {self.POST_AUDIO_WAIT_S}s 后发送 finish-task, "
                 f"task_id={task_id}"
             )
@@ -925,6 +938,7 @@ class BailianASRClient(BaseASR):
           sentence-synthesis  中间结果（刷新中）
           sentence-end        最终结果（句子结束）
         """
+        recv_count = 0
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -932,6 +946,7 @@ class BailianASRClient(BaseASR):
                 msg = json.loads(raw)
                 header = msg.get("header", {})
                 event = header.get("event", "")
+                recv_count += 1
 
                 if event == "result-generated":
                     payload = msg.get("payload", {})
@@ -976,7 +991,7 @@ class BailianASRClient(BaseASR):
                                 yield ASRResult(text=text2, is_final=is_final2)
                     except asyncio.TimeoutError:
                         pass
-                    logger.info(f"百炼 ASR: task-finished, task_id={task_id}")
+                    logger.info(f"百炼 ASR: task-finished, task_id={task_id}, 共接收 {recv_count} 条消息")
                     return
 
                 elif event == "task-failed":

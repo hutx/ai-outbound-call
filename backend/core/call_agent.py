@@ -398,12 +398,15 @@ class CallAgent:
         )
 
         final_text = ""
+        last_intermediate_text = ""  # 兜底：如果 ASR 未产出 is_final，使用最后一条中间结果
         asr_result_count = 0
         try:
             async with asyncio.timeout(ASR_TIMEOUT):
                 async for result in self._asr_with_retry(adapter.stream()):
                     asr_result_count += 1
                     logger.info(f"[{self.ctx.uuid}] ASR 中间结果 #{asr_result_count}: text={result.text!r} is_final={result.is_final} conf={result.confidence:.2f}")
+                    if result.text:
+                        last_intermediate_text = result.text
                     if result.is_final and result.text:
                         final_text = result.text
                         logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
@@ -425,6 +428,15 @@ class CallAgent:
             f"speech_ms={audio_stats['speech_ms']} "
             f"max_rms={audio_stats['max_rms']}"
         )
+
+        # 兜底：未产出 is_final 但有人声 + 中间结果，使用最后一条中间结果
+        if not final_text and last_intermediate_text and audio_stats.get("speech_detected"):
+            final_text = last_intermediate_text
+            logger.info(
+                f"[{self.ctx.uuid}] ASR 兜底：使用最后一条中间结果 {last_intermediate_text!r} "
+                f"(speech_ms={audio_stats['speech_ms']}, max_rms={audio_stats['max_rms']})"
+            )
+
         if not audio_stats["speech_detected"]:
             logger.warning(f"[{self.ctx.uuid}] 本轮进入 ASR 的音频未检测到有效人声")
         elif not final_text:

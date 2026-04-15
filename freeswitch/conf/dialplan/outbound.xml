@@ -65,11 +65,7 @@
         <!-- 4. 开始录音（合规要求：所有通话必须录音） -->
         <action application="record_session" data="${record_file}"/>
 
-        <!-- 5. ★ 启用 mod_audio_stream 实时音频流
-             FreeSWITCH 将通话音频实时推送到后端 WebSocket (8765)，供 ASR 流式识别 -->
-        <action application="audio_stream" data="ws://backend:8765/${uuid}"/>
-
-        <!-- 6. ★ 关键：将通话控制权交给后端 CallAgent
+        <!-- 5. ★ 关键：将通话控制权交给后端 CallAgent
              FreeSWITCH 主动连接后端的 ESL Socket 服务器
              async = 异步模式（FS 可以继续处理其他事件）
              full  = 完整事件模式（接收所有事件） -->
