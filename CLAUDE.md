@@ -88,9 +88,10 @@
   8. mod_audio_fork 尝试在 sofia A-leg 上推送（当前返回静音，但 WebSocket 连接成功）
   9. start_audio_capture 检测 WebSocket 帧内容：抽样 20 帧，超过 50% 静音 → **降级到文件轮询**
   10. `_poll_audio_file()` 以实时速率（20ms/帧）读取 B-leg record_session WAV，320 字节分帧送入 ASR
-  11. ASR WebSocket 推送识别结果 → CallAgent 处理
-  12. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
-  13. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
+  11. ASR 消费音频：连续 5 帧语音（100ms）才触发 `_started_speaking`，防止开头噪音误触发
+  12. 百炼 ASR 识别（8k→16k 上采样），返回中间/最终结果
+  13. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
+  14. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
 - **关键**：loopback 不是 sofia 端点，bridge 后 RTP 不会旁路
 - **关键**：`uuid_audio_fork` 使用 `mono 8000` 格式（FreeSWITCH help 确认）
 - **关键**：`uuid_displace` 正确目标查找（`esl_service.py` `_discover_aleg_uuid()` + `play()`）：
@@ -99,7 +100,12 @@
   - `other_loopback_leg_uuid` = loopback-a UUID ✗（写到它用户听不到）
 - **首次播放延迟**：`play()` 中首次 `uuid_displace` 等待 3 秒（socket 接管媒体路径需要时间），后续播放等待 2 秒
 - **ASR 兜底**：如果 ASR 未产出 `is_final=True` 结果，使用最后一条中间结果作为最终文本
-- **代码位置**：`backend/services/esl_service.py` — `ESLPool.originate()`, `ESLSocketCallSession.start_audio_capture()`, `_discover_aleg_uuid()`, `_poll_audio_file()`
+- **连续语音帧检测**：需连续 5 帧（100ms）语音才认为用户开始说话，防止开头噪音误触发
+- **百炼 ASR 上采样**：8kHz → 16kHz 线性插值（`paraformer-realtime-v1` 要求 16kHz 输入）
+- **代码位置**：
+  - `backend/services/esl_service.py` — `ESLPool.originate()`, `ESLSocketCallSession.start_audio_capture()`, `_discover_aleg_uuid()`, `_poll_audio_file()`
+  - `backend/services/asr_service.py` — `BailianASRClient._upsample_8k_to_16k()`, `recognize_stream()`
+  - `backend/core/call_agent.py` — `AudioStreamAdapter.stream()`, `_consecutive_speech_frames`
 
 ### PSTN 外呼：&park() + dialplan socket
 - **命令**：`originate [{vars}]sofia/gateway/... &park()`
@@ -137,17 +143,41 @@
 - **参数**：`mono`/`stereo`/`mixed` + `8000`/`16000`（FreeSWITCH help 确认）
 - **日期**：2026-04-15
 
-### ✅ ASR 兜底策略
-- **场景**：百炼 ASR 返回 0 条 `is_final=True` 结果但产生多条中间结果
+### ✅ ASR 兜底策略（已优化，部分场景不再需要兜底）
+- **场景**：百炼 ASR 未产出 `is_final=True` 结果但产生多条中间结果
 - **修复**：`_listen_user` 中累积 `last_intermediate_text`，检测到人声且中间结果非空时兜底使用
+- **最新状态**：连续语音帧修复后，部分场景 ASR 能正常返回 `is_final=True`（如 "在哪里啊？"），不再依赖兜底
 - **日期**：2026-04-15
 
-### ✅ 百炼 ASR 8k→16k 上采样
-- **问题**：百炼 ASR 要求 16kHz 输入，系统音频为 8kHz PCMU，直接发送导致 `NO_VALID_AUDIO_ERROR`
-- **修复**：`BailianASRClient._send_audio()` 中使用线性插值将 8kHz PCM 上采样到 16kHz 再发送
-- **结果**：ASR 能正常识别语音，中间结果正常返回（`"不知道"` → `"不需要。"` → `"没有"`）
-- **注意**：`is_final` 仍不返回 true，依赖兜底策略使用最后一条中间结果
-- **代码位置**：`backend/services/asr_service.py` — `BailianASRClient._upsample_8k_to_16k()`, `_send_audio()`
+### ✅ 百炼 ASR 完整修复（2026-04-15）
+百炼 ASR 从 `NO_VALID_AUDIO_ERROR` 到成功识别，共 4 项修复：
+
+#### 修复 1：8k→16k 上采样
+- **问题**：百炼 ASR 要求 16kHz 输入（`paraformer-realtime-v1`），系统音频为 8kHz PCMU
+- **修复**：`BailianASRClient` 新增 `SEND_SAMPLE_RATE = 16000` + `_upsample_8k_to_16k()` 静态方法
+- **细节**：线性插值上采样，8kHz 每两个样本间插入平均值 → 16kHz
+- **代码位置**：`backend/services/asr_service.py` — `BailianASRClient` 类
+
+#### 修复 2：连续语音帧检测（防止噪音误触发）
+- **问题**：文件轮询开头的几个噪音 chunk（RMS 略高于 120）误触发 `_started_speaking`，随后 300ms 静音就退出，还没读到用户说话就结束
+- **修复**：`AudioStreamAdapter` 新增 `_consecutive_speech_frames` 计数器，需连续 5 帧（100ms）语音才认为用户真正开始说话
+- **代码位置**：`backend/core/call_agent.py` — `AudioStreamAdapter.__init__()` + `stream()`
+
+#### 修复 3：ASR 超时增大
+- **原值**：`ASR_TIMEOUT = 12.0`
+- **新值**：`ASR_TIMEOUT = 30.0`
+- **原因**：文件轮询模式下录音开头有 TTS 准备期静音，用户可能在 15-20 秒后才说话，12s 太短
+
+#### 修复 4：VAD 静音超时增大
+- **原值**：`vad_silence_ms = 300`（config 默认值）
+- **新值**：`vad_silence_ms = 1000`（config 默认值），运行时环境变量 `VAD_SILENCE_MS=500`
+- **原因**：300ms 太短，用户说话中间短暂停顿就会误截断
+
+#### 验证结果
+- ASR 成功识别："在哪里啊？"（`is_final=True`, conf=1.00）
+- 语音检测：`speech_chunks=36, max_rms=6079`
+- LLM 正确响应并播放 TTS ✓
+- 完整对话流程验证通过
 
 ### ✅ 文件轮询实时速率控制
 - **问题**：文件轮询以全速读取并广播音频帧，ASR 服务端期望实时速率输入
