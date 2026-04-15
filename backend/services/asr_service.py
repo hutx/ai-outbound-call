@@ -727,20 +727,24 @@ class BailianASRClient(BaseASR):
       Server → Client : JSON (task-result) ← 中间/最终结果
       Client → Server : JSON (finish-task)
       Server → Client : JSON (task-finished)
+
+    ★ 关键：百炼 ASR 要求 16kHz 采样率。
+    输入音频（通常 8kHz PCMU）会在内部通过线性插值上采样到 16kHz 再发送。
     """
 
     WS_URI = "wss://dashscope.aliyuncs.com/api-ws/v1/inference/"
 
+    # ★ 百炼 ASR 发送采样率（固定 16kHz，与官方 SDK 一致）
+    SEND_SAMPLE_RATE = 16000
+
     # 音频发送完毕后等待 ASR 服务端处理的时间（秒）
-    # 太短：服务端来不及产出 sentence-end 最终结果
-    # 太长：用户感知延迟增加
-    # 3.0s 经验值：短语句（1-3 字）通常 1-2s 可完成最终识别
     POST_AUDIO_WAIT_S = 3.0
 
     def __init__(self, cfg: ASRConfig):
         self.api_key = cfg.bailian_access_token
-        self.model_name = cfg.bailian_asr_model or "paraformer-realtime-v1"
-        self.sample_rate = cfg.sample_rate
+        # ★ 修复：不要覆盖配置中的模型名
+        self.model_name = cfg.bailian_asr_model
+        self.input_sample_rate = cfg.sample_rate  # 输入采样率（通常 8000Hz）
 
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None],
@@ -785,7 +789,7 @@ class BailianASRClient(BaseASR):
                         "function": "recognition",
                         "input": {},
                         "parameters": {
-                            "sample_rate": self.sample_rate,
+                            "sample_rate": self.SEND_SAMPLE_RATE,
                             "format": "pcm",
                         },
                     },
@@ -793,7 +797,8 @@ class BailianASRClient(BaseASR):
                 await ws.send(json.dumps(run_task))
                 logger.info(
                     f"百炼 ASR: run-task sent, model={self.model_name}, "
-                    f"sample_rate={self.sample_rate}"
+                    f"send_sample_rate={self.SEND_SAMPLE_RATE} "
+                    f"(input={self.input_sample_rate})"
                 )
 
                 # 2. 等待 task-started 确认（服务器用 event 字段，不是 action）
@@ -846,7 +851,8 @@ class BailianASRClient(BaseASR):
             # 将原始 PCM 转为 WAV，文件名包含 call_uuid 和识别结果
             if dump_pcm:
                 try:
-                    dur = len(dump_pcm) / (self.sample_rate * 2)
+                    # dump_pcm 是上采样后的 16kHz 数据
+                    dur = len(dump_pcm) / (self.SEND_SAMPLE_RATE * 2)
                     text_tag = re.sub(r'[^\w\u4e00-\u9fff]', '', final_text)[:20] if final_text else "silent"
                     prefix = call_uuid[:8] if call_uuid else f"asr_{int(_time.time())}"
                     dump_path = os.path.join(
@@ -855,7 +861,7 @@ class BailianASRClient(BaseASR):
                     with wave.open(dump_path, "wb") as wf:
                         wf.setnchannels(1)
                         wf.setsampwidth(2)
-                        wf.setframerate(self.sample_rate)
+                        wf.setframerate(self.SEND_SAMPLE_RATE)
                         wf.writeframes(dump_pcm)
                     logger.info(
                         f"百炼 ASR 音频已保存: {dump_path} "
@@ -864,14 +870,52 @@ class BailianASRClient(BaseASR):
                 except Exception as e:
                     logger.warning(f"百炼 ASR WAV 保存失败: {e}")
 
+    # ── 上采样：8kHz → 16kHz ──────────────────────────────────
+
+    @staticmethod
+    def _upsample_8k_to_16k(pcm_8k: bytes) -> bytes:
+        """将 8kHz 16-bit PCM 上采样到 16kHz（线性插值）。
+
+        每对相邻 8k 样本之间插入一个线性插值样本，使采样率翻倍。
+        对于 n 个 8k 样本，输出 2n-1 个样本（≈2n 用于批量处理）。
+
+        Args:
+            pcm_8k: 8kHz 16-bit 单声道 PCM 数据
+
+        Returns:
+            16kHz 16-bit 单声道 PCM 数据
+        """
+        if len(pcm_8k) < 2:
+            return pcm_8k
+
+        import struct as _struct
+
+        # 解码 8k 样本
+        n = len(pcm_8k) // 2
+        samples = _struct.unpack(f'<{n}h', pcm_8k[:n * 2])
+
+        # 线性插值：每对相邻样本之间插入平均值
+        out = []
+        for i in range(n):
+            out.append(samples[i])
+            if i < n - 1:
+                out.append((samples[i] + samples[i + 1]) // 2)
+        # 最后一个样本也复制一次（保持偶数长度）
+        out.append(samples[-1])
+
+        # 编码回 16-bit PCM
+        return _struct.pack(f'<{len(out)}h', *out)
+
     async def _send_audio(self, ws, audio_gen, task_id: str):
         """
         分块发送 PCM 音频数据。
-        帧大小：100ms 对应字节数（8000Hz=1600 bytes, 16000Hz=3200 bytes）。
+        ★ 输入为 8kHz PCM，内部上采样到 16kHz 后发送（与官方 SDK 一致）。
+        帧大小：100ms @ 16kHz = 3200 bytes。
         发送速率与录音速率一致（实时倍速）。
         """
         frame_ms = 100
-        frame_size = int(self.sample_rate * frame_ms / 1000 * 2)  # 16bit mono
+        # ★ 使用 16kHz 计算帧大小
+        frame_size = int(self.SEND_SAMPLE_RATE * frame_ms / 1000 * 2)  # 3200 bytes
         frame_interval = frame_ms / 1000.0
         buffer = b""
         total_sent = 0
@@ -881,7 +925,14 @@ class BailianASRClient(BaseASR):
             async for chunk in audio_gen:
                 if not chunk:
                     break
-                buffer += chunk
+
+                # ★ 如果输入采样率低于发送采样率，需要上采样
+                if self.input_sample_rate < self.SEND_SAMPLE_RATE:
+                    chunk_16k = self._upsample_8k_to_16k(chunk)
+                else:
+                    chunk_16k = chunk
+                buffer += chunk_16k
+
                 while len(buffer) >= frame_size:
                     frame = buffer[:frame_size]
                     buffer = buffer[frame_size:]
@@ -898,13 +949,11 @@ class BailianASRClient(BaseASR):
 
             logger.info(
                 f"百炼 ASR: 音频发送完毕, task_id={task_id}, "
-                f"共 {frame_count} 帧, {total_sent} bytes ({total_sent/1600*100:.0f}ms)"
+                f"共 {frame_count} 帧 @ 16kHz, {total_sent} bytes "
+                f"({total_sent / (self.SEND_SAMPLE_RATE * 2) * 1000:.0f}ms)"
             )
 
             # 等待 ASR 服务端处理完已发送的音频
-            # 百炼 ASR 需要时间来处理音频并生成 sentence-end 最终结果
-            # 太早发送 finish-task 会导致服务端来不及产出最终结果
-            # 从 2.0s 增加到 3.0s — 短语句（如"怎么操作"）需要 1-2s 处理
             await asyncio.sleep(self.POST_AUDIO_WAIT_S)
             logger.info(
                 f"百炼 ASR: 等待 {self.POST_AUDIO_WAIT_S}s 后发送 finish-task, "

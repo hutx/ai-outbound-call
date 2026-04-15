@@ -1457,6 +1457,7 @@ class ESLSocketCallSession:
         #
         #    注意：不能用 connections_active > 0 判断 dialplan audio_fork 是否就绪，
         #    因为该连接可能来自之前的调用或其他来源，无法代表当前通话有音频流。
+        logger.info(f"[{self._uuid}] 准备启动 uuid_audio_fork (esl_pool={self.esl_pool is not None}, _audio_started={self._audio_started})")
         if self.esl_pool and not self._audio_started:
             stream_uuid = aleg_uuid or self._aleg_uuid
             if not stream_uuid and self._channel_vars:
@@ -1485,14 +1486,60 @@ class ESLSocketCallSession:
                         if self.ws_server and self.ws_server.stats.get("connections_active", 0) > 0:
                             queue = await self.ws_server.get_session_queue(stream_uuid, timeout=1.0)
                             if queue is not None:
-                                sub_queue = asyncio.Queue(maxsize=500)
-                                self._audio_subscribers.append(sub_queue)
-                                asyncio.create_task(self._relay_ws_audio(queue))
-                                self._audio_started = True
-                                self._audio_mode = "websocket"
-                                logger.info(f"[{self._uuid}] WebSocket audio_fork 已连接")
-                                return sub_queue
-                    logger.warning(f"[{self._uuid}] uuid_audio_fork 启动但 WebSocket 未连接")
+                                # ★ 关键修复：WebSocket 连接后，验证帧内容是否为有效音频
+                                #    mod_audio_fork 在 sofia A-leg 上可能只推送静音（ff ff ff），
+                                #    需要抽样检查帧内容，不能仅依赖 frame_count > 0
+                                logger.info(f"[{self._uuid}] WebSocket 已连接，等待 3 秒验证音频流...")
+                                await asyncio.sleep(3.0)
+
+                                ws_stats = self.ws_server.stats
+                                conn_count = ws_stats.get("connections_active", 0)
+                                frame_count = ws_stats.get("frames_received", 0)
+
+                                if conn_count > 0 and frame_count > 0:
+                                    # 从 WebSocket 队列抽样检查帧内容
+                                    silent_count = 0
+                                    total_checked = 0
+                                    for _ in range(min(20, queue.qsize())):
+                                        try:
+                                            frame = queue.get_nowait()
+                                            total_checked += 1
+                                            # 计算整帧 RMS：静音帧（ff ff ff = -1 in signed 16-bit）的 RMS≈1
+                                            if len(frame) >= 4:
+                                                import struct as _struct
+                                                samples = [
+                                                    s for (s,) in _struct.iter_unpack(
+                                                        '<h', frame
+                                                    )
+                                                ]
+                                                rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+                                                if rms < 10:  # RMS < 10 视为静音
+                                                    silent_count += 1
+                                        except Exception:
+                                            break
+
+                                    silent_ratio = silent_count / total_checked if total_checked > 0 else 1.0
+
+                                    if silent_ratio < 0.5:
+                                        # 超过 50% 帧有有效音频，使用 WebSocket 模式
+                                        sub_queue = asyncio.Queue(maxsize=500)
+                                        self._audio_subscribers.append(sub_queue)
+                                        asyncio.create_task(self._relay_ws_audio(queue))
+                                        self._audio_started = True
+                                        self._audio_mode = "websocket"
+                                        logger.info(
+                                            f"[{self._uuid}] WebSocket audio_fork 已连接且有音频流 "
+                                            f"(frames={frame_count}, silent_ratio={silent_ratio:.1%})"
+                                        )
+                                        return sub_queue
+                                    else:
+                                        # 超过 50% 帧为静音，降级到文件轮询
+                                        logger.warning(
+                                            f"[{self._uuid}] WebSocket 帧全部为静音 "
+                                            f"(silent_ratio={silent_ratio:.1%}, frames={frame_count})，降级到文件轮询"
+                                        )
+                                        break  # 跳出 WebSocket 等待循环，进入文件轮询
+                    logger.warning(f"[{self._uuid}] uuid_audio_fork 启动但 WebSocket 无有效音频流")
                 else:
                     logger.warning(f"[{self._uuid}] uuid_audio_fork 返回: {result_stripped[:200]}")
             except Exception as e:
@@ -1522,7 +1569,7 @@ class ESLSocketCallSession:
         # 为当前调用者创建独立的订阅队列
         sub_queue = asyncio.Queue(maxsize=500)
         self._audio_subscribers.append(sub_queue)
-        logger.info(f"[{self._uuid}] 音频订阅队列已创建 (总数: {len(self._audio_subscribers)})")
+        logger.info(f"[{self._uuid}] 音频订阅队列已创建 (总数: {len(self._audio_subscribers)}, 模式: {self._audio_mode})")
 
         asyncio.create_task(self._poll_audio_file(asr_path))
         return sub_queue
@@ -1530,10 +1577,14 @@ class ESLSocketCallSession:
     async def _poll_audio_file(self, path: str):
         """轮询音频文件，读取新增数据送入音频队列
 
-        每次读取的新数据按 320 bytes（20ms @ 8kHz mono 16bit）分帧广播，
-        避免一次性广播大块数据导致 ASR 处理异常。
+        ★ 关键修复：以实时速率（1x）发送音频帧，不超实时。
+        ASR 服务端（百炼/阿里云）期望音频以真实通话速率输入，
+        如果发送速度过快，VAD 和句子切分算法无法正确工作。
+
+        每次读取的新数据按 320 bytes（20ms @ 8kHz mono 16bit）分帧广播。
         """
         import os
+        import time
         import aiofiles
 
         # 等待文件创建（FreeSWITCH record_session 创建文件）
@@ -1553,6 +1604,8 @@ class ESLSocketCallSession:
             logger.info(f"[{self._uuid}] 检测到 WAV 文件，跳过 {header_offset} 字节头")
 
         frame_size = 320  # 20ms @ 8kHz mono 16bit
+        frame_interval = 0.020  # 20ms 每帧，实时速率
+        total_broadcast = 0
         while self._connected:
             try:
                 current_size = os.path.getsize(path)
@@ -1562,17 +1615,28 @@ class ESLSocketCallSession:
                         data = await f.read(current_size - offset)
                         if data:
                             offset += len(data)
-                            # 按 320 bytes 分帧广播
+                            total_broadcast += len(data)
+                            # 按 320 bytes 分帧，以实时速率广播
                             for i in range(0, len(data), frame_size):
                                 frame = data[i:i + frame_size]
                                 if len(frame) >= frame_size:
                                     await self._broadcast_audio(frame)
-                await asyncio.sleep(0.02)  # 20ms 轮询间隔
+                                    # ★ 实时速率控制：每帧间隔 20ms，不超实时
+                                    await asyncio.sleep(frame_interval)
+                                else:
+                                    # 不足一帧的剩余数据，延迟后发送
+                                    await asyncio.sleep(frame_interval)
+                                    await self._broadcast_audio(frame)
+                else:
+                    # 文件暂无新数据，等待下一次轮询
+                    await asyncio.sleep(0.02)
             except FileNotFoundError:
                 await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"[{self._uuid}] 音频文件读取失败: {e}")
                 await asyncio.sleep(0.1)
+
+        logger.info(f"[{self._uuid}] 文件轮询结束: 共广播 {total_broadcast} bytes, 清理 {len(self._audio_subscribers)} 个订阅者")
 
         # 清理订阅者
         logger.debug(f"[{self._uuid}] 文件轮询结束，清理 {len(self._audio_subscribers)} 个订阅者")

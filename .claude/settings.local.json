@@ -46,7 +46,17 @@
       "WebFetch(domain:www.cnblogs.com)",
       "Bash(1:*)",
       "Bash(docker port:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:developer.signalwire.com)",
+      "WebFetch(domain:freeswitch.org)",
+      "WebFetch(domain:zhuanlan.zhihu.com)",
+      "WebFetch(domain:gitee.com)",
+      "Bash(sox:*)",
+      "Bash(ffmpeg:*)",
+      "WebFetch(domain:www.google.com)",
+      "Bash(docker images:*)",
+      "Bash(do lsof:*)"
     ]
   }
 }

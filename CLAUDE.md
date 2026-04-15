@@ -51,11 +51,26 @@
 - **注意**：`proxy-media` 是 channel variable，不是 profile 级参数
 - **日期**：2026-04-15
 
-### 6. ❌ mod_audio_fork 在 sofia A-leg 上推送静音（proxy_media 问题）
+### 6. ❌ mod_audio_fork 在 sofia A-leg 上推送静音（proxy_media 无法解决）
 - **命令**：`uuid_audio_fork {sofia_a_leg_uuid} start ws://backend:8765/{call_uuid} mono 8000`
-- **问题**：WebSocket 收到完整帧（3700+ 帧），但全是 `ff ff ff` 静音字节
-- **原因**：sofia A-leg RTP 旁路（P2P），即使 `proxy_media=true` 在 originate 中设置，mod_audio_fork 的 media bug 仍可能捕获不到有效 RTP
-- **降级方案**：文件轮询 — 读取 `record_session` 的 WAV 文件，跳过 44 字节 WAV 头，320 字节分帧送入 ASR
+- **问题**：WebSocket 收到完整帧（3700+ 帧），但全是 `ff ff ff` 静音字节（max_rms=2）
+- **原因**：sofia A-leg RTP 旁路（P2P），即使 `proxy_media=true` 在 originate 和 dialplan 中都确认设置成功（`uuid_dump` 显示 `variable_proxy_media: true`），mod_audio_fork 的 media bug 仍捕获不到有效 RTP
+- **验证日期**：2026-04-15（多次测试，包括在 internal.xml Local_Extension 中添加 proxy_media=true 后仍然失败）
+- **结论**：`proxy_media=true` 能确保 RTP 经过 FreeSWITCH 软件层（bridge 正常），但 mod_audio_fork 的 media bug 在 sofia leg 上就是捕获不到音频帧 — 这是 mod_audio_fork 的限制
+- **降级方案**：文件轮询 — 读取 `record_session` 的 WAV 文件，跳过 44 字节 WAV 头，320 字节分帧送入 ASR（已验证有效）
+
+### 7. ✅ Docker RTP 端口映射限制 — 已修复
+- **配置**：`docker-compose.yml` 中 `"16384-32768:16384-32768/udp"`（16385 个端口）
+- **问题**：Docker Desktop (Mac) 实际只映射了约 1000 个 UDP 端口（16384-17384），超出范围的端口无法到达容器
+- **现象**：FreeSWITCH 随机选择到 17385+ 的 RTP 端口时（如 19164），Zoiper 的 RTP 无法到达 FreeSWITCH
+- **修复**：
+  1. `vars.xml` 中 `rtp_start_port=16384` + `rtp_end_port=17384`
+  2. `docker-compose.yml` 中端口映射改为 `"16384-17384:16384-17384/udp"`
+- **日期**：2026-04-15
+
+### 8. ❌ drachtio/drachtio-freeswitch-mrf 镜像不适用
+- **原因**：容器启动时 entrypoint 的 sed 命令在只读挂载卷上失败（`Device or resource busy`）
+- **现象**：容器退出码 137
 - **日期**：2026-04-15
 
 ## 当前外呼策略（已验证有效）
@@ -71,8 +86,8 @@
   6. socket 连接后端 ESL Outbound → CallAgent.run()
   7. CallAgent._discover_aleg_uuid() → start_audio_capture()
   8. mod_audio_fork 尝试在 sofia A-leg 上推送（当前返回静音，但 WebSocket 连接成功）
-  9. start_audio_capture 检测到 WebSocket 无有效音频后，**降级到文件轮询**
-  10. `_poll_audio_file()` 读取 B-leg record_session WAV，320 字节分帧送入 ASR
+  9. start_audio_capture 检测 WebSocket 帧内容：抽样 20 帧，超过 50% 静音 → **降级到文件轮询**
+  10. `_poll_audio_file()` 以实时速率（20ms/帧）读取 B-leg record_session WAV，320 字节分帧送入 ASR
   11. ASR WebSocket 推送识别结果 → CallAgent 处理
   12. CallAgent._say_opening() → _say() → TTS 生成 → `uuid_displace` 写入 sofia A-leg
   13. 后续 TTS 同样通过 `uuid_displace` + `execute playback` 播放到通道
@@ -101,12 +116,13 @@
 - `{var=val}` — FreeSWITCH 变量，紧跟端点不能有空格
 - `[var=val]` — channel 变量，允许端点前有空格
 
-### ✅ `proxy_media=true` 必须在 originate 命令中设置
-- **问题**：sofia A-leg 的 RTP 默认旁路（P2P），音频流捕获不到用户语音
-- **表现**：WebSocket 连接成功但只收到 1 帧静音（320 bytes, max_rms=0）
-- **修复**：`originate [{vars},proxy_media=true] user/1002@domain &bridge(loopback/AI_CALL)`
-- **验证**：`max_rms=12679 total_chunks=160 speech_detected=True`
-- **注意**：mod_audio_fork 的 media bug 在当前 FreeSWITCH 版本中可能仍不生效，需依赖文件轮询
+### ⚠️ `proxy_media=true` 能解决 bridge 的 RTP 旁路，但不能解决 mod_audio_fork 的静音问题
+- **问题**：sofia A-leg 的 RTP 默认旁路（P2P），导致 bridge 后 RTP 不经过 FreeSWITCH 软件层
+- **表现**：bridge 正常工作，但 `uuid_audio_fork` 只收到静音（max_rms=2）
+- **设置**：`originate [{vars},proxy_media=true] user/1002@domain &bridge(loopback/AI_CALL)` + dialplan 中 `proxy_media=true`
+- **验证**：`uuid_dump` 确认 `variable_proxy_media: true`，bridge 正常，TTS 正常播放
+- **但**：mod_audio_fork media bug 仍然捕获不到音频 — 这是 mod_audio_fork 在当前 FreeSWITCH 版本中的限制
+- **结论**：`proxy_media=true` 仍然需要设置（确保 bridge 正常），但不能依赖它解决 audio_fork 静音
 - **日期**：2026-04-15
 
 ### ✅ `uuid_displace` 必须写到 sofia A-leg UUID
@@ -125,6 +141,29 @@
 - **场景**：百炼 ASR 返回 0 条 `is_final=True` 结果但产生多条中间结果
 - **修复**：`_listen_user` 中累积 `last_intermediate_text`，检测到人声且中间结果非空时兜底使用
 - **日期**：2026-04-15
+
+### ✅ 百炼 ASR 8k→16k 上采样
+- **问题**：百炼 ASR 要求 16kHz 输入，系统音频为 8kHz PCMU，直接发送导致 `NO_VALID_AUDIO_ERROR`
+- **修复**：`BailianASRClient._send_audio()` 中使用线性插值将 8kHz PCM 上采样到 16kHz 再发送
+- **结果**：ASR 能正常识别语音，中间结果正常返回（`"不知道"` → `"不需要。"` → `"没有"`）
+- **注意**：`is_final` 仍不返回 true，依赖兜底策略使用最后一条中间结果
+- **代码位置**：`backend/services/asr_service.py` — `BailianASRClient._upsample_8k_to_16k()`, `_send_audio()`
+
+### ✅ 文件轮询实时速率控制
+- **问题**：文件轮询以全速读取并广播音频帧，ASR 服务端期望实时速率输入
+- **修复**：`_poll_audio_file()` 中每帧（320 bytes）间隔 20ms 发送，模拟实时速率
+- **日期**：2026-04-15
+
+### ✅ VAD 阈值调整
+- **原值**：`energy_threshold=250`
+- **新值**：`energy_threshold=120`
+- **原因**：文件轮询的音频能量较低（max_rms≈134），原阈值过高导致语音漏检
+- **代码位置**：`backend/core/call_agent.py` — `AudioStreamAdapter.__init__()`
+
+### ✅ TTS WAV 文件采样率
+- **问题**：TTS WAV 文件以 16000Hz 写入，但实际音频为 8000Hz，导致播放速度 2 倍
+- **修复**：`write_wav()` 使用 `sample_rate=8000`
+- **注意**：Bailian CosyVoice TTS 使用 `AudioFormat.WAV_8000HZ_MONO_16BIT` 格式
 
 ## 项目结构
 - `backend/` - Python FastAPI 后端
