@@ -21,5 +21,10 @@
     <!-- <param name="runas-groupname" value="freeswitch"/> -->
     <!-- 核心 dump（调试用） -->
     <param name="dump-cores" value="yes"/>
+    <!-- ★ RTP 端口范围：限制在 Docker 实际映射的范围内（16384-17384）
+         Docker Desktop 限制端口映射数量，16384-32768 只能映射约 1000 个端口
+         1001 个端口可支持约 500 个并发通话 -->
+    <param name="rtp-start-port" value="16384"/>
+    <param name="rtp-end-port" value="17384"/>
   </settings>
 </configuration>

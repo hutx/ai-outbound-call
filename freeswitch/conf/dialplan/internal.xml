@@ -58,6 +58,9 @@
         <action application="set" data="transfer_ringback=${us-ring}" />
         <action application="set" data="call_timeout=30" />
         <action application="set" data="hangup_after_bridge=true" />
+        <!-- ★ 确保 RTP 经过 FreeSWITCH 软件层，使 mod_audio_fork 能捕获用户语音 -->
+        <action application="set" data="proxy_media=true" />
+        <action application="set" data="bypass_media=false" />
         <!-- ★ AI 外呼音频采集：bridge 之前启动 record_session，录制用户语音 -->
         <action application="set" data="RECORD_STEREO=false" />
         <action application="set" data="media_bug_answer_req=true" />
