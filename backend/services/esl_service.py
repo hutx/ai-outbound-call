@@ -889,6 +889,8 @@ class ESLSocketCallSession:
         self._audio_started: bool = False  # 防止重复启动 uuid_audio_fork
         self._active_uuid: Optional[str] = None  # CHANNEL_ANSWER 中捕获的实际通话 UUID
         self._aleg_uuid: Optional[str] = None  # sofia A-leg UUID (bridge_partner)
+        self._audio_relay_task: Optional[asyncio.Task] = None
+        self._audio_poll_task: Optional[asyncio.Task] = None
 
     @property
     def uuid(self) -> Optional[str]:
@@ -1227,11 +1229,12 @@ class ESLSocketCallSession:
             if not hasattr(self, '_play_count'):
                 self._play_count = 0
             if self._play_count == 0:
-                logger.info(f"[{self._uuid}] 首次播放，等待 socket 接管媒体路径（1秒）...")
-                await asyncio.sleep(1)
+                warmup_delay = 0.35
+                logger.info(f"[{self._uuid}] 首次播放，等待 socket 接管媒体路径（{warmup_delay:.2f}秒）...")
             else:
-                logger.info(f"[{self._uuid}] 等待 socket 接管媒体路径（1秒）...")
-                await asyncio.sleep(1)
+                warmup_delay = 0.12
+                logger.info(f"[{self._uuid}] 等待 socket 接管媒体路径（{warmup_delay:.2f}秒）...")
+            await asyncio.sleep(warmup_delay)
             self._play_count += 1
 
         if self.esl_pool and target_uuid and target_uuid != self._uuid:
@@ -1241,7 +1244,7 @@ class ESLSocketCallSession:
                     f"uuid_displace {target_uuid} start {audio_path} write"
                 )
                 logger.info(f"[{self._uuid}] uuid_displace({target_uuid[:8]}, write) 结果: {result.strip()[:100]}")
-                await asyncio.sleep(estimated_duration + 0.5)
+                await asyncio.sleep(max(estimated_duration + 0.15, 0.2))
                 # 停止 displace
                 try:
                     await self.esl_pool.api(f"uuid_displace {target_uuid} stop")
@@ -1368,6 +1371,29 @@ class ESLSocketCallSession:
             logger.warning("无法启动音频捕获: UUID 为空")
             self._audio_mode = "none"
             return asyncio.Queue()
+
+        # 音频源已就绪时直接复用，避免每次 TTS/barge-in/主监听都重复挂 media bug 或轮询文件。
+        if self._audio_started:
+            active_task = None
+            if self._audio_mode == "websocket":
+                active_task = self._audio_relay_task
+            elif self._audio_mode == "file_poll":
+                active_task = self._audio_poll_task
+
+            if active_task is not None and not active_task.done():
+                sub_queue = asyncio.Queue(maxsize=500)
+                self._audio_subscribers.append(sub_queue)
+                logger.info(
+                    f"[{self._uuid}] 复用已启动的音频采集 "
+                    f"(模式: {self._audio_mode}, 订阅者: {len(self._audio_subscribers)})"
+                )
+                return sub_queue
+
+            logger.warning(
+                f"[{self._uuid}] 音频采集标记为已启动，但后台任务不存在/已结束，重新初始化 "
+                f"(模式: {self._audio_mode})"
+            )
+            self._audio_started = False
 
         asr_path = None
 
@@ -1517,7 +1543,10 @@ class ESLSocketCallSession:
                                         # 超过 50% 帧有有效音频，使用 WebSocket 模式
                                         sub_queue = asyncio.Queue(maxsize=500)
                                         self._audio_subscribers.append(sub_queue)
-                                        asyncio.create_task(self._relay_ws_audio(queue))
+                                        if self._audio_relay_task is None or self._audio_relay_task.done():
+                                            self._audio_relay_task = asyncio.create_task(
+                                                self._relay_ws_audio(queue)
+                                            )
                                         self._audio_started = True
                                         self._audio_mode = "websocket"
                                         logger.info(
@@ -1564,7 +1593,8 @@ class ESLSocketCallSession:
         self._audio_subscribers.append(sub_queue)
         logger.info(f"[{self._uuid}] 音频订阅队列已创建 (总数: {len(self._audio_subscribers)}, 模式: {self._audio_mode})")
 
-        asyncio.create_task(self._poll_audio_file(asr_path))
+        if self._audio_poll_task is None or self._audio_poll_task.done():
+            self._audio_poll_task = asyncio.create_task(self._poll_audio_file(asr_path))
         return sub_queue
 
     async def _poll_audio_file(self, path: str):

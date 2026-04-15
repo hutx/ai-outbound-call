@@ -484,6 +484,26 @@ class TestESLService:
         await ESLSocketCallSession._safe_put(queue, "c")
         assert queue.qsize() == 2
 
+    @pytest.mark.asyncio
+    async def test_start_audio_capture_reuses_existing_file_poll(self):
+        from backend.services.esl_service import ESLSocketCallSession
+
+        session = ESLSocketCallSession(self.FakeReader(b""), self.FakeWriter())
+        session._uuid = "uuid_reuse_001"
+        session._audio_started = True
+        session._audio_mode = "file_poll"
+        session._audio_poll_task = asyncio.create_task(asyncio.sleep(60))
+
+        try:
+            queue = await session.start_audio_capture()
+            assert queue in session._audio_subscribers
+            assert session._audio_poll_task is not None
+            assert session._audio_poll_task.done() is False
+            assert len(session._audio_subscribers) == 1
+        finally:
+            session._audio_poll_task.cancel()
+            await asyncio.gather(session._audio_poll_task, return_exceptions=True)
+
 
 class TestAudioUtils:
     def test_write_and_read_wav(self, tmp_path):
@@ -608,7 +628,7 @@ class TestCallAgent:
         assert MAX_CALL_DURATION == 300
         assert LLM_TIMEOUT == 30.0
         assert TTS_TIMEOUT == 10.0
-        assert ASR_TIMEOUT == 12.0
+        assert ASR_TIMEOUT == 15.0
 
     @pytest.mark.asyncio
     async def test_barge_in_fires_on_audio(self):

@@ -201,7 +201,7 @@ services:
       BAILIAN_ASR_MODEL:     ${BAILIAN_ASR_MODEL:-paraformer-realtime-v1}
       # 通用 ASR
       ASR_SAMPLE_RATE:       ${ASR_SAMPLE_RATE:-8000}
-      VAD_SILENCE_MS:        ${VAD_SILENCE_MS:-500}
+      VAD_SILENCE_MS:        ${VAD_SILENCE_MS:-400}
       # ── TTS ──────────────────────────────────────────────────
       TTS_PROVIDER:          ${TTS_PROVIDER:-bailian}
       TTS_OUTPUT_DIR:        /tmp/tts_cache
