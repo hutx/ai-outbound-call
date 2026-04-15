@@ -126,9 +126,6 @@
     <!-- <load module="mod_java"/> -->
     <load module="mod_lua"/>
 
-    <!-- Audio Streaming (AI Voice) -->
-    <load module="mod_audio_stream"/>
-
     <!-- ASR /TTS -->
     <!-- <load module="mod_flite"/> -->
     <!-- <load module="mod_pocketsphinx"/> -->
@@ -139,12 +136,13 @@
     <!-- Say -->
     <load module="mod_say_en"/>
     <!-- <load module="mod_say_ru"/> -->
-    <!-- <load module="mod_say_zh"/> -->
+    <load module="mod_say_zh"/>
     <!-- <load module="mod_say_sv"/> -->
 
     <!-- Third party modules -->
     <!--<load module="mod_nibblebill"/>-->
     <!--<load module="mod_callcenter"/>-->
 
+    <load module="mod_audio_fork"/>
   </modules>
 </configuration>

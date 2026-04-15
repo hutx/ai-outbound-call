@@ -1,8 +1,9 @@
 """
-mod_audio_stream WebSocket 接收服务
+mod_audio_fork WebSocket 接收服务
 ───────────────────────────────────────
-FreeSWITCH 通过 mod_audio_stream 将实时音频流推送到此 WebSocket Server。
-每路通话一个 WebSocket 连接，首帧携带 Channel UUID，后续为 PCM 音频帧。
+FreeSWITCH 通过 mod_audio_fork 将实时音频流推送到此 WebSocket Server。
+mod_audio_fork 作为 WebSocket 客户端主动连接后端，直接发送二进制音频帧。
+如果 ESL 命令中传入了 metadata 参数，FreeSWITCH 会先发送一个 JSON 文本帧。
 
 设计目标：
   - 低延迟：20ms 帧大小，直接入队
@@ -19,13 +20,13 @@ logger = logging.getLogger(__name__)
 
 class AudioStreamWebSocket:
     """
-    接收 mod_audio_stream 推送的音频帧
+    接收 mod_audio_fork 推送的音频帧
 
     工作流程：
-      1. FreeSWITCH 拨号计划执行 audio_stream 指令
-      2. mod_audio_stream 连接此 WebSocket 服务器
-      3. 首帧消息为 Channel UUID（纯文本或 JSON）
-      4. 后续每 20ms 推送一帧 PCM（8000Hz 16bit mono）
+      1. FreeSWITCH 拨号计划执行 audio_fork 指令，或 ESL 执行 uuid_audio_fork API
+      2. mod_audio_fork 连接此 WebSocket 服务器
+      3. 如果传入了 metadata 参数，首帧为 JSON 元数据帧（含 uuid/channel_uuid）
+      4. 后续每 20ms 推送一帧 PCM（8000Hz 16bit mono，L16 线性编码）
       5. PCM 帧直接送入对应通话的 audio_queue
 
     与 ESLSocketCallSession 的集成：
@@ -114,19 +115,19 @@ class AudioStreamWebSocket:
         if call_uuid in self._sessions:
             return self._sessions[call_uuid]
 
-        # 等待 mod_audio_stream 连接建立
-        logger.debug(f"[{call_uuid}] 等待 audio_stream WebSocket 连接...")
+        # 等待 mod_audio_fork 连接建立
+        logger.debug(f"[{call_uuid}] 等待 audio_fork WebSocket 连接...")
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             if call_uuid in self._sessions:
-                logger.info(f"[{call_uuid}] audio_stream WebSocket 连接已就绪")
+                logger.info(f"[{call_uuid}] audio_fork WebSocket 连接已就绪")
                 return self._sessions[call_uuid]
             if self._global_queue is not None:
-                logger.info(f"[{call_uuid}] audio_stream 全局队列已就绪")
+                logger.info(f"[{call_uuid}] audio_fork 全局队列已就绪")
                 return self._global_queue
             await asyncio.sleep(0.1)
 
-        logger.warning(f"[{call_uuid}] audio_stream WebSocket 连接超时 ({timeout}s)")
+        logger.warning(f"[{call_uuid}] audio_fork WebSocket 连接超时 ({timeout}s)")
         return None
 
     def register_session(self, call_uuid: str, queue: asyncio.Queue):
@@ -134,7 +135,7 @@ class AudioStreamWebSocket:
         self._sessions[call_uuid] = queue
         self._global_queue = queue
         self._global_uuid = call_uuid
-        logger.info(f"[{call_uuid}] audio_stream 会话已预注册（全局队列）")
+        logger.info(f"[{call_uuid}] audio_fork 会话已预注册（全局队列）")
 
     async def _handle_connection_simple(self, websocket):
         """极简处理器：从 URL 路径提取 UUID，注册到 _sessions"""
@@ -188,7 +189,24 @@ class AudioStreamWebSocket:
         try:
             async for frame in websocket:
                 if isinstance(frame, str):
-                    logger.debug(f"[ws#{ws_id}] 文本帧: {frame[:200]}")
+                    # mod_audio_fork 可选发送 JSON metadata 帧（如果 ESL 命令中传入了 metadata 参数）
+                    # 否则直接发送二进制音频帧，没有首帧
+                    try:
+                        data = json.loads(frame)
+                        call_uuid = data.get("uuid", data.get("channel_uuid", data.get("callId", "")))
+                        if call_uuid and call_uuid not in self._sessions:
+                            self._sessions[call_uuid] = queue
+                            self._ws_to_uuid[ws_id] = call_uuid
+                            self._global_uuid = call_uuid
+                        logger.info(f"[ws#{ws_id}] mod_audio_fork metadata: {list(data.keys())}")
+                    except json.JSONDecodeError:
+                        # 可能是纯文本 UUID（兼容旧格式）
+                        extracted = self._extract_uuid(frame)
+                        if extracted:
+                            call_uuid = extracted
+                            self._sessions[call_uuid] = queue
+                            self._ws_to_uuid[ws_id] = call_uuid
+                            self._global_uuid = call_uuid
                     continue
 
                 frame_count += 1
@@ -295,7 +313,7 @@ class AudioStreamWebSocket:
         """
         从首帧消息中提取 Channel UUID
 
-        mod_audio_stream 不同 fork 的首帧格式不同：
+        mod_audio_fork 不同 fork 的首帧格式不同：
           1. 纯文本 UUID：直接返回
           2. JSON 格式：解析 JSON 中的 channel_uuid / uuid / call_id 字段
           3. 其他：尝试匹配 UUID 格式字符串

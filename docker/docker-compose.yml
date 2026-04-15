@@ -68,7 +68,7 @@ services:
     # ★ 推荐镜像：drachtio/freeswitch-modules（含常用模块，开箱即用）
     #   备选：signalwire/freeswitch:1.10.10（官方，更新，但部分模块需手动安装）
     #
-    image: freeswitch-ai:latest  
+    image: srt2011/freeswitch-mod-audio-fork:latest  
     # image: safarov/freeswitch:latest
     # image: rocketchat/freeswitch:latest
     # image: ghcr.io/patrickbaus/freeswitch-docker:master
@@ -86,35 +86,31 @@ services:
       - "5060:5060/udp"
       - "5080:5080"
       - "5080:5080/udp"
-      - "16384-16484:16384-16484/udp"
-      - "16485-16585:16485-16585/udp"
-      - "16586-16686:16586-16686/udp"
-      - "16687-16787:16687-16787/udp"
-      - "16788-16888:16788-16888/udp"
-      - "16889-17384:16889-17384/udp"
+      - "16384-32768:16384-32768/udp"
     volumes:
       # ★ 只挂载 autoload_configs 和 dialplan，其余用镜像内置默认值
-      #   挂载整个 /etc/freeswitch 会覆盖镜像内的 ivr/sounds 等必要文件
-      - ../freeswitch/conf/vars.xml:/etc/freeswitch/vars.xml:ro
-      - ../freeswitch/conf/autoload_configs/modules.conf.xml:/etc/freeswitch/autoload_configs/modules.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/event_socket.conf.xml:/etc/freeswitch/autoload_configs/event_socket.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/sofia.conf.xml:/etc/freeswitch/autoload_configs/sofia.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/acl.conf.xml:/etc/freeswitch/autoload_configs/acl.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/cdr_csv.conf.xml:/etc/freeswitch/autoload_configs/cdr_csv.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/logfile.conf.xml:/etc/freeswitch/autoload_configs/logfile.conf.xml:ro
-      - ../freeswitch/conf/autoload_configs/local_stream.conf.xml:/etc/freeswitch/autoload_configs/local_stream.conf.xml:ro
-      - ../freeswitch/conf/sip_profiles:/etc/freeswitch/sip_profiles:ro
-      - ../freeswitch/conf/dialplan/outbound.xml:/etc/freeswitch/dialplan/outbound.xml:ro
-      - ../freeswitch/conf/dialplan/internal.xml:/etc/freeswitch/dialplan/internal.xml:ro
-      - ../freeswitch/conf/dialplan/default.xml:/etc/freeswitch/dialplan/default.xml:ro
-      - ../freeswitch/conf/directory/default.xml:/etc/freeswitch/directory/default.xml:ro
+      #   挂载整个 /usr/local/freeswitch/conf 会覆盖镜像内的 ivr/sounds 等必要文件
+      - ../freeswitch/conf/vars.xml:/usr/local/freeswitch/conf/vars.xml:ro
+      - ../freeswitch/conf/autoload_configs/modules.conf.xml:/usr/local/freeswitch/conf/autoload_configs/modules.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/event_socket.conf.xml:/usr/local/freeswitch/conf/autoload_configs/event_socket.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/sofia.conf.xml:/usr/local/freeswitch/conf/autoload_configs/sofia.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/acl.conf.xml:/usr/local/freeswitch/conf/autoload_configs/acl.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/cdr_csv.conf.xml:/usr/local/freeswitch/conf/autoload_configs/cdr_csv.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/logfile.conf.xml:/usr/local/freeswitch/conf/autoload_configs/logfile.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/audio_fork.conf.xml:/usr/local/freeswitch/conf/autoload_configs/audio_fork.conf.xml:ro
+      - ../freeswitch/conf/autoload_configs/local_stream.conf.xml:/usr/local/freeswitch/conf/autoload_configs/local_stream.conf.xml:ro
+      - ../freeswitch/conf/sip_profiles:/usr/local/freeswitch/conf/sip_profiles:ro
+      - ../freeswitch/conf/dialplan/outbound.xml:/usr/local/freeswitch/conf/dialplan/outbound.xml:ro
+      - ../freeswitch/conf/dialplan/internal.xml:/usr/local/freeswitch/conf/dialplan/internal.xml:ro
+      - ../freeswitch/conf/dialplan/default.xml:/usr/local/freeswitch/conf/dialplan/default.xml:ro
+      - ../freeswitch/conf/directory/default.xml:/usr/local/freeswitch/conf/directory/default.xml:ro
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
       # - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
       - ./recordings:/recordings
       - /Users/hutx/work/freeswitch/sounds:/usr/share/freeswitch/sounds  # 使用镜像内置声音文件
-      # 日志
-      - ./logs/freeswitch:/var/log/freeswitch
+      # 日志（镜像日志路径为 /usr/local/freeswitch/log/）
+      - ./logs/freeswitch:/usr/local/freeswitch/log
       - /usr/share/alsa:/usr/share/alsa:ro
       # 时区文件
       - /etc/localtime:/etc/localtime:ro
