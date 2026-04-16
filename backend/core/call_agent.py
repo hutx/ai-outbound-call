@@ -39,8 +39,8 @@ LLM_TIMEOUT = 30.0
 # TTS 超时（秒）
 TTS_TIMEOUT = 10.0
 # ASR 单句最长等待（秒）
-# 15s 足够覆盖正常一句话，同时避免识别链路长时间挂起。
-ASR_TIMEOUT = 15.0
+# 8s 可覆盖正常一句话，同时避免识别链路长时间挂起。
+ASR_TIMEOUT = 8.0
 
 
 class AudioStreamAdapter:
@@ -302,7 +302,9 @@ class CallAgent:
             if cv.get("script_id"):
                 self.ctx.script_id = cv["script_id"]
             dest = channel_data.get("Caller-Destination-Number", "")
-            if dest and dest != "unknown":
+            # Caller-Destination-Number 在内部分机场景下是 "AI_CALL"（loopback 端点名），
+            # 只有纯数字的有效号码才覆盖
+            if dest and dest != "unknown" and dest.isdigit():
                 self.ctx.phone_number = dest
 
             # 3. 查询客户信息（CRM）
@@ -397,7 +399,7 @@ class CallAgent:
         self.sm.transition(CallState.AI_SPEAKING)
         opening = await get_opening_for_call(self.ctx.script_id, self.ctx.customer_info)
         text = opening["reply"]
-        self.ctx.messages.append({"role": "assistant", "content": text})
+        self.ctx.messages.append({"role": "assistant", "content": text, "timestamp": int(time.time() * 1000)})
         self.ctx.ai_utterances += 1
         await self._say(text, record=False, speech_type="opening")
 
@@ -497,7 +499,7 @@ class CallAgent:
 
         if final_text:
             self.ctx.user_utterances += 1
-            self.ctx.messages.append({"role": "user", "content": final_text})
+            self.ctx.messages.append({"role": "user", "content": final_text, "timestamp": int(time.time() * 1000)})
 
         return final_text
 
@@ -611,7 +613,7 @@ class CallAgent:
         reply_text, action = await self.sm.process_llm_response(response)
 
         if reply_text:
-            self.ctx.messages.append({"role": "assistant", "content": reply_text})
+            self.ctx.messages.append({"role": "assistant", "content": reply_text, "timestamp": int(time.time() * 1000)})
             self.ctx.ai_utterances += 1
             logger.info(f"[{self.ctx.uuid}] 🤖 {reply_text[:80]} [action={action}]")
 
@@ -677,7 +679,7 @@ class CallAgent:
             )
             logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动（后台音频采集中）")
 
-            # TTS 播放：等完整合成后写临时 WAV 文件，通过 uuid_displace 播放
+            # TTS 播放：边合成边播（FIFO 流式）
             await self.session.play_stream(
                 audio_chunks,
                 timeout=60.0,
@@ -768,6 +770,11 @@ class CallAgent:
             or f"{config.freeswitch.recording_path}/{self.ctx.task_id}/{self.ctx.uuid}.wav"
         )
 
+        # sofia A-leg 录音（用户侧语音）
+        aleg_uuid = self.session.channel_vars.get("other_loopback_from_uuid", "")
+        if aleg_uuid and aleg_uuid not in ("-ERR", "_undef_"):
+            self.ctx.aleg_recording_path = f"{config.freeswitch.recording_path}/{aleg_uuid}.wav"
+
         # 捕获挂断原因和 SIP 状态码
         cv = self.session.channel_vars
         if cv.get("sip_hangup_cause"):
@@ -792,9 +799,9 @@ class CallAgent:
             f"sip={self.ctx.sip_code} cause={self.ctx.hangup_cause}"
         )
 
-        # 写 CDR
+        # 写 CDR（异步后台任务，不阻塞挂断流程）
         try:
-            await save_call_record(self.ctx)
+            asyncio.create_task(save_call_record(self.ctx))
         except Exception as e:
             logger.error(f"[{self.ctx.uuid}] CDR 写入失败: {e}")
 

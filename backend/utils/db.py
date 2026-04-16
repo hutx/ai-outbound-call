@@ -117,6 +117,7 @@ class CallRecord(Base):
     user_utterances:  Mapped[int]            = mapped_column(Integer, default=0)
     ai_utterances:    Mapped[int]            = mapped_column(Integer, default=0)
     recording_path:   Mapped[Optional[str]]  = mapped_column(String(512), nullable=True)
+    aleg_recording_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
     # 对话历史（保留最近 30 条消息）
     messages:         Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
@@ -215,6 +216,7 @@ def _build_call_record_values(ctx) -> dict:
         "user_utterances": ctx.user_utterances,
         "ai_utterances": ctx.ai_utterances,
         "recording_path": ctx.recording_path,
+        "aleg_recording_path": ctx.aleg_recording_path,
         "messages": ctx.messages[-30:] if ctx.messages else [],
         "customer_info": ctx.customer_info or {},
         "sip_code": ctx.sip_code,
@@ -339,6 +341,7 @@ def _record_to_dict(r: CallRecord) -> dict:
         "user_utterances":  r.user_utterances,
         "ai_utterances":    r.ai_utterances,
         "recording_path":   r.recording_path,
+        "aleg_recording_path": r.aleg_recording_path,
     }
 
 

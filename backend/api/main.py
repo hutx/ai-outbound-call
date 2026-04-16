@@ -99,7 +99,16 @@ async def _handle_call_session(session: ESLSocketCallSession):
     )
     task_id = session.channel_vars.get("task_id", "unknown")
     script_id = session.channel_vars.get("script_id", "finance_product_a")
-    phone_number = session.channel_vars.get("caller_id_number", "unknown")
+    # 调试：打印所有 channel_vars 的 key
+    logger.debug(f"[{call_uuid}] channel_vars keys: {sorted(session.channel_vars.keys())}")
+    phone_number = (
+        session.channel_vars.get("callee_number", "")
+        or session.channel_vars.get("export_callee_number", "")
+        or session.channel_vars.get("origination_caller_id_number", "")
+        or session.channel_vars.get("caller_id_number", "")
+        or "unknown"
+    )
+    logger.info(f"[{call_uuid}] phone_number={phone_number}, task_id={task_id}")
 
     ctx = CallContext(
         uuid=call_uuid,

@@ -120,6 +120,7 @@ class AsyncESLConnection:
         simple_vars = (
             f"origination_uuid={call_uuid},"
             f"export_origination_uuid={call_uuid},"
+            f"export_callee_number={phone},"
             f"ai_agent=true,"
             f"task_id={task_id},"
             f"script_id={script_id},"
@@ -135,30 +136,12 @@ class AsyncESLConnection:
             internal_domain=internal_domain,
         )
 
-        if endpoint_type == "internal_extension":
-            # 内部分机：拨打用户，接通后桥接到 AI 拨号计划扩展
-            # audio_fork 通过 uuid_audio_fork API 在 B-leg socket 连接后启动
-            # proxy_media=true + bypass_media=false 确保 RTP 经过 FreeSWITCH 软件层
-            cmd = (
-                f"originate {{{simple_vars}}}{endpoint} "
-                f"&bridge(loopback/AI_CALL)"
-            )
-        else:
-            # PSTN 外呼：通过运营商网关导出，接通后 uuid_transfer 到 AI_Handler
-            # 与内部分机统一：先建立通道，再 uuid_transfer 到 AI_Handler
-            pstn_vars = (
-                f"origination_uuid={call_uuid},"
-                f"ai_agent=true,"
-                f"export_ai_agent=true,"
-                f"export_origination_uuid={call_uuid},"
-                f"task_id={task_id},"
-                f"script_id={script_id},"
-                f"origination_caller_id_number={caller_id},"
-                f"originate_timeout={originate_timeout}"
-            )
-            cmd = (
-                f"originate {{{pstn_vars}}}{endpoint} &park()"
-            )
+        # 内部分机 / PSTN 外呼统一流程：桥接到 loopback/AI_CALL
+        # proxy_media=true + bypass_media=false 确保 RTP 经过 FreeSWITCH 软件层
+        cmd = (
+            f"originate {{{simple_vars}}}{endpoint} "
+            f"&bridge(loopback/AI_CALL)"
+        )
         logger.debug(f"ESL 发送 originate 命令: {cmd[:200]}")
         logger.info(
             f"ESL originate → {phone} "
@@ -700,9 +683,8 @@ class AsyncESLPool:
     async def _wait_and_start_ai_from_queue(self, call_uuid: str, queue: asyncio.Queue, kwargs: dict):
         """从已注册的 queue 等待 CHANNEL_ANSWER。
 
-        对于内部分机：originate 使用 &bridge(loopback/AI_CALL)，
-        拨号计划会处理 socket，无需额外操作。
-        对于 PSTN 外呼：&park() 后等待后续处理。
+        内部分机和 PSTN 外呼统一使用 bridge(loopback/AI_CALL)，
+        拨号计划 ai_call_handler 处理 socket，无需额外操作。
         """
         try:
             result = await asyncio.wait_for(queue.get(), timeout=60.0)
@@ -735,10 +717,9 @@ class AsyncESLPool:
             # socket(async full) 已建立，CallAgent 由 ESL socket 自动启动
             logger.info(f"[{call_uuid[:8]}] 内部分机已接通，socket 连接由 dialplan ai_call_handler 处理")
         else:
-            # PSTN 外呼：B-leg (sofia/gateway) 已匹配 ai_outbound_bleg dialplan
-            # dialplan 已执行 answer → record_session → socket(async full)
-            # CallAgent 由 B-leg 的 ESL socket 自动启动，A-leg 停留在 park
-            logger.info(f"[{call_uuid[:8]}] PSTN 外呼已接通，socket 连接由 B-leg dialplan ai_outbound_bleg 处理")
+            # PSTN 外呼：统一使用 bridge(loopback/AI_CALL)，已匹配 ai_call_handler dialplan
+            # socket(async full) 已建立，CallAgent 由 ESL socket 自动启动
+            logger.info(f"[{call_uuid[:8]}] PSTN 外呼已接通，socket 连接由 dialplan ai_call_handler 处理")
 
     async def _transfer_to_ai_handler(self, call_uuid: str):
         """执行 uuid_transfer 将通道转到 AI_Handler (9998 XML internal)。

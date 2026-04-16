@@ -72,6 +72,8 @@
       <condition field="destination_number" expression="^AI_CALL$">
         <action application="answer"/>
         <action application="sleep" data="500"/>
+        <!-- 从 originate export 变量中读取被叫号码（PSTN 场景下传递） -->
+        <action application="set" data="callee_number=${export_callee_number}"/>
         <!-- 确保 RTP 经过 FreeSWITCH 软件层，防止 P2P 旁路导致音频捕获失败 -->
         <action application="set" data="proxy_media=true"/>
         <action application="set" data="bypass_media=false"/>

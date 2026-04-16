@@ -145,8 +145,8 @@ class TTSConfig:
     cosyvoice_url: str = "http://127.0.0.1:50000"
     # 发音人
     voice: str = "longxiaochun_v3"
-    # 语速 (0.5 ~ 2.0)
-    speech_rate: float = 1.0
+    # 语速 (0.5 ~ 2.0)，提高至 1.2 以缩短 TTS 播报耗时
+    speech_rate: float = 1.2
     # 音频格式
     audio_format: str = "wav"
     # 合成音频临时目录

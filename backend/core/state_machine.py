@@ -78,6 +78,7 @@ class CallContext:
 
     # 录音文件路径
     recording_path: Optional[str] = None
+    aleg_recording_path: Optional[str] = None  # sofia A-leg 录音（用户侧语音）
 
     # 不满意/拒绝计数（连续拒绝超过阈值则结束）
     rejection_count: int = 0
