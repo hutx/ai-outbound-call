@@ -10,7 +10,6 @@ import base64
 import logging
 import os
 import re
-import tempfile
 import time
 import uuid
 from typing import Callable, Awaitable, Optional
@@ -1259,53 +1258,108 @@ class ESLSocketCallSession:
             await self.stop_playback()
 
     async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
+        """流式 TTS 播放：收集全部 PCM 后写 WAV 文件播放。
+
+        注意：FreeSWITCH 的 uuid_broadcast 在打开文件时读取完整内容，
+        因此采用先收集后播放的策略，确保音频完整性。
+
+        优化：
+        1. TTS 合成期间并行查找 target_uuid，避免串行等待
+        2. 直接调 uuid_broadcast，跳过 play() 的 warmup 延迟
+           （TTS 合成 3-4s 已远大于 warmup 所需的 350ms）
         """
-        兼容流式 TTS：先收集 PCM，再写临时 WAV 文件播放。
-        这不是严格的实时流式，但能保证真实 FreeSWITCH 路径可运行。
-        """
+        from backend.utils.audio import write_wav
+
+        shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
+        os.makedirs(shared_dir, exist_ok=True)
+
+        # 在 TTS 合成期间并行查找 target_uuid
+        uuid_task = asyncio.create_task(self._resolve_target_uuid())
+
+        # 收集全部 TTS chunk（流式接收中 TTS 已在后台合成）
         pcm_parts = []
         total_bytes = 0
+        chunk_count = 0
         async for chunk in audio_chunks:
             if chunk:
                 pcm_parts.append(chunk)
                 total_bytes += len(chunk)
+                chunk_count += 1
 
-        logger.info(f"[{self._uuid}] TTS 流式收集完成: {len(pcm_parts)} 块, {total_bytes} 字节")
+        logger.info(f"[{self._uuid}] TTS 流式接收完成: {chunk_count} 块, {total_bytes} 字节")
 
         if not pcm_parts:
             logger.warning(f"[{self._uuid}] TTS 流式播放收到空音频")
+            uuid_task.cancel()
             return
 
-        from backend.utils.audio import write_wav
+        # 等待 UUID 解析完成（通常已就绪，因为 TTS 耗时更长）
+        target_uuid = await uuid_task
 
-        # 写入两个容器共享的 /recordings 目录，FreeSWITCH 才能访问
-        shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
-        os.makedirs(shared_dir, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f"tts_{self._uuid or 'call'}_",
-            suffix=".wav",
-            dir=shared_dir,
-        )
-        os.close(fd)
-
-        total_pcm = len(b"".join(pcm_parts))
-        logger.info(f"[{self._uuid}] 写入 WAV: {temp_path} ({total_pcm} bytes PCM)")
-
+        # 写 WAV 文件
+        temp_path = os.path.join(shared_dir, f"tts_{self._uuid}_{uuid.uuid4().hex[:8]}.wav")
         try:
             write_wav(temp_path, b"".join(pcm_parts), sample_rate=8000)
             file_size = os.path.getsize(temp_path)
-            logger.info(f"[{self._uuid}] WAV 文件大小: {file_size} bytes, 开始播放")
-            await self.play(temp_path, timeout=timeout)
+            audio_bytes = max(0, file_size - 44)
+            estimated_duration = audio_bytes / 16000.0 if audio_bytes > 0 else 1.0
+
+            # 直接 uuid_broadcast，跳过 play() 的 warmup 延迟
+            if target_uuid and target_uuid != self._uuid and self.esl_pool:
+                result = await self.esl_pool.api(
+                    f"uuid_broadcast {target_uuid} {temp_path} aleg"
+                )
+                logger.info(f"[{self._uuid}] uuid_broadcast({target_uuid[:8]}) 结果: {result.strip()[:100]}")
+            else:
+                # 降级：execute playback
+                self._playback_done.clear()
+                await self.execute("playback", temp_path)
+                try:
+                    await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{self._uuid}] 播放超时 ({timeout}s)")
+                    await self.stop_playback()
+                return
+
+            # 等待播放完成
+            await asyncio.sleep(max(estimated_duration + 0.3, 0.5))
             logger.info(f"[{self._uuid}] 播放完成")
         except Exception as e:
             logger.error(f"[{self._uuid}] 播放异常: {e}", exc_info=True)
         finally:
             try:
                 if os.path.exists(temp_path):
-                    logger.debug(f"[{self._uuid}] 删除临时文件: {temp_path}")
                     os.remove(temp_path)
             except OSError:
                 pass
+
+    async def _resolve_target_uuid(self):
+        """解析 sofia A-leg UUID（可在 TTS 合成期间并行调用）。"""
+        target_uuid = None
+        for var in ("other_loopback_from_uuid", "export_origination_uuid", "origination_uuid"):
+            val = self._channel_vars.get(var, "")
+            if val and val not in ("-ERR", "_undef_"):
+                target_uuid = val
+                logger.info(f"[{self._uuid}] 从 _channel_vars.{var} 找到 sofia A-leg: {target_uuid[:8]}...")
+                break
+
+        if not target_uuid and self.esl_pool:
+            try:
+                dump = await self.esl_pool.api(f"uuid_dump {self._uuid}")
+                import re
+                for var in ("other_loopback_from_uuid", "export_origination_uuid", "origination_uuid"):
+                    pattern = rf"Variable: {var}: ([\w-]+)"
+                    match = re.search(pattern, dump)
+                    if match and match.group(1) not in ("-ERR", "_undef_"):
+                        target_uuid = match.group(1)
+                        logger.info(f"[{self._uuid}] 从 uuid_dump {var} 找到 sofia A-leg: {target_uuid[:8]}...")
+                        break
+            except Exception as e:
+                logger.debug(f"[{self._uuid}] uuid_dump 查询失败: {e}")
+
+        if not target_uuid:
+            target_uuid = self._aleg_uuid or self._uuid
+        return target_uuid
 
     async def stop_playback(self):
         """打断当前播放（barge-in）"""

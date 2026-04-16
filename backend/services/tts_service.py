@@ -359,7 +359,7 @@ class BailianCosyVoiceClient(BaseTTS):
             audio_format_cls,
             self._ResultCallback,
         ) = _load_dashscope_tts()
-        self._audio_format = audio_format_cls.WAV_8000HZ_MONO_16BIT
+        self._audio_format = audio_format_cls.PCM_8000HZ_MONO_16BIT
         self.model_name = cfg.bailian_tts_model or "cosyvoice-v3-flash"
         self.voice = cfg.voice or "longyingxiao_v3"
         # speech_rate: [0.5, 2.0], 默认 1.0
@@ -416,10 +416,12 @@ class BailianCosyVoiceClient(BaseTTS):
         return synth.call(text)
 
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
-        """流式合成：通过 callback 将同步回调桥接为 AsyncGenerator
+        """双向流式合成：使用 streaming_call() 逐段发送文本，on_data 实时返回音频
 
-        注意：百炼 TTS 输出 WAV 格式（含 44 字节头），需要剥离头部
-        只发送裸 PCM 数据给前端
+        相比 synth.call(text) 的阻塞式全量合成，streaming_call 能在文本发送后
+        几秒内就开始返回音频 chunk，实现真正的「边合边播」。
+
+        输出：8000Hz 16bit mono 裸 PCM（不含 WAV 头）
         """
         if not self._dashscope.api_key:
             logger.error("百炼 TTS: API Key 为空")
@@ -471,10 +473,11 @@ class BailianCosyVoiceClient(BaseTTS):
             callback=callback,
         )
 
-        # 在线程池中启动同步 TTS 调用
+        # 在线程池中启动双向流式 TTS 调用
         def _run():
             try:
-                synth.call(text)
+                synth.streaming_call(text)
+                synth.streaming_complete()
             except Exception as e:
                 error_ref["value"] = e
                 try:
@@ -485,15 +488,13 @@ class BailianCosyVoiceClient(BaseTTS):
         loop = asyncio.get_event_loop()
         task = loop.run_in_executor(None, _run)
 
-        # 从队列中异步取数据，剥离 WAV 头
-        header_stripped = False
+        # 从队列中异步取数据（PCM_8000HZ_MONO_16BIT 格式，纯 PCM 无 header）
         while True:
             try:
                 chunk = await asyncio.get_event_loop().run_in_executor(
                     None, q.get, True, 2.0
                 )
             except _queue.Empty:
-                # 队列 2 秒无数据，检查是否已完成
                 if error_ref["value"]:
                     logger.error(f"TTS 流式错误: {error_ref['value']}")
                     break
@@ -502,14 +503,6 @@ class BailianCosyVoiceClient(BaseTTS):
             if chunk is None:
                 break
             if chunk:
-                # 第一个 chunk 可能包含 WAV 头，需要剥离
-                if not header_stripped:
-                    header_stripped = True
-                    if len(chunk) > 44 and chunk[:4] == b"RIFF":
-                        chunk = chunk[44:]  # 跳过 WAV 头
-                    elif len(chunk) <= 44:
-                        # 太小了，可能是纯头部，跳过
-                        continue
                 yield chunk
 
         await task
