@@ -1238,21 +1238,16 @@ class ESLSocketCallSession:
             self._play_count += 1
 
         if self.esl_pool and target_uuid and target_uuid != self._uuid:
-            # 使用 uuid_displace 替换 sofia A-leg 的写入媒体流
+            # 使用 uuid_broadcast 将 TTS 音频注入到 sofia A-leg
             try:
                 result = await self.esl_pool.api(
-                    f"uuid_displace {target_uuid} start {audio_path} write"
+                    f"uuid_broadcast {target_uuid} {audio_path} aleg"
                 )
-                logger.info(f"[{self._uuid}] uuid_displace({target_uuid[:8]}, write) 结果: {result.strip()[:100]}")
-                await asyncio.sleep(max(estimated_duration + 0.15, 0.2))
-                # 停止 displace
-                try:
-                    await self.esl_pool.api(f"uuid_displace {target_uuid} stop")
-                except Exception:
-                    pass
+                logger.info(f"[{self._uuid}] uuid_broadcast({target_uuid[:8]}) 结果: {result.strip()[:100]}")
+                await asyncio.sleep(max(estimated_duration + 0.3, 0.5))
                 return
             except Exception as e:
-                logger.warning(f"[{self._uuid}] uuid_displace 失败: {e}，降级 execute")
+                logger.warning(f"[{self._uuid}] uuid_broadcast 失败: {e}，降级 execute")
 
         # 降级：通过 Outbound socket 的 execute playback
         self._playback_done.clear()
@@ -1600,9 +1595,9 @@ class ESLSocketCallSession:
     async def _poll_audio_file(self, path: str):
         """轮询音频文件，读取新增数据送入音频队列
 
-        ★ 关键修复：以实时速率（1x）发送音频帧，不超实时。
-        ASR 服务端（百炼/阿里云）期望音频以真实通话速率输入，
-        如果发送速度过快，VAD 和句子切分算法无法正确工作。
+        ★ 关键修复：跳到文件当前写入位置（末尾），从实时新音频开始读取。
+        录音文件可能已有大量旧音频（如 TTS 播放期间的录制），
+        如果从开头以 1x 速率追赶，ASR 会在读到用户语音前就超时。
 
         每次读取的新数据按 320 bytes（20ms @ 8kHz mono 16bit）分帧广播。
         """
@@ -1622,8 +1617,14 @@ class ESLSocketCallSession:
         # WAV 文件需要跳过 44 字节头
         is_wav = path.endswith(".wav")
         header_offset = 44 if is_wav else 0
-        offset = header_offset
-        if is_wav:
+
+        # ★ 跳到文件当前写入位置，从实时新音频开始读取
+        #    避免从开头追赶 100+ 秒旧音频导致 ASR 超时
+        current_size = os.path.getsize(path)
+        offset = max(header_offset, current_size)
+        if offset > header_offset:
+            logger.info(f"[{self._uuid}] 文件轮询：跳到末尾 offset={offset}（已有 {current_size - header_offset} 字节旧数据，跳过）")
+        else:
             logger.info(f"[{self._uuid}] 检测到 WAV 文件，跳过 {header_offset} 字节头")
 
         frame_size = 320  # 20ms @ 8kHz mono 16bit

@@ -56,7 +56,9 @@
       "Bash(ffmpeg:*)",
       "WebFetch(domain:www.google.com)",
       "Bash(docker images:*)",
-      "Bash(do lsof:*)"
+      "Bash(do lsof:*)",
+      "WebFetch(domain:signalwire.com)",
+      "WebFetch(domain:www.bing.com)"
     ]
   }
 }

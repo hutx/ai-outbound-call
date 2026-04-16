@@ -22,6 +22,20 @@ def write_wav(path: str, pcm_data: bytes, sample_rate: int = 8000, channels: int
         wf.writeframes(pcm_data)
 
 
+def write_wav_header_to_fd(fd: int, sample_rate: int = 8000, channels: int = 1, sampwidth: int = 2):
+    """向已打开的文件描述符写入 44 字节 WAV header（不关闭 fd）"""
+    import struct, os
+    # data_size 设为最大值，流式场景后续追加 PCM 数据
+    data_size = 0x7FFFFFFF
+    header = struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', data_size + 36, b'WAVE', b'fmt ',
+        16, 1, channels, sample_rate,
+        sample_rate * channels * sampwidth,
+        channels * sampwidth, sampwidth * 8,
+        b'data', data_size)
+    os.write(fd, header)
+
+
 def read_wav_pcm(path: str) -> tuple[bytes, int, int]:
     """
     读取 WAV 文件，返回 (pcm_bytes, sample_rate, channels)
