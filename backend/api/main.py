@@ -30,6 +30,7 @@ from backend.core.state_machine import CallContext, CallResult
 from backend.services.esl_service import AsyncESLPool, ESLSocketServer, ESLSocketCallSession, ESLEventListener
 from backend.services.asr_service import create_asr_client
 from backend.services.audio_stream_ws import AudioStreamWebSocket
+from backend.services.forkzstream_ws import ForkzstreamWebSocketServer
 from backend.services.tts_service import create_tts_client
 from backend.services.llm_service import LLMService
 from backend.services.crm_service import crm
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 _esl_pool: Optional[AsyncESLPool] = None
 _esl_listener: Optional[ESLEventListener] = None
 _ws_server: Optional[AudioStreamWebSocket] = None
+_forkzstream_ws_server: Optional[ForkzstreamWebSocketServer] = None
 _asr = None
 _tts = None
 _llm = None
@@ -101,6 +103,14 @@ async def _handle_call_session(session: ESLSocketCallSession):
     script_id = session.channel_vars.get("script_id", "finance_product_a")
     # 调试：打印所有 channel_vars 的 key
     logger.debug(f"[{call_uuid}] channel_vars keys: {sorted(session.channel_vars.keys())}")
+
+    # 优先使用 forkzstream 握手帧中的 botid（话术 ID）
+    if _forkzstream_ws_server:
+        forkz_script_id = await _forkzstream_ws_server.get_script_id(call_uuid, timeout=3.0)
+        if forkz_script_id:
+            logger.info(f"[{call_uuid}] forkzstream botid={forkz_script_id}，覆盖 channel_vars 中的 script_id")
+            script_id = forkz_script_id
+
     phone_number = (
         session.channel_vars.get("callee_number", "")
         or session.channel_vars.get("export_callee_number", "")
@@ -162,7 +172,7 @@ async def _handle_call_session(session: ESLSocketCallSession):
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _esl_pool, _esl_listener, _ws_server, _asr, _tts, _llm, _scheduler
+    global _esl_pool, _esl_listener, _ws_server, _forkzstream_ws_server, _asr, _tts, _llm, _scheduler
 
     # ★ 显式配置日志（uvicorn 的 --log-level 不会配置根日志器）
     _log_level = logging.DEBUG if config.debug else logging.INFO
@@ -211,6 +221,18 @@ async def lifespan(app: FastAPI):
         logger.warning(f"✗ AudioStream WebSocket 启动失败（将降级到文件轮询）: {e}")
         _ws_server = None
 
+    # mod_forkzstream WebSocket Server（接收 FreeSWITCH forkzstream 实时音频流）
+    _forkzstream_ws_server = ForkzstreamWebSocketServer(
+        host="0.0.0.0",
+        port=config.freeswitch.forkzstream_port,
+    )
+    try:
+        await _forkzstream_ws_server.start()
+        logger.info(f"✓ Forkzstream WebSocket 监听 :{config.freeswitch.forkzstream_port}")
+    except Exception as e:
+        logger.warning(f"✗ Forkzstream WebSocket 启动失败: {e}")
+        _forkzstream_ws_server = None
+
     # ESL 事件监听器（持久订阅 CHANNEL_ANSWER 等事件）
     _esl_listener = ESLEventListener(
         host=config.freeswitch.host,
@@ -232,12 +254,17 @@ async def lifespan(app: FastAPI):
         pool_size=5,
         event_listener=_esl_listener,
         ws_server=_ws_server,
+        forkzstream_ws_server=_forkzstream_ws_server,
     )
     try:
         await _esl_pool.start()
         logger.info("✓ ESL 连接池就绪")
     except Exception as e:
         logger.warning(f"✗ ESL 连接池启动失败（FreeSWITCH 未运行？）: {e}")
+
+    # 将 ESL pool 引用设置给 forkzstream server（用于 CallAgent 通话控制）
+    if _forkzstream_ws_server:
+        _forkzstream_ws_server._esl_pool = _esl_pool
 
     # 任务调度器
     _scheduler = TaskScheduler(esl_pool=_esl_pool)
@@ -250,6 +277,7 @@ async def lifespan(app: FastAPI):
         max_connections=config.max_concurrent_calls + 50,
         esl_pool=_esl_pool,
         ws_server=_ws_server,
+        forkzstream_ws_server=_forkzstream_ws_server,
     )
     server_task = asyncio.create_task(esl_server.start())
     logger.info(f"✓ ESL Socket Server 监听 :{config.freeswitch.socket_port}")
@@ -284,6 +312,9 @@ async def lifespan(app: FastAPI):
 
     if _ws_server:
         await _ws_server.stop()
+
+    if _forkzstream_ws_server:
+        await _forkzstream_ws_server.stop()
 
     if _esl_pool:
         await _esl_pool.stop()

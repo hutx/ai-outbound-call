@@ -58,7 +58,11 @@
       "Bash(docker images:*)",
       "Bash(do lsof:*)",
       "WebFetch(domain:signalwire.com)",
-      "WebFetch(domain:www.bing.com)"
+      "WebFetch(domain:www.bing.com)",
+      "Bash(ldd:*)",
+      "Bash(docker pull:*)",
+      "Bash(do docker:*)",
+      "Bash(docker buildx:*)"
     ]
   }
 }

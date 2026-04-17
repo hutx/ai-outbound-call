@@ -101,6 +101,7 @@ services:
       - ../freeswitch/conf/dialplan/internal.xml:/usr/local/freeswitch/conf/dialplan/internal.xml:ro
       - ../freeswitch/conf/dialplan/default.xml:/usr/local/freeswitch/conf/dialplan/default.xml:ro
       - ../freeswitch/conf/directory/default.xml:/usr/local/freeswitch/conf/directory/default.xml:ro
+      - ../freeswitch/mod/mod_forkzstream.so:/usr/local/freeswitch/lib/freeswitch/mod/mod_forkzstream.so:ro
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
       # - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
@@ -241,7 +242,7 @@ services:
   # ── FunASR 本地 ASR 服务（可选，替换云端 ASR）────────────────
   # 如果使用云端 ASR（讯飞等），注释掉这个服务
   # funasr:
-  #   image: registry.cn-hangzhou.aliyuncs.com/modelscope-repo/modelscope:funasr-runtime-sdk-online-cpu-0.1.10
+  #   image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.10
   #   container_name: outbound_funasr
   #   restart: unless-stopped
   #   ports:

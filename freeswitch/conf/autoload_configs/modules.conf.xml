@@ -144,5 +144,6 @@
     <!--<load module="mod_callcenter"/>-->
 
     <load module="mod_audio_fork"/>
+    <load module="mod_forkzstream"/>
   </modules>
 </configuration>

@@ -7,6 +7,7 @@ Outbound ESL : FS 接通后主动连后端:9999，每路通话独立 session
 """
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -116,11 +117,10 @@ class AsyncESLConnection:
         # - {export_var=val} 导出到 bridge 后的 B-leg（仅对 sofia/gateway 有效）
         # - loopback B-leg 不继承 export_ 变量，需要在 bridge 命令中显式传递
         #
-        # execute_on_bridge 值中包含空格（audio_fork ws://...），必须用 [ ] 语法
         simple_vars = (
-            f"origination_uuid={call_uuid},"
             f"export_origination_uuid={call_uuid},"
             f"export_callee_number={phone},"
+            f"export_script_id={script_id},"
             f"ai_agent=true,"
             f"task_id={task_id},"
             f"script_id={script_id},"
@@ -564,6 +564,7 @@ class AsyncESLPool:
         idle_timeout: float = 60.0,
         event_listener: Optional[ESLEventListener] = None,
         ws_server=None,
+        forkzstream_ws_server=None,
     ):
         self._host = host
         self._port = port
@@ -576,12 +577,17 @@ class AsyncESLPool:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._event_listener = event_listener
         self._ws_server = ws_server  # AudioStreamWebSocket for uuid_audio_fork
+        self._forkzstream_ws_server = forkzstream_ws_server  # ForkzstreamWebSocketServer
         # call_uuid(origination_uuid) → B-leg UUID 映射（由 _wait_and_start_ai_from_queue 设置）
         self._aleg_uuids: dict[str, str] = {}
 
     @property
     def ws_server(self):
         return self._ws_server
+
+    @property
+    def forkzstream_ws_server(self):
+        return self._forkzstream_ws_server
 
     async def start(self):
         for _ in range(self._pool_size):
@@ -850,7 +856,7 @@ class ESLSocketCallSession:
     """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                 esl_pool=None, ws_server=None):
+                 esl_pool=None, ws_server=None, forkzstream_ws_server=None):
         self._reader = reader
         self._writer = writer
         self._uuid: Optional[str] = None
@@ -865,7 +871,8 @@ class ESLSocketCallSession:
         self._sip_code: Optional[int] = None
         self.esl_pool = esl_pool  # ESL Inbound pool for uuid_eavesdrop
         self.ws_server = ws_server  # AudioStreamWebSocket for mod_audio_fork
-        self._audio_mode: str = "unknown"  # "websocket" | "file_poll" | "custom"
+        self.forkzstream_ws_server = forkzstream_ws_server  # ForkzstreamWebSocketServer
+        self._audio_mode: str = "unknown"  # "websocket" | "file_poll" | "custom" | "forkzstream"
         self._audio_started: bool = False  # 防止重复启动 uuid_audio_fork
         self._active_uuid: Optional[str] = None  # CHANNEL_ANSWER 中捕获的实际通话 UUID
         self._aleg_uuid: Optional[str] = None  # sofia A-leg UUID (bridge_partner)
@@ -1054,6 +1061,38 @@ class ESLSocketCallSession:
             logger.info(f"[{self._uuid}] A-leg UUID 已发现: {aleg_uuid[:8]}...")
         else:
             logger.debug(f"[{self._uuid}] 暂未发现 A-leg UUID，稍后 start_audio_capture 会重试")
+
+    async def _trigger_forkzstream_on_aleg(self, aleg_uuid: str):
+        """通过 ESL API 在 sofia A-leg 上触发 forkzstream 应用。
+
+        使用 uuid_broadcast 在 A-leg 上执行 forkzstream dialplan 应用。
+        uuid_broadcast 可以在指定通道上执行 dialplan 应用。
+
+        参数:
+            aleg_uuid: sofia A-leg UUID（forkzstream 的 callId）
+        """
+        if not self.esl_pool:
+            return
+
+        # 防止重复触发
+        if hasattr(self, '_forkzstream_triggered') and self._forkzstream_triggered:
+            return
+        self._forkzstream_triggered = True
+
+        ws_url = f"ws://backend:8766"
+        # forkzstream 格式：start url=<ws_url> type=websocket direction=both session_id=<uuid> botid=<script_id>
+        script_id = self._channel_vars.get("script_id", "finance_product_a")
+        fz_args = f"start url={ws_url} type=websocket direction=both session_id={aleg_uuid} botid={script_id}"
+
+        try:
+            # 使用 uuid_broadcast 在 A-leg 上执行 forkzstream 应用
+            result = await self.esl_pool.api(f"uuid_broadcast {aleg_uuid} forkzstream {fz_args}")
+            if result.strip().startswith("+OK"):
+                logger.info(f"[{self._uuid}] 已在 A-leg {aleg_uuid[:8]} 触发 forkzstream: {ws_url}")
+            else:
+                logger.debug(f"[{self._uuid}] uuid_broadcast forkzstream 返回: {result.strip()[:200]}")
+        except Exception as e:
+            logger.debug(f"[{self._uuid}] 触发 forkzstream 失败: {e}")
 
     async def _start_audio_fork_bleg(self):
         """在 B-leg 上启动 uuid_audio_fork（已知只能捕获 TTS 回声）"""
@@ -1257,6 +1296,35 @@ class ESLSocketCallSession:
         # 在 TTS 合成期间并行查找 target_uuid
         uuid_task = asyncio.create_task(self._resolve_target_uuid())
 
+        # ★ forkzstream 流式 TTS：合并全部 chunk 后一次性发送
+        if self.forkzstream_ws_server:
+            # forkzstream callId = socket session UUID (self._uuid)
+            if await self.forkzstream_ws_server.is_connected(self._uuid):
+                total_bytes = 0
+                all_audio = b""
+                async for chunk in audio_chunks:
+                    if chunk:
+                        all_audio += chunk
+                        total_bytes += len(chunk)
+                # 保存为 WAV 文件供检查（带序号防覆盖）
+                if not hasattr(self, '_debug_tts_counter'):
+                    self._debug_tts_counter = 0
+                self._debug_tts_counter += 1
+                debug_path = os.path.join(shared_dir, f"debug_tts_{self._uuid}_{self._debug_tts_counter}.wav")
+                try:
+                    from backend.utils.audio import write_wav
+                    write_wav(debug_path, all_audio, sample_rate=8000)
+                    logger.info(f"[{self._uuid}] TTS 已保存到 {debug_path} ({total_bytes} 字节)")
+                except Exception as e:
+                    logger.warning(f"[{self._uuid}] 保存调试 WAV 失败: {e}")
+                if total_bytes > 0:
+                    # 先发 ttsstart 开启 TTS 接收（forkzstream is_tts 初始为 false，不发会丢弃数据）
+                    await self.forkzstream_ws_server.send_command(self._uuid, "ttsstart")
+                    await self.forkzstream_ws_server.send_audio(self._uuid, all_audio)
+                logger.info(f"[{self._uuid}] forkzstream TTS 推送完成: {total_bytes} 字节, 预估播放 {total_bytes / 16000.0:.1f}s")
+                return
+
+        # 降级：走原有 uuid_broadcast + sleep 逻辑
         # 收集全部 TTS chunk（流式接收中 TTS 已在后台合成）
         pcm_parts = []
         total_bytes = 0
@@ -1344,6 +1412,10 @@ class ESLSocketCallSession:
 
     async def stop_playback(self):
         """打断当前播放（barge-in）"""
+        # forkzstream TTS 打断（callId = socket session UUID）
+        if self.forkzstream_ws_server:
+            await self.forkzstream_ws_server.send_command(self._uuid, "ttsstop_clean")
+        # 原有打断逻辑
         try:
             await self.execute("break", "", lock=False)
         except Exception:
@@ -1405,7 +1477,7 @@ class ESLSocketCallSession:
         # 音频源已就绪时直接复用，避免每次 TTS/barge-in/主监听都重复挂 media bug 或轮询文件。
         if self._audio_started:
             active_task = None
-            if self._audio_mode == "websocket":
+            if self._audio_mode in ("websocket", "forkzstream"):
                 active_task = self._audio_relay_task
             elif self._audio_mode == "file_poll":
                 active_task = self._audio_poll_task
@@ -1424,6 +1496,28 @@ class ESLSocketCallSession:
                 f"(模式: {self._audio_mode})"
             )
             self._audio_started = False
+
+        # ★ 优先级 0：forkzstream 实时音频流
+        # forkzstream 在 dialplan 中已启动，使用 B-leg UUID（即 self._uuid）作为 callId
+        if self.forkzstream_ws_server:
+            call_uuid = self._uuid
+            logger.info(f"[{call_uuid}] 尝试 forkzstream 实时音频流")
+            fz_queue = await self.forkzstream_ws_server.get_session_queue(call_uuid, timeout=5.0)
+            if fz_queue is not None:
+                logger.info(f"[{call_uuid}] 使用 forkzstream 实时音频流")
+                self._audio_mode = "forkzstream"
+                self._audio_started = True
+                # 创建订阅队列
+                sub_queue = asyncio.Queue(maxsize=500)
+                self._audio_subscribers.append(sub_queue)
+                # 启动中继任务（如果还没有）
+                if self._audio_relay_task is None or self._audio_relay_task.done():
+                    self._audio_relay_task = asyncio.create_task(
+                        self._relay_ws_audio(fz_queue)
+                    )
+                return sub_queue
+            else:
+                logger.debug(f"[{call_uuid}] forkzstream 连接未就绪，降级到现有方案")
 
         asr_path = None
 
@@ -1919,6 +2013,7 @@ class ESLSocketServer:
         max_connections: int = 200,
         esl_pool=None,
         ws_server=None,
+        forkzstream_ws_server=None,
     ):
         self.host = host
         self.port = port
@@ -1927,6 +2022,7 @@ class ESLSocketServer:
         self._server: Optional[asyncio.Server] = None
         self._esl_pool = esl_pool
         self._ws_server = ws_server
+        self._forkzstream_ws_server = forkzstream_ws_server
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -1944,7 +2040,8 @@ class ESLSocketServer:
     async def _handle(self, reader, writer):
         async with self._sem:
             session = ESLSocketCallSession(reader, writer, esl_pool=self._esl_pool,
-                                           ws_server=self._ws_server)
+                                           ws_server=self._ws_server,
+                                           forkzstream_ws_server=self._forkzstream_ws_server)
             try:
                 await self.call_handler(session)
             except Exception as e:

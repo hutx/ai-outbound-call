@@ -68,6 +68,7 @@
     </extension>
 
     <!-- AI 外呼 A-leg 处理（loopback/AI_CALL 匹配此扩展） -->
+    <!-- 参考文档示例：answer → forkzstream → sleep → 保持通道存活 -->
     <extension name="ai_call_handler">
       <condition field="destination_number" expression="^AI_CALL$">
         <action application="answer"/>
@@ -81,10 +82,12 @@
         <action application="set" data="media_bug_answer_req=true"/>
         <action application="set" data="record_file=/recordings/${uuid}.wav"/>
         <action application="record_session" data="/recordings/${uuid}.wav"/>
-        <!-- 注意：不在这里播放 opening_greeting，因为 &bridge() 是异步的，
-              playback 可能在 sofia 侧用户应答前就执行了。
-             开场白由 CallAgent 在 socket 连接后通过 uuid_displace 播放。 -->
-        <action application="socket" data="backend:9999 async full"/>
+        <!-- ★ forkzstream：ASR 音频流捕获 + TTS 音频播放（参考文档标准写法） -->
+        <action application="set" data="forkzstream_params={&quot;url&quot;:&quot;ws://backend:8766&quot;,&quot;callId&quot;:&quot;${uuid}&quot;,&quot;tenantId&quot;:&quot;default&quot;,&quot;botid&quot;:&quot;finance_product_a&quot;,&quot;fsInstanceId&quot;:&quot;default&quot;,&quot;session_id&quot;:&quot;${uuid}&quot;,&quot;text&quot;:&quot;&quot;}"/>
+        <action application="forkzstream" data="${uuid} start ${uuid} ws ${forkzstream_params}" />
+        <!-- ★ 长时间 sleep 保持通道存活，forkzstream 后台处理所有 ASR/TTS -->
+        <action application="sleep" data="300000"/>
+        <action application="forkzstream" data="${uuid} stop ${uuid} ws"/>
       </condition>
     </extension>
 

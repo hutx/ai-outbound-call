@@ -66,6 +66,9 @@
         <action application="set" data="media_bug_answer_req=true" />
         <action application="set" data="record_file=/recordings/${uuid}.wav" />
         <action application="record_session" data="/recordings/${uuid}.wav" />
+        <!-- forkzstream 推送实时音频到后端，在 bridge 之前执行 -->
+        <action application="set" data="forkzstream_params={&quot;url&quot;:&quot;ws://backend:8766&quot;,&quot;callId&quot;:&quot;${uud}&quot;,&quot;tenantId&quot;:&quot;default&quot;,&quot;botid&quot;:&quot;finance_product_a&quot;,&quot;fsInstanceId&quot;:&quot;default&quot;,&quot;session_id&quot;:&quot;${uuid}&quot;,&quot;text&quot;:&quot;&quot;}"/>
+        <action application="forkzstream" data="${uuid} start ${uuid} ws ${forkzstream_params}" />
         <action application="bridge" data="user/${dialed_extension}@${sip_domain}" />
       </condition>
     </extension>
