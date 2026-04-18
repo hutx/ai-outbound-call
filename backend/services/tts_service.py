@@ -363,7 +363,7 @@ class BailianCosyVoiceClient(BaseTTS):
         self.model_name = cfg.bailian_tts_model or "cosyvoice-v3-flash"
         self.voice = cfg.voice or "longyingxiao_v3"
         # speech_rate: [0.5, 2.0], 默认 1.0
-        self.speech_rate = max(0.5, min(2.0, cfg.speech_rate))
+        self.speech_rate = 1.0 #max(0.5, min(2.0, cfg.speech_rate))
         self.output_dir = cfg.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -410,8 +410,9 @@ class BailianCosyVoiceClient(BaseTTS):
             voice=self.voice,
             format=self._audio_format,
             volume=50,
-            speech_rate=self.speech_rate,
+            speech_rate=1.0,
             pitch_rate=1.0,
+            bit_rate= 128,
         )
         return synth.call(text)
 
@@ -429,7 +430,7 @@ class BailianCosyVoiceClient(BaseTTS):
 
         import queue as _queue
 
-        q = _queue.Queue(maxsize=200)
+        q = _queue.Queue(maxsize=512)
         error_ref = {"value": None}
 
         class _StreamCallback(self._ResultCallback):
@@ -488,7 +489,7 @@ class BailianCosyVoiceClient(BaseTTS):
         loop = asyncio.get_event_loop()
         task = loop.run_in_executor(None, _run)
 
-        # 从队列中异步取数据（PCM_8000HZ_MONO_16BIT 格式，纯 PCM 无 header）
+        # 从队列中异步取数据（PCM_16000HZ_MONO_16BIT 格式，纯 PCM 无 header）
         while True:
             try:
                 chunk = await asyncio.get_event_loop().run_in_executor(

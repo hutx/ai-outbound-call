@@ -21,7 +21,8 @@ from backend.core.state_machine import CallState, CallResult, CallContext, State
 from backend.services.asr_service import BaseASR, create_asr_client, ASRResult
 from backend.services.tts_service import BaseTTS, create_tts_client
 from backend.services.llm_service import LLMService
-from backend.services.esl_service import ESLSocketCallSession, ESLError
+from backend.services.esl_service import ESLError
+from backend.services.forkzstream_session import ForkzstreamCallSession
 from backend.services.crm_service import crm
 from backend.utils.db import save_call_record
 from backend.utils.audio import SimpleVAD
@@ -73,6 +74,7 @@ class AudioStreamAdapter:
         self._barge_in_event = barge_in_cb
         self._stopped = False
         self._started_speaking = False  # 是否已经检测到用户开始说话
+        self._is_all_silent = False     # stream() 退出时：从未检测到语音 = True
         # 打断策略
         self._barge_in_enabled = barge_in_enabled
         self._total_duration_ms = total_duration_ms
@@ -92,7 +94,7 @@ class AudioStreamAdapter:
         self._vad = SimpleVAD(
             sample_rate=8000,
             frame_ms=40,              # 40ms 帧：比 20ms 更稳定的能量检测
-            energy_threshold=120,     # 降低阈值：文件轮询的音频能量较低（max_rms≈134），需确保能触发语音检测
+            energy_threshold=120,     # 降低阈值：音频能量较低（max_rms≈134），需确保能触发语音检测
             speech_min_frames=1,
             silence_min_frames=max(1, int(vad_silence_ms / 40)),
         )
@@ -158,6 +160,7 @@ class AudioStreamAdapter:
                     #    改为：如果队列持续为空且从未检测到语音，最多等待 ASR_TIMEOUT 后退出
                     continue
                 if not chunk:
+                    logger.warning(f"[adapter] 收到空 chunk，音频流已断开（forkzstream WS 可能已断开）")
                     break
 
                 chunk_duration_ms = self._chunk_duration_ms(chunk)
@@ -187,9 +190,9 @@ class AudioStreamAdapter:
                     self._silence_ms += chunk_duration_ms
                     if not self._started_speaking:
                         # ★ 优化：初始静音超时从 2s → 15s
-                        #    文件轮询模式下，录音开头可能有较长静音（TTS 准备期），
+                        #    通话开头可能有较长静音（TTS 准备期），
                         #    2s 太短导致适配器在收到有效语音前就退出。
-                        #    15s 足够等待文件轮询到达语音段。
+                        #    15s 足够等待到达语音段。
                         if self._silence_ms >= 15000:
                             break
                         # ★ 关键修复：即使当前帧是静音，也要 yield 给 ASR
@@ -221,6 +224,7 @@ class AudioStreamAdapter:
                     break
             yield b""  # ASR 结束信号
         finally:
+            self._is_all_silent = not self._started_speaking
             dump_file.close()
             if dump_bytes > 0:
                 wav_path = dump_path.replace(".pcm", ".wav")
@@ -247,7 +251,7 @@ class CallAgent:
 
     def __init__(
         self,
-        session: ESLSocketCallSession,
+        session: ForkzstreamCallSession,
         context: CallContext,
         asr: Optional[BaseASR] = None,
         tts: Optional[BaseTTS] = None,
@@ -360,15 +364,19 @@ class CallAgent:
             # 监听用户（继续 _say 期间未完成的 ASR 监听）
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             cfg = self._last_barge_in_config
-            user_text = await self._listen_user(
+            user_text, is_all_silent = await self._listen_user(
                 barge_in_enabled=cfg["enabled"],
                 protect_start_ms=cfg["protect_start_ms"],
                 protect_end_ms=cfg["protect_end_ms"],
                 total_duration_ms=cfg["duration_ms"],
             )
-            logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r}")
+            logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r} is_all_silent={is_all_silent}")
 
             if not user_text:
+                if is_all_silent:
+                    # 全程静音（VAD 未检测到有效语音），不算作无响应，继续等待
+                    logger.info(f"[{self.ctx.uuid}] 本轮全静音，不计入无响应，继续监听")
+                    continue
                 silence_retries += 1
                 if silence_retries > MAX_SILENCE_RETRIES:
                     logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
@@ -408,13 +416,18 @@ class CallAgent:
     # ─────────────────────────────────────────────────────────
     async def _listen_user(self, *, barge_in_enabled: bool = True,
                            protect_start_ms: int = 3000, protect_end_ms: int = 3000,
-                           total_duration_ms: float = 0) -> str:
+                           total_duration_ms: float = 0) -> tuple[str, bool]:
+        """监听用户语音。
+
+        Returns:
+            (text, is_all_silent) — is_all_silent=True 表示全程静音，不算无响应
+        """
         self.sm.transition(CallState.USER_SPEAKING)
 
         # 通话已断开时跳过 ASR
         if not self.session._connected:
             logger.info(f"[{self.ctx.uuid}] 会话已断开，跳过 ASR")
-            return ""
+            return "", False
 
         # ★ 优化5：如果 _say 设置了提前启动信号，等待它
         if not self._main_asr_ready.is_set():
@@ -501,7 +514,7 @@ class CallAgent:
             self.ctx.user_utterances += 1
             self.ctx.messages.append({"role": "user", "content": final_text, "timestamp": int(time.time() * 1000)})
 
-        return final_text
+        return final_text, adapter._is_all_silent
 
     async def _barge_in_asr_loop_with_queue(self, adapter: AudioStreamAdapter,
                                              audio_capture_task: asyncio.Task):

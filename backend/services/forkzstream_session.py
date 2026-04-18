@@ -13,6 +13,7 @@ Forkzstream 通话会话 — 替代 ESL Outbound Socket
 import asyncio
 import logging
 import os
+import struct
 import time
 import uuid
 from typing import Optional
@@ -133,11 +134,25 @@ class ForkzstreamCallSession:
         return sub_queue
 
     async def _relay_forkzstream_audio(self, source_queue: asyncio.Queue):
-        """将 forkzstream ASR 音频广播到所有订阅者队列。"""
+        """将 forkzstream ASR 音频广播到所有订阅者队列。
+
+        ★ 当 WebSocket 断开时，source_queue 会收到一个空 bytes sentinel，
+          此时向所有订阅者发送 sentinel 后退出，并标记 session 为已断开。
+        """
         try:
             while self._connected:
                 try:
                     chunk = await asyncio.wait_for(source_queue.get(), timeout=30.0)
+                    # ★ WS 断开信号：空 bytes 表示连接已丢失，非正常音频结束
+                    if chunk == b"":
+                        logger.warning(f"[{self._uuid}] forkzstream WebSocket 已断开，通知所有订阅者")
+                        self._connected = False
+                        for q in self._audio_subscribers:
+                            try:
+                                q.put_nowait(b"")
+                            except asyncio.QueueFull:
+                                pass
+                        break
                     for q in self._audio_subscribers:
                         if not q.full():
                             try:
@@ -152,79 +167,24 @@ class ForkzstreamCallSession:
             logger.warning(f"[{self._uuid}] forkzstream 音频中继异常: {e}")
 
     async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
-        """流式 TTS：收集全部 PCM → 写 WAV → uuid_broadcast 到 sofia A-leg。
-
-        forkzstream 的 z_play_thread 在 bridge 架构下无法正确将音频送到用户侧
-        （loopback B-leg write_frame 通过 bridge 转发有定时/缓冲冲突），
-        因此 TTS 降级为 uuid_broadcast（FreeSWITCH 原生文件播放引擎，流畅无卡顿）。
-        """
-        from backend.utils.audio import write_wav
-
-        shared_dir = os.environ.get("FS_RECORDING_PATH", "/recordings")
-        os.makedirs(shared_dir, exist_ok=True)
-
-        # 收集全部 TTS chunk
-        all_audio = b""
+        """流式发送 TTS 音频，边合成边播放，避免一次性发送导致的卡顿。"""
         total_bytes = 0
         chunk_count = 0
+
+        logger.info(f"[{self._uuid}] TTS 流式播放开始")
+
         async for chunk in audio_chunks:
-            if chunk:
-                all_audio += chunk
-                total_bytes += len(chunk)
-                chunk_count += 1
-
-        logger.info(f"[{self._uuid}] TTS 收集完成: {chunk_count} 块, {total_bytes} 字节")
-
-        if total_bytes == 0:
-            logger.warning(f"[{self._uuid}] TTS 收到空音频")
-            return
-
-        # 保存为 WAV 文件
-        if not hasattr(self, '_debug_tts_counter'):
-            self._debug_tts_counter = 0
-        self._debug_tts_counter += 1
-        wav_path = os.path.join(shared_dir, f"tts_fz_{self._uuid}_{self._debug_tts_counter}.wav")
-        try:
-            write_wav(wav_path, all_audio, sample_rate=8000)
-            logger.info(f"[{self._uuid}] TTS WAV 已保存: {wav_path}")
-        except Exception as e:
-            logger.warning(f"[{self._uuid}] 保存 WAV 失败: {e}")
-            return
-
-        # 查找 sofia A-leg UUID（用户电话侧）
-        target_uuid = None
-        for var in ("other_loopback_from_uuid", "export_origination_uuid", "origination_uuid"):
-            val = self._channel_vars.get(var, "")
-            if val and val not in ("-ERR", "_undef_"):
-                target_uuid = val
-                logger.info(f"[{self._uuid}] 从 _channel_vars.{var} 找到 sofia A-leg: {target_uuid[:8]}...")
+            if not chunk:
+                continue
+            chunk_count += 1
+            total_bytes += len(chunk)
+            # 每收到一个 TTS chunk 就立即发送
+            sent = await self.forkzstream_ws_server.send_audio(self._uuid, chunk)
+            if not sent:
+                logger.warning(f"[{self._uuid}] TTS 音频发送失败")
                 break
 
-        if not target_uuid:
-            target_uuid = self._aleg_uuid or self._uuid
-            logger.info(f"[{self._uuid}] TTS 目标 UUID 使用 fallback: {target_uuid[:8]}...")
-
-        est_duration = total_bytes / 16000.0
-
-        # 通过 ESL Inbound pool 执行 uuid_broadcast
-        if self.esl_pool and target_uuid:
-            try:
-                result = await self.esl_pool.api(
-                    f"uuid_broadcast {target_uuid} {wav_path} aleg"
-                )
-                logger.info(f"[{self._uuid}] uuid_broadcast({target_uuid[:8]}) 结果: {result.strip()[:100]}")
-                # 等待播放完成
-                await asyncio.sleep(max(est_duration + 0.3, 0.5))
-                return
-            except Exception as e:
-                logger.warning(f"[{self._uuid}] uuid_broadcast 失败: {e}")
-
-        # 降级：通过 forkzstream 发送（已知可能有卡顿问题）
-        logger.warning(f"[{self._uuid}] uuid_broadcast 不可用，降级使用 forkzstream TTS")
-        await self.forkzstream_ws_server.send_command(self._uuid, "ttsstart")
-        sent = await self.forkzstream_ws_server.send_audio(self._uuid, all_audio)
-        if sent:
-            await asyncio.sleep(min(est_duration + 0.5, timeout))
+        logger.info(f"[{self._uuid}] TTS 流式播放完成: {chunk_count} 块, {total_bytes} 字节")
 
     async def stop_playback(self):
         """打断 TTS 播放。"""
