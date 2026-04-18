@@ -82,7 +82,7 @@ services:
       - "5060:5060/udp"
       - "5080:5080"
       - "5080:5080/udp"
-      - "16384-17384:16384-17384/udp"
+      - "16384-32768:16384-32768/udp"
     volumes:
       # ★ 只挂载 autoload_configs 和 dialplan，其余用镜像内置默认值
       #   挂载整个 /usr/local/freeswitch/conf 会覆盖镜像内的 ivr/sounds 等必要文件

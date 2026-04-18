@@ -9,10 +9,11 @@
         <!-- File to log to -->
 	<!--<param name="logfile" value="/var/log/freeswitch.log"/>-->
         <!-- At this length in bytes rotate the log file (0 for never) -->
-        <param name="rollover" value="1048576000"/>
+        <!-- ★ 从 1GB 减小到 50MB，防止日志文件过大 -->
+        <param name="rollover" value="52428800"/>
 		<!-- Maximum number of log files to keep before wrapping -->
 		<!-- If this parameter is enabled, the log filenames will not include a date stamp -->
-		<param name="maximum-rotate" value="32"/>
+		<param name="maximum-rotate" value="10"/>
         <!-- Prefix all log lines by the session's uuid  -->
         <param name="uuid" value="true" />
       </settings>
@@ -28,10 +29,13 @@
     <profile name="stdout">
         <settings>
             <param name="logfile" value="/dev/stdout"/>
-            <param name="rollover" value="0"/>
+            <!-- ★ stdout 日志也设置 50MB 轮转 -->
+            <param name="rollover" value="52428800"/>
+            <param name="maximum-rotate" value="10"/>
             <param name="uuid" value="true" />
         </settings>
         <mappings>
+            <!-- ★ stdout 只输出 warning 以上级别，减少高频 INFO 日志 -->
             <map name="all" value="warning,err,crit,alert"/>
         </mappings>
     </profile>

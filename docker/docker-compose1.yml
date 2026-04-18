@@ -109,8 +109,9 @@ services:
   # ── FunASR 本地 ASR 服务（可选，替换云端 ASR）────────────────
   # 如果使用云端 ASR（讯飞等），注释掉这个服务
   funasr:
-    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.10
-    container_name: outbound_funasr
+#    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.10
+    image: drachtio/drachtio-freeswitch-mrf:v1.10.1-full
+    container_name: outbound_funasr1
     restart: unless-stopped
     ports:
       - "10095:10095"

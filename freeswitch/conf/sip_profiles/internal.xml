@@ -246,7 +246,7 @@
     <!--<param name="inbound-bypass-media" value="true"/>-->
 
     <!--Uncomment to set all inbound calls to proxy media mode-->
-    <param name="inbound-proxy-media" value="true"/>
+    <!--<param name="inbound-proxy-media" value="true"/>-->
 
     <!-- Let calls hit the dialplan before selecting codec for the a-leg -->
     <param name="inbound-late-negotiation" value="true"/>

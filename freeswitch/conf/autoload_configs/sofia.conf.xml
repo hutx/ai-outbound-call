@@ -196,9 +196,10 @@
              不需要 auto-rtp-bug 修复 NAT 问题。 -->
         <param name="auto-rtp-bug" value="false"/>
 
-        <!-- ★ 确保所有 inbound 通话的 RTP 经过 FreeSWITCH 软件层，
-             使 mod_audio_fork / uuid_audio_fork 能捕获到用户语音 -->
-        <param name="inbound-proxy-media" value="true"/>
+        <!-- ★ 关闭 inbound-proxy-media — 开启后 sofia 跳过 codec 协商，
+             导致 A-leg 没有 RTP 解码，media bug 捕获不到音频。
+             改用 dialplan 的 proxy_media=true 通道变量控制单路通话。 -->
+        <!--<param name="inbound-proxy-media" value="true"/>-->
 
         <!-- 需要鉴权 -->
         <param name="auth-calls"      value="true"/>

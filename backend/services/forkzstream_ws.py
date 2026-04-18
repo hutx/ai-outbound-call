@@ -370,6 +370,15 @@ class ForkzstreamWebSocketServer:
             logger.error(f"[forkzstream#{ws_id}] 连接异常: {e}")
         finally:
             if call_uuid:
+                # ★ 断开信号：通知正在等待音频的 AudioStreamAdapter 快速退出，
+                #    避免 WS 断后 _listen_user 空等 15s 超时 → total_chunks=0。
+                queue = self._sessions.get(call_uuid)
+                if queue is not None:
+                    try:
+                        queue.put_nowait(b"")  # sentinel → adapter 检测到空 bytes 立即 break
+                    except asyncio.QueueFull:
+                        pass
+
                 self._sessions.pop(call_uuid, None)
                 self._ws_connections.pop(call_uuid, None)
                 self._script_ids.pop(call_uuid, None)

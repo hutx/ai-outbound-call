@@ -33,10 +33,6 @@ class FreeSwitchConfig:
     host: str = "127.0.0.1"
     port: int = 8021
     password: str = "ClueCon"
-    # ESL Socket 服务器端口（FreeSWITCH 反连后端用）
-    socket_port: int = 9999
-    # mod_audio_stream WebSocket 接收端口
-    audio_stream_port: int = 8765
     # mod_forkzstream WebSocket 接收端口
     forkzstream_port: int = 8766
     # SIP Gateway 名称（sofia.conf.xml 中配置的 gateway name）
@@ -52,8 +48,6 @@ class FreeSwitchConfig:
         self.host = _env("FS_HOST", self.host)
         self.port = _env_int("FS_ESL_PORT", self.port)
         self.password = _env("FS_ESL_PASSWORD", self.password)
-        self.socket_port = _env_int("FS_SOCKET_PORT", self.socket_port)
-        self.audio_stream_port = _env_int("FS_AUDIO_STREAM_PORT", self.audio_stream_port)
         self.forkzstream_port = _env_int("FS_FORKZSTREAM_PORT", self.forkzstream_port)
         self.gateway = _env("FS_GATEWAY", self.gateway)
         self.internal_domain = _env("FS_INTERNAL_DOMAIN", self.internal_domain)

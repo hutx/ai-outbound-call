@@ -10,7 +10,6 @@
 """
 import asyncio
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -350,8 +349,6 @@ class TaskScheduler:
                 script_id=task.script_id,
                 caller_id=task.caller_id or "202603311547",
                 originate_timeout=config.freeswitch.originate_timeout,
-                socket_host=os.environ.get("FS_BACKEND_SOCKET_HOST", "127.0.0.1"),
-                socket_port=config.freeswitch.socket_port,
                 internal_domain=config.freeswitch.internal_domain,
             )
             logger.info(
