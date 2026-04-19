@@ -58,74 +58,29 @@ class FreeSwitchConfig:
 @dataclass
 class ASRConfig:
     """ASR 语音识别配置"""
-    # 支持: funasr_local | xunfei | ali | bailian | mock
-    provider: str = "ali"
+    # 支持: funasr_local | qwen
+    provider: str = "qwen"
 
     # FunASR 本地服务地址
     funasr_host: str = "127.0.0.1"
     funasr_port: int = 10095
 
-    # 讯飞实时语音转写
-    xunfei_appid: str = ""
-    xunfei_apikey: str = ""
-    xunfei_apisecret: str = ""
-
-    # ── 阿里云智能语音交互 NLS ─────────────────────────────
-    # 获取方式: 阿里云控制台 → 智能语音交互 → 项目管理
-    # AppKey: 每个项目唯一，用于标识调用来源
-    ali_asr_appkey: str = ""
-    # AccessKey ID + Secret（RAM 子账号，授权 AliyunNLSFullAccess）
-    ali_access_key_id: str = ""
-    ali_access_key_secret: str = ""
-    # NLS Token（由 AK 换取，有效期 24h，SDK 会自动刷新）
-    # 也可以直接填写 Token 跳过动态获取（适合测试）
-    ali_nls_token: str = ""
-    # NLS 服务地址（默认上海，可换 beijing / cn-hangzhou）
-    # 上海: wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1
-    # 北京: wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1
-    ali_nls_url: str = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
-    # 实时转写：是否开启中间结果（true = 边说边出结果，false = 只返回最终句子）
-    ali_enable_intermediate: bool = True
-    # 实时转写：是否开启标点预测
-    ali_enable_punctuation: bool = True
-    # 实时转写：是否开启数字转写（把"一百二十三"转为"123"）
-    ali_enable_itn: bool = True
-    # 热词 ID（在阿里云控制台配置，提升产品名/专有名词识别率）
-    ali_vocabulary_id: str = ""
-
-    # ── 阿里云百炼平台 ASR ──────────────────────────────────
+    # ── Qwen 实时语音识别（百炼平台，WebSocket 直连）───────
     # 百炼 API Key（sk-xxx，控制台获取）
     bailian_access_token: str = ""
-    # 百炼 ASR 模型（默认 fun-asr-realtime，SDK 支持的实时转写模型）
-    bailian_asr_model: str = "fun-asr-realtime"
+    # Qwen ASR 模型（默认 qwen3-asr-flash-realtime）
+    qwen_asr_model: str = "qwen3-asr-flash-realtime"
 
     # 通用参数
-    # 采样率（Hz），FreeSWITCH PCMU/PCMA 默认 8000Hz
     sample_rate: int = 8000
-    # VAD 静音检测阈值（ms），超过此时长则认为用户说完
-    # 通话场景优先响应速度，默认控制在 400ms 左右。
     vad_silence_ms: int = 400
 
     def __post_init__(self):
         self.provider = _env("ASR_PROVIDER", self.provider)
         self.funasr_host = _env("FUNASR_HOST", self.funasr_host)
         self.funasr_port = _env_int("FUNASR_PORT", self.funasr_port)
-        self.xunfei_appid = _env("XUNFEI_APPID", self.xunfei_appid)
-        self.xunfei_apikey = _env("XUNFEI_APIKEY", self.xunfei_apikey)
-        self.xunfei_apisecret = _env("XUNFEI_APISECRET", self.xunfei_apisecret)
-        # 阿里云 ASR
-        self.ali_asr_appkey = _env("ALI_ASR_APPKEY", self.ali_asr_appkey)
-        self.ali_access_key_id = _env("ALI_ACCESS_KEY_ID", self.ali_access_key_id)
-        self.ali_access_key_secret = _env("ALI_ACCESS_KEY_SECRET", self.ali_access_key_secret)
-        self.ali_nls_token = _env("ALI_NLS_TOKEN", self.ali_nls_token)
-        self.ali_nls_url = _env("ALI_NLS_URL", self.ali_nls_url)
-        self.ali_enable_intermediate = _env_bool("ALI_ASR_INTERMEDIATE", self.ali_enable_intermediate)
-        self.ali_enable_punctuation = _env_bool("ALI_ASR_PUNCTUATION", self.ali_enable_punctuation)
-        self.ali_enable_itn = _env_bool("ALI_ASR_ITN", self.ali_enable_itn)
-        self.ali_vocabulary_id = _env("ALI_ASR_VOCABULARY_ID", self.ali_vocabulary_id)
-        # 百炼 ASR
         self.bailian_access_token = _env("BAILIAN_ACCESS_TOKEN", self.bailian_access_token)
-        self.bailian_asr_model = _env("BAILIAN_ASR_MODEL", self.bailian_asr_model)
+        self.qwen_asr_model = _env("QWEN_ASR_MODEL", self.qwen_asr_model)
         self.sample_rate = _env_int("ASR_SAMPLE_RATE", self.sample_rate)
         self.vad_silence_ms = _env_int("VAD_SILENCE_MS", self.vad_silence_ms)
 

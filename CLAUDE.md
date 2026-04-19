@@ -10,14 +10,34 @@
 - **FreeSWITCH 日志**：`docker logs outbound_freeswitch`
 - **FreeSWITCH 容器名**：`outbound_freeswitch`
 - **后端日志**：`docker logs outbound_backend`
+- **外部 IP 配置**：`freeswitch/conf/vars.xml` 中 `external_rtp_ip` / `external_sip_ip` 必须设为公网 IP（当前 `61.180.80.84`）
 
-## 架构概览
+## 架构概览（mod_forkzstream + Qwen ASR + 百炼 TTS）
+
+### 音频流路径
 - **sofia A-leg**：用户电话侧（如分机 1001），用户语音从此处进入
 - **loopback B-leg**：FreeSWITCH 内部端点，RTP 一定经过软件媒体层
 - **bridge(loopback/AI_CALL)**：sofia A-leg ↔ loopback B-leg，RTP 经过 FreeSWITCH 软件媒体层
-- **mod_forkzstream**：替代 mod_audio_fork，通过 WebSocket 推送实时 RTP 音频到后端 8766 端口
-- **forkzstream WS**：双向通道 — ASR 音频（FS → 后端二进制帧）+ TTS 音频（后端 → FS 二进制帧，8kHz L16 PCM）
-- **已废弃**：ESL Outbound Socket（audio_stream_ws.py 已删除）
+- **mod_forkzstream**：在 loopback B-leg 上通过 dialplan `forkzstream` 应用推送实时 RTP 音频到后端 8766 端口
+- **forkzstream WS**：双向 WebSocket 通道 — ASR 音频（FS → 后端二进制帧）+ TTS 音频（后端 → FS 二进制帧，8kHz L16 PCM）
+- **TTS 回传**：`play_stream` 逐 chunk 降采样 16k→8k → forkzstream WS 二进制帧发送到 FS
+- **已废弃**：ESL Outbound Socket（audio_stream_ws.py 已删除）、mod_audio_fork、dialplan audio_fork
+
+### 后端模块
+- **ForkzstreamWebSocketServer**（`forkzstream_ws.py`，8766 端口）：WebSocket 服务器，接收 FS 音频，推送 TTS
+- **ForkzstreamCallSession**（`forkzstream_session.py`）：每个通话的 WS 会话，兼容 CallAgent 接口
+- **CallAgent**（`call_agent.py`）：AI 对话引擎，串联 ESL ↔ ASR ↔ LLM ↔ TTS
+- **QwenRealtimeASRClient**（`asr_service.py`）：百炼 Qwen 实时语音识别（dashscope SDK OmniRealtimeConversation）
+- **BailianTTSClient**（`tts_service.py`）：百炼 CosyVoice TTS（cosyvoice-v3-flash，16kHz PCM）
+- **ESL Inbound Pool**（`esl_service.py`）：仅用于通话级控制（originate、uuid_kill、uuid_transfer 等）
+
+### 端口
+| 端口 | 用途 |
+|------|------|
+| 8021 | FreeSWITCH ESL Inbound |
+| 8766 | mod_forkzstream WebSocket |
+| 8767 | mod_audio_stream WebSocket（保留，非主用） |
+| 8000 | FastAPI REST API |
 
 ## 已验证失败的方案（不要再试）
 
@@ -71,7 +91,7 @@
   7. CallAgent 通过 `session.start_audio_capture()` 获取 forkzstream 音频队列
   8. ASR 音频：forkzstream WS → ForkzstreamCallSession → AudioStreamAdapter → ASR
   9. TTS 音频：百炼 CosyVoice (16kHz) → `play_stream` 逐 chunk 降采样到 8kHz → forkzstream WS 发送
-  10. ASR 识别（8k→16k 上采样，百炼 paraformer-realtime-v1），返回中间/最终结果
+  10. ASR 识别（8k→16k 上采样，Qwen qwen3-asr-flash-realtime），返回中间/最终结果
   11. LLM 推理 → TTS 流式播放 → 循环对话
 - **关键**：forkzstream WS 使用 callId 作为通话 UUID 标识
 - **关键**：TTS 输出 16kHz PCM，`play_stream` 中 `_downsample_16k_to_8k` 降采样后发送
@@ -81,6 +101,9 @@
   - `backend/services/forkzstream_ws.py` — ForkzstreamWebSocketServer，WS 服务端
   - `backend/services/forkzstream_session.py` — ForkzstreamCallSession，兼容 CallAgent 接口
   - `backend/core/call_agent.py` — CallAgent, AudioStreamAdapter
+  - `backend/services/asr_service.py` — QwenRealtimeASRClient, FunASRClient, create_asr_client()
+  - `backend/services/tts_service.py` — BailianTTSClient（百炼 CosyVoice）
+  - `backend/core/config.py` — 全局配置单例
 
 ### PSTN 外呼：&park() + dialplan forkzstream
 - **命令**：`originate [{vars}]sofia/gateway/... &park()`
@@ -102,6 +125,24 @@
 - `other_loopback_leg_uuid` = loopback-a UUID ✗（写到它用户听不到）
 - **日期**：2026-04-14
 
+### ✅ Qwen ASR 噪声过滤（2026-04-19）
+Qwen ASR 会将背景噪音识别为语气词（"嗯。"、"你好。"等），需在 **主路径和兜底路径** 同时过滤：
+
+- **主路径**：`_listen_user()` 中 ASR 结果先经 `_is_noise_word()` 过滤，噪声词 `continue` 跳过
+- **兜底路径**：ASR 超时后，最后一条中间结果也经 `_is_noise_word()` 过滤
+- **barge-in 路径**：两个 barge-in ASR 循环（`_barge_in_asr_loop_with_queue`、`_barge_in_asr_loop`）也需过滤，防止误触发打断
+- **噪声词集合**：`{"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。", "你好", "你好。", "你", "你。", "对", "对。", "行", "行。", "喂", "喂。", "好", "好。", "是", "是。"}`
+- **模式匹配**：单字 + 标点（如 `"嗯。"`、`"啊！"`）也视为噪声
+- **代码位置**：`backend/core/call_agent.py` — `_listen_user()` 内 `_is_noise_word()` 函数
+
+### ✅ Qwen ASR OmniRealtimeConversation（dashscope SDK，2026-04-19）
+- **必须使用** `enable_turn_detection=False`，否则模型进入"对话模式"（生成 AI 回复）而非纯转录
+- **URL**：`wss://dashscope.aliyuncs.com/api-ws/v1/realtime`
+- **模型**：`qwen3-asr-flash-realtime`（或 `qwen3-asr-flash-realtime-2026-02-10`）
+- **音频格式**：PCM 16-bit，发送端 16kHz（8kHz 需线性插值上采样）
+- **事件类型**：`conversation.item.input_audio_transcription.text`（中间结果）、`conversation.item.input_audio_transcription.completed`（最终结果）
+- **代码位置**：`backend/services/asr_service.py` — `QwenRealtimeASRClient`
+
 ### ✅ ASR 静音检测（VAD 层）
 - `AudioStreamAdapter._is_all_silent`：stream() 退出时设置，`_started_speaking=False` 表示全程静音
 - `_conversation_loop` 中 `is_all_silent=True` 时不计入 silence_retry，防止误挂断
@@ -113,21 +154,25 @@
 - 流式发送：逐 chunk 立即发送，不等全部收集完
 - **日期**：2026-04-18
 
-### ✅ ASR 兜底策略
+### ✅ ASR 兜底策略（带噪声过滤）
 - 如果 ASR 未产出 `is_final=True` 结果但有人声 + 中间结果，使用最后一条中间结果
-- **日期**：2026-04-15
+- **多重过滤**：
+  1. `max_rms > 2000` → 跳过（TTS 回声）
+  2. `speech_ms < 200` → 跳过（噪音）
+  3. `_is_noise_word(text)` → 跳过（噪声词）
+- **日期**：2026-04-19
 
 ### ✅ 连续语音帧检测
 - 需连续 2 帧语音（40ms）才认为用户开始说话，防止开头噪音误触发
 - **代码位置**：`backend/core/call_agent.py` — `AudioStreamAdapter._speech_onset_threshold = 2`
 
 ### ✅ VAD 静音超时
-- `vad_silence_ms = 400`（config 默认值），运行时环境变量 `VAD_SILENCE_MS` 可覆盖
-- `energy_threshold=120`（文件轮询音频能量较低）
+- `vad_silence_ms = 400~500`（config 默认值），运行时环境变量 `VAD_SILENCE_MS` 可覆盖
+- `energy_threshold=120`（音频能量较低，需确保能触发语音检测）
 - **代码位置**：`backend/core/config.py`, `backend/core/call_agent.py`
 
-### ✅ ASR 超时
-- `ASR_TIMEOUT = 8.0`（单句最长等待）
+### ✅ ASR/LLM/TTS 超时配置
+- `ASR_TIMEOUT = 15.0`（单句最长等待，百炼流式 ASR 首包约 2-5s）
 - `LLM_TIMEOUT = 30.0`
 - `TTS_TIMEOUT = 10.0`
 
@@ -136,12 +181,26 @@
 - 避免 WS 断后空等 15s 超时
 - **代码位置**：`backend/services/forkzstream_ws.py` — `_handle_connection` finally 块
 
+### ✅ 调试音频自动保存
+- `AudioStreamAdapter.stream()` 将送入 ASR 的 PCM 音频保存到 `/recordings/debug/asr_input_*.wav`
+- 便于追溯 ASR 识别质量、VAD 检测准确性
+- **代码位置**：`backend/core/call_agent.py` — `AudioStreamAdapter.stream()` 内 dump 逻辑
+
 ## 项目结构
 - `backend/` - Python FastAPI 后端
   - `api/` - REST API 路由
-  - `core/` - 核心业务逻辑（CallAgent, TaskScheduler, 状态机）
-  - `services/` - 外部服务（forkzstream, ASR, TTS, LLM, CRM）
+  - `core/` - 核心业务逻辑
+    - `call_agent.py` — CallAgent, AudioStreamAdapter
+    - `state_machine.py` — 通话状态机
+    - `config.py` — 全局配置单例
+  - `services/` - 外部服务
+    - `forkzstream_ws.py` — ForkzstreamWebSocketServer（8766 端口）
+    - `forkzstream_session.py` — ForkzstreamCallSession
+    - `asr_service.py` — ASR 服务（QwenRealtimeASRClient, FunASRClient, BaseASR）
+    - `tts_service.py` — TTS 服务（百炼 CosyVoice）
+    - `esl_service.py` — ESL Inbound 连接池
 - `freeswitch/conf/` - FreeSWITCH 配置（dialplan, autoload_configs, sip_profiles）
 - `freeswitch/mod/` - FreeSWITCH 模块（mod_forkzstream.so）
 - `docker/` - Docker Compose 部署配置
 - `frontend/` - 管理界面前端
+- `tests/` - 测试

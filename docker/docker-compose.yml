@@ -61,9 +61,6 @@ services:
 
   # ── FreeSWITCH ─────────────────────────────────────────────
   freeswitch:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.freeswitch.audio
     #
     # ★ FreeSWITCH 镜像（含 mod_audio_fork）
     #   RTP 端口范围由 vars.xml 中的 rtp_start_port / rtp_end_port 控制
@@ -101,7 +98,7 @@ services:
       - ../freeswitch/conf/dialplan/internal.xml:/usr/local/freeswitch/conf/dialplan/internal.xml:ro
       - ../freeswitch/conf/dialplan/default.xml:/usr/local/freeswitch/conf/dialplan/default.xml:ro
       - ../freeswitch/conf/directory/default.xml:/usr/local/freeswitch/conf/directory/default.xml:ro
-      - ../freeswitch/mod/mod_forkzstream.so:/usr/local/freeswitch/lib/freeswitch/mod/mod_forkzstream.so:ro
+      - ../freeswitch/mod/mod_forkzstream.so:/usr/local/freeswitch/lib/freeswitch/mod/mod_forkzstream.so
       - ../freeswitch/scripts:/usr/share/freeswitch/scripts:ro
       # - ./freeswitch/sounds:/usr/share/freeswitch/sounds  # 可选：本地声音文件
       # 录音文件
@@ -180,26 +177,12 @@ services:
       # FreeSWITCH 反连后端的 socket 地址（容器内使用服务名）
       FS_BACKEND_SOCKET_HOST: backend
       # ── ASR ──────────────────────────────────────────────────
-      ASR_PROVIDER:          ${ASR_PROVIDER:-bailian}
+      ASR_PROVIDER:          ${ASR_PROVIDER:-qwen}
       FUNASR_HOST:           funasr
       FUNASR_PORT:           10095
-      # 讯飞 ASR
-      XUNFEI_APPID:          ${XUNFEI_APPID:-}
-      XUNFEI_APIKEY:         ${XUNFEI_APIKEY:-}
-      XUNFEI_APISECRET:      ${XUNFEI_APISECRET:-}
-      # 阿里云 ASR
-      ALI_ASR_APPKEY:        ${ALI_ASR_APPKEY:-}
-      ALI_ACCESS_KEY_ID:     ${ALI_ACCESS_KEY_ID:-}
-      ALI_ACCESS_KEY_SECRET: ${ALI_ACCESS_KEY_SECRET:-}
-      ALI_NLS_TOKEN:         ${ALI_NLS_TOKEN:-}
-      ALI_NLS_URL:           ${ALI_NLS_URL:-wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1}
-      ALI_ASR_INTERMEDIATE:  ${ALI_ASR_INTERMEDIATE:-true}
-      ALI_ASR_PUNCTUATION:   ${ALI_ASR_PUNCTUATION:-true}
-      ALI_ASR_ITN:           ${ALI_ASR_ITN:-true}
-      ALI_ASR_VOCABULARY_ID: ${ALI_ASR_VOCABULARY_ID:-}
-      # 百炼 ASR
+      # Qwen 实时语音识别（百炼平台）
       BAILIAN_ACCESS_TOKEN:  ${BAILIAN_ACCESS_TOKEN:-}
-      BAILIAN_ASR_MODEL:     ${BAILIAN_ASR_MODEL:-paraformer-realtime-v1}
+      QWEN_ASR_MODEL:        ${QWEN_ASR_MODEL:-qwen3-asr-flash-realtime-2026-02-10}
       # 通用 ASR
       ASR_SAMPLE_RATE:       ${ASR_SAMPLE_RATE:-8000}
       VAD_SILENCE_MS:        ${VAD_SILENCE_MS:-400}
