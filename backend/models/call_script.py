@@ -31,3 +31,7 @@ class CallScript(Base):
     conversation_barge_in = Column(Boolean, nullable=False, default=True)  # 其他对话支持打断
     barge_in_protect_start = Column(Integer, nullable=False, default=3)  # 开始 N 秒内不打断
     barge_in_protect_end = Column(Integer, nullable=False, default=3)  # 结束前 N 秒不打断
+
+    # 宽容时间配置
+    tolerance_enabled = Column(Boolean, nullable=False, default=True)  # 是否启用宽容时间
+    tolerance_ms = Column(Integer, nullable=False, default=1000)  # TTS 播放后宽容时间（毫秒）
