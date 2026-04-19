@@ -44,12 +44,14 @@ class BaseASR(ABC):
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None],
         call_uuid: Optional[str] = None,
+        adapter=None,
     ) -> AsyncGenerator[ASRResult, None]:
         """
         流式识别
         输入: 音频数据生成器（PCM bytes）
         输出: 识别结果生成器
         call_uuid: 通话 UUID（用于音频文件命名，便于追溯）
+        adapter: AudioStreamAdapter 实例（用于在收到 is_final 后通知停止）
         """
         pass
 
@@ -87,6 +89,7 @@ class FunASRClient(BaseASR):
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None],
         call_uuid: Optional[str] = None,
+        adapter=None,
     ) -> AsyncGenerator[ASRResult, None]:
         try:
             async with websockets.connect(
@@ -191,6 +194,7 @@ class QwenRealtimeASRClient(BaseASR):
     async def recognize_stream(
         self, audio_gen: AsyncGenerator[bytes, None],
         call_uuid: Optional[str] = None,
+        adapter=None,
     ) -> AsyncGenerator[ASRResult, None]:
         import base64
         import queue as _queue
@@ -295,9 +299,11 @@ class QwenRealtimeASRClient(BaseASR):
             conversation.update_session(
                 output_modalities=[MultiModality.TEXT],
                 enable_input_audio_transcription=True,
-                enable_turn_detection=False,  # 禁用对话模式，只做纯转录
+                enable_turn_detection=True,  # ★ 启用服务端 VAD，流式 ASR
+                turn_detection_type="server_vad",
+                turn_detection_threshold=0.2,
+                turn_detection_silence_duration_ms=800,  # 用户说完后 800ms 静音才判定结束
                 transcription_params=transcription_params,
-                turn_detection_threshold=0.4,
             )
 
             # 发送音频
@@ -346,22 +352,13 @@ class QwenRealtimeASRClient(BaseASR):
 
             send_task = asyncio.create_task(_send())
 
-            # 等待发送完成
-            await send_task
-
-            # ★ 关键修复：发送完成后立即调用 end_session_async() 触发服务器处理音频
-            #   enable_turn_detection=False 时，服务器 VAD 不会自动检测语音结束，
-            #   必须发送 session.finish 才能触发转录结果返回。
-            #   之前 end_session() 只在 finally 中调用，导致接收循环先超时（20s 无结果），
-            #   现在改为发送完成就触发，ASR 可在 2-5s 内返回结果。
-            try:
-                conversation.end_session_async()
-            except Exception as e:
-                logger.warning(f"Qwen ASR end_session_async 异常: {e}")
-
-            # 接收结果
+            # ★ 流式 ASR：发送和接收并发运行
+            #   Qwen 服务端 VAD 实时检测语音段结束，返回 is_final=True
+            #   收到后调用 adapter.stop() 让发送任务退出
             result_count = 0
             t0 = time.time()
+
+            # 接收循环：收到 is_final=True 后立即停止发送
             while True:
                 try:
                     item = await asyncio.wait_for(
@@ -373,12 +370,19 @@ class QwenRealtimeASRClient(BaseASR):
                     logger.warning(f"Qwen ASR 接收超时 (已等待 {elapsed:.1f}s)")
                     break
 
-                if item is None:  # 哨兵
+                if item is None:  # 哨兵：WebSocket 已关闭
                     break
                 result_count += 1
                 yield item
                 if item.is_final:
                     final_text = item.text
+                    # ★ 收到最终结果，通知 adapter 停止发送
+                    adapter.stop()
+                    break
+
+            # 等待发送任务完成（adapter.stop() 后会很快退出）
+            send_task.cancel()
+            await asyncio.gather(send_task, return_exceptions=True)
 
             elapsed = time.time() - t0
             logger.info(
@@ -390,7 +394,10 @@ class QwenRealtimeASRClient(BaseASR):
             logger.error(f"Qwen ASR 异常: {e}", exc_info=True)
             yield ASRResult(text="", is_final=True)
         finally:
-            # end_session_async() 已在发送完成后调用，此处直接关闭连接
+            # 超时兜底：通知 adapter 停止（防止残留发送任务）
+            if adapter is not None:
+                adapter.stop()
+            # 关闭 WebSocket 连接
             try:
                 conversation.close()
             except Exception:

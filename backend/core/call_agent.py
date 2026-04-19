@@ -69,6 +69,7 @@ class AudioStreamAdapter:
         total_duration_ms: float = 0,
         protect_start_ms: int = 3000,
         protect_end_ms: int = 3000,
+        server_vad_mode: bool = False,
     ):
         self._queue = audio_queue
         self._vad_silence_ms = vad_silence_ms
@@ -76,6 +77,7 @@ class AudioStreamAdapter:
         self._stopped = False
         self._started_speaking = False  # 是否已经检测到用户开始说话
         self._is_all_silent = False     # stream() 退出时：从未检测到语音 = True
+        self._server_vad_mode = server_vad_mode  # 服务端 VAD 模式：不依赖本地静音检测退出
         # 打断策略
         self._barge_in_enabled = barge_in_enabled
         self._total_duration_ms = total_duration_ms
@@ -182,11 +184,12 @@ class AudioStreamAdapter:
                 else:
                     self._consecutive_speech_frames = 0  # 重置连续计数
                     self._silence_ms += chunk_duration_ms
-                    if not self._started_speaking:
+                    if not self._started_speaking and not self._server_vad_mode:
                         # ★ 优化：初始静音超时从 2s → 15s
                         #    通话开头可能有较长静音（TTS 准备期），
                         #    2s 太短导致适配器在收到有效语音前就退出。
                         #    15s 足够等待到达语音段。
+                        #    server_vad_mode 下禁用，让 Qwen 服务端 VAD 控制语音段结束
                         if self._silence_ms >= 15000:
                             break
                         # ★ 关键修复：即使当前帧是静音，也要 yield 给 ASR
@@ -214,7 +217,8 @@ class AudioStreamAdapter:
                 dump_file.write(chunk)
 
                 yield chunk
-                if self._started_speaking and not has_speech and self._silence_ms >= self._vad_silence_ms:
+                # ★ server_vad_mode 下不依赖本地 VAD 静音退出，让 Qwen 服务端 VAD 控制语音段结束
+                if not self._server_vad_mode and self._started_speaking and not has_speech and self._silence_ms >= self._vad_silence_ms:
                     break
             yield b""  # ASR 结束信号
         finally:
@@ -462,6 +466,7 @@ class CallAgent:
             total_duration_ms=total_duration_ms,
             protect_start_ms=protect_start_ms,
             protect_end_ms=protect_end_ms,
+            server_vad_mode=True,  # ★ 流式 ASR：Qwen 服务端 VAD 控制语音段结束
         )
 
         # 噪声词过滤
@@ -489,7 +494,7 @@ class CallAgent:
 
         try:
             async with asyncio.timeout(total_timeout):
-                async for result in self._asr_with_retry(adapter.stream()):
+                async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
                     if result.is_final and result.text:
                         if _is_noise_word(result.text):
                             logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
@@ -596,13 +601,14 @@ class CallAgent:
         finally:
             adapter.stop()
 
-    async def _asr_with_retry(self, audio_gen: AsyncGenerator[bytes, None]):
+    async def _asr_with_retry(self, audio_gen: AsyncGenerator[bytes, None],
+                               adapter=None):
         """ASR 带超时的流式识别"""
         async def _gen_with_timeout():
             async for chunk in audio_gen:
                 yield chunk
 
-        async for result in self.asr.recognize_stream(_gen_with_timeout(), call_uuid=self.ctx.uuid):
+        async for result in self.asr.recognize_stream(_gen_with_timeout(), call_uuid=self.ctx.uuid, adapter=adapter):
             yield result
 
     async def _tts_stream_with_timeout(self, text: str) -> AsyncGenerator[bytes, None]:
