@@ -32,6 +32,8 @@ async def list_scripts(current_user: dict = Depends(require_auth)):
                 "conversation_barge_in": s.conversation_barge_in,
                 "barge_in_protect_start": s.barge_in_protect_start,
                 "barge_in_protect_end": s.barge_in_protect_end,
+                "tolerance_enabled": s.tolerance_enabled,
+                "tolerance_ms": s.tolerance_ms,
                 "is_active": s.is_active
             }
             for s in scripts
@@ -64,6 +66,8 @@ async def get_script(script_id: str, current_user: dict = Depends(require_auth))
             "conversation_barge_in": script.conversation_barge_in,
             "barge_in_protect_start": script.barge_in_protect_start,
             "barge_in_protect_end": script.barge_in_protect_end,
+            "tolerance_enabled": script.tolerance_enabled,
+            "tolerance_ms": script.tolerance_ms,
             "is_active": script.is_active
         }
     except HTTPException:
@@ -117,7 +121,9 @@ async def create_script(script_data: dict, current_user: dict = Depends(require_
             closing_barge_in=script_data.get("closing_barge_in", False),
             conversation_barge_in=script_data.get("conversation_barge_in", True),
             barge_in_protect_start=script_data.get("barge_in_protect_start", 3),
-            barge_in_protect_end=script_data.get("barge_in_protect_end", 3)
+            barge_in_protect_end=script_data.get("barge_in_protect_end", 3),
+            tolerance_enabled=script_data.get("tolerance_enabled", True),
+            tolerance_ms=script_data.get("tolerance_ms", 1000)
         )
 
         # 调用服务创建脚本
@@ -174,6 +180,10 @@ async def update_script(script_id: str, script_data: dict, current_user: dict = 
             update_data["barge_in_protect_start"] = script_data["barge_in_protect_start"]
         if "barge_in_protect_end" in script_data:
             update_data["barge_in_protect_end"] = script_data["barge_in_protect_end"]
+        if "tolerance_enabled" in script_data:
+            update_data["tolerance_enabled"] = script_data["tolerance_enabled"]
+        if "tolerance_ms" in script_data:
+            update_data["tolerance_ms"] = script_data["tolerance_ms"]
 
         # 调用服务更新脚本
         success = await script_service.update_script(script_id, **update_data)
