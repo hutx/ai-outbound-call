@@ -416,6 +416,15 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <input id="sf-protect-end" type="number" value="3" min="0" max="60"/>
         </div>
       </div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="sf-tolerance-enabled" type="checkbox" checked/> TTS 播放后启用宽容时间
+        </label>
+      </div>
+      <div class="form-group" style="max-width:200px">
+        <label>宽容时间（毫秒）</label>
+        <input id="sf-tolerance-ms" type="number" value="1000" min="0" max="10000" step="100"/>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('script-modal')">取消</button>
@@ -760,6 +769,8 @@ function openCreateScript(){
   $('sf-conversation-barge-in').checked=true;
   $('sf-protect-start').value=3;
   $('sf-protect-end').value=3;
+  $('sf-tolerance-enabled').checked=true;
+  $('sf-tolerance-ms').value=1000;
   openModalDirect('script-modal');
 }
 
@@ -780,6 +791,8 @@ async function openEditScript(scriptId){
     $('sf-conversation-barge-in').checked=d.conversation_barge_in!==false;
     $('sf-protect-start').value=d.barge_in_protect_start??3;
     $('sf-protect-end').value=d.barge_in_protect_end??3;
+    $('sf-tolerance-enabled').checked=d.tolerance_enabled!==false;
+    $('sf-tolerance-ms').value=d.tolerance_ms??1000;
     openModalDirect('script-modal');
   }catch(e){ notify('加载话术详情失败: '+e.message,'err') }
 }
@@ -808,7 +821,9 @@ async function saveScript(){
     closing_barge_in: $('sf-closing-barge-in').checked,
     conversation_barge_in: $('sf-conversation-barge-in').checked,
     barge_in_protect_start: parseInt($('sf-protect-start').value)||3,
-    barge_in_protect_end: parseInt($('sf-protect-end').value)||3
+    barge_in_protect_end: parseInt($('sf-protect-end').value)||3,
+    tolerance_enabled: $('sf-tolerance-enabled').checked,
+    tolerance_ms: parseInt($('sf-tolerance-ms').value)||1000
   };
 
   try{
@@ -859,6 +874,7 @@ async function viewScriptDetail(scriptId){
           <tr><td style="color:var(--muted);padding:6px 10px">对话打断</td><td style="padding:6px 10px">${d.conversation_barge_in!==false?'<span style="color:var(--green)">● 支持</span>':'<span style="color:var(--muted)">● 不支持</span>'}</td></tr>
           <tr><td style="color:var(--muted);padding:6px 10px">开始保护期</td><td style="padding:6px 10px">${d.barge_in_protect_start??3} 秒</td></tr>
           <tr><td style="color:var(--muted);padding:6px 10px">结束保护期</td><td style="padding:6px 10px">${d.barge_in_protect_end??3} 秒</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">宽容时间</td><td style="padding:6px 10px">${d.tolerance_enabled?d.tolerance_ms+' ms':'<span style="color:var(--muted)">未启用</span>'}</td></tr>
         </table>
       </div>
     `;
