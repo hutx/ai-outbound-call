@@ -112,13 +112,6 @@ class AudioStreamAdapter:
             "speech_detected": self._speech_chunks > 0,
         }
 
-    def should_commit_intermediate(self) -> bool:
-        """本地 VAD 已明显判定句尾时，允许提前提交最后一条中间结果。"""
-        if not self._started_speaking:
-            return False
-        threshold_ms = max(150.0, min(280.0, self._vad_silence_ms * 0.4))
-        return self._silence_ms >= threshold_ms
-
     @staticmethod
     def _chunk_duration_ms(chunk: bytes, sample_rate: int = 8000) -> float:
         if not chunk:
@@ -279,6 +272,7 @@ class CallAgent:
         self._last_barge_in_config = {
             "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
         }
+        self._tolerance_text: str = ""  # 宽容期内捕获的用户语音
 
         # 注册状态机动作
         self.sm.register_handler("transfer",  self._do_transfer)
@@ -379,8 +373,14 @@ class CallAgent:
                     logger.info(f"[{self.ctx.uuid}] 本轮全静音，不计入无响应，继续监听")
                     continue
                 if is_asr_timeout:
-                    # ASR 超时但检测到人声，可能是百炼服务慢，不追问直接重试
-                    logger.info(f"[{self.ctx.uuid}] ASR 超时但检测到人声，不追问，直接重试监听")
+                    # ASR 超时但检测到人声，可能是背景噪音或用户自言自语
+                    # 累计计数，达到上限后主动询问
+                    silence_retries += 1
+                    if silence_retries > MAX_SILENCE_RETRIES:
+                        logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
+                        break
+                    logger.info(f"[{self.ctx.uuid}] 第 {silence_retries} 次无响应（ASR 超时），追问")
+                    await self._say("您好，请问您还在吗？")
                     continue
                 silence_retries += 1
                 if silence_retries > MAX_SILENCE_RETRIES:
@@ -401,6 +401,21 @@ class CallAgent:
             # 播报（transfer 时先播再转，end 时先说再挂）
             if reply_text and action not in ("transfer",):
                 await self._say(reply_text)
+
+            # 宽容期等待：TTS 播放完成后，等待用户补充说话
+            tolerance_config = await get_barge_in_config(self.ctx.script_id, "conversation")
+            if tolerance_config.get("tolerance_enabled", True):
+                tolerance_ms = tolerance_config.get("tolerance_ms", 1000)
+                self._tolerance_text = await self._tolerance_listen(tolerance_ms)
+                if self._tolerance_text:
+                    logger.info(f"[{self.ctx.uuid}] 宽容期捕获用户语音: {self._tolerance_text!r}")
+                    self.ctx.messages.append({
+                        "role": "user",
+                        "content": self._tolerance_text,
+                        "timestamp": int(time.time() * 1000),
+                    })
+                    self.ctx.user_utterances += 1
+                    self._tolerance_text = ""
 
             if action == "end":
                 break
@@ -460,51 +475,32 @@ class CallAgent:
             protect_end_ms=protect_end_ms,
         )
 
-        # 噪声词过滤（全局常量，主路径和兜底路径共用）
+        # 噪声词过滤
         NOISE_WORDS = {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
                         "你好", "你好。", "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
                         "好", "好。", "是", "是。"}
-        MAX_RMS_FALLBACK = 2000
-        MIN_SPEECH_MS_FALLBACK = 200
 
         def _is_noise_word(text: str) -> bool:
-            """判断文本是否为噪音词（背景噪音被 ASR 误识别）"""
             t = text.strip()
             if not t:
                 return True
             if t in NOISE_WORDS:
                 return True
-            # 单字语气词 + 标点
             if len(t) == 2 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and t[1] in {"。", "！", "?", "…"}:
                 return True
             return False
 
         final_text = ""
-        last_intermediate_text = ""  # 兜底：如果 ASR 未产出 is_final，使用最后一条中间结果
-        asr_result_count = 0
         asr_timed_out = False
         try:
             async with asyncio.timeout(ASR_TIMEOUT):
                 async for result in self._asr_with_retry(adapter.stream()):
-                    asr_result_count += 1
-                    if _is_noise_word(result.text):
-                        logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r} is_final={result.is_final}")
-                        continue
-                    logger.info(f"[{self.ctx.uuid}] ASR 中间结果 #{asr_result_count}: text={result.text!r} is_final={result.is_final} conf={result.confidence:.2f}")
-                    if result.text:
-                        last_intermediate_text = result.text
                     if result.is_final and result.text:
-                        final_text = result.text
-                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, is_final={result.is_final})")
-                        # 通话场景中，一句话即为一轮对话，拿到 is_final 后立即退出
-                        # 避免前端持续送音频导致 VAD 无法触发、ASR 无限识别多句
-                        break
-                    if result.text and adapter.should_commit_intermediate():
-                        final_text = result.text
-                        logger.info(
-                            f"[{self.ctx.uuid}] ASR 早提交中间结果 {result.text!r} "
-                            f"(silence_ms={adapter._silence_ms:.0f})"
-                        )
+                        if _is_noise_word(result.text):
+                            logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
+                        else:
+                            final_text = result.text
+                            logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f})")
                         break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
@@ -517,48 +513,13 @@ class CallAgent:
         audio_stats = adapter.audio_stats()
         logger.info(
             f"[{self.ctx.uuid}] 音频检测: speech_detected={audio_stats['speech_detected']} "
-            f"total_chunks={audio_stats['total_chunks']} "
-            f"speech_chunks={audio_stats['speech_chunks']} "
-            f"speech_ms={audio_stats['speech_ms']} "
-            f"max_rms={audio_stats['max_rms']}"
+            f"speech_ms={audio_stats['speech_ms']} max_rms={audio_stats['max_rms']}"
         )
 
-        # 兜底：未产出 is_final 但有人声 + 中间结果，使用最后一条中间结果
-        # 多重过滤，防止噪音/回声误触发：
-        #   1. max_rms 过高（>2000）→ 可能是 TTS 回声
-        #   2. speech_ms 过短（<200ms）→ 可能是噪音
-        #   3. 文本为噪音词 → 可能是背景噪音转录
-        should_fallback = False
-        skip_reason = ""
-
-        if not final_text and last_intermediate_text and audio_stats.get("speech_detected"):
-            if audio_stats.get("max_rms", 0) > MAX_RMS_FALLBACK:
-                skip_reason = f"max_rms={audio_stats['max_rms']} 过高（TTS 回声）"
-            elif audio_stats.get("speech_ms", 0) < MIN_SPEECH_MS_FALLBACK:
-                skip_reason = f"speech_ms={audio_stats['speech_ms']:.0f} 过短（噪音）"
-            elif _is_noise_word(last_intermediate_text):
-                skip_reason = f"兜底文本 {last_intermediate_text!r} 为噪音词"
-            else:
-                should_fallback = True
-
-        if should_fallback:
-            final_text = last_intermediate_text
-            logger.info(
-                f"[{self.ctx.uuid}] ASR 兜底：使用最后一条中间结果 {last_intermediate_text!r} "
-                f"(speech_ms={audio_stats['speech_ms']}, max_rms={audio_stats['max_rms']})"
-            )
-        elif not final_text and skip_reason:
-            logger.warning(f"[{self.ctx.uuid}] ASR 跳过兜底：{skip_reason}，忽略 {last_intermediate_text!r}")
-
-        if not audio_stats["speech_detected"]:
+        if not audio_stats["speech_detected"] and not asr_timed_out:
             logger.warning(f"[{self.ctx.uuid}] 本轮进入 ASR 的音频未检测到有效人声")
-        elif not final_text:
-            logger.warning(
-                f"[{self.ctx.uuid}] 已检测到人声，但 ASR 未产出最终文本 "
-                f"(speech_ms={audio_stats['speech_ms']}, max_rms={audio_stats['max_rms']})"
-            )
 
-        logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}, 共 {asr_result_count} 条结果")
+        logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}")
 
         if final_text:
             self.ctx.user_utterances += 1
@@ -771,6 +732,66 @@ class CallAgent:
             logger.error(f"[{self.ctx.uuid}] TTS/播放失败: {e}", exc_info=True)
         finally:
             self._barge_in.set()  # 播放结束，允许新一轮录音
+
+    # ─────────────────────────────────────────────────────────
+    # 宽容期监听
+    # ─────────────────────────────────────────────────────────
+    async def _tolerance_listen(self, tolerance_ms: int) -> str:
+        """在 TTS 播放后等待 tolerance_ms，若用户说话则返回识别文本。
+
+        Returns:
+            宽容期内识别到的用户语音文本，超时或无语音返回空字符串。
+        """
+        if not self.session._connected:
+            return ""
+
+        try:
+            audio_queue = await self.session.start_audio_capture()
+        except Exception as e:
+            logger.warning(f"[{self.ctx.uuid}] 宽容期音频采集失败: {e}")
+            return ""
+
+        adapter = AudioStreamAdapter(
+            audio_queue,
+            vad_silence_ms=config.asr.vad_silence_ms,
+            barge_in_enabled=False,  # 宽容期不需要 barge-in
+        )
+
+        noise_words = {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
+                       "你好", "你好。", "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
+                       "好", "好。", "是", "是。"}
+
+        def _is_noise(text: str) -> bool:
+            t = text.strip()
+            if not t:
+                return True
+            if t in noise_words:
+                return True
+            if len(t) == 2 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and t[1] in {"。", "！", "?", "…"}:
+                return True
+            return False
+
+        tolerance_sec = tolerance_ms / 1000.0
+        result_text = ""
+
+        try:
+            async with asyncio.timeout(tolerance_sec):
+                async for result in self.asr.recognize_stream(adapter.stream(), call_uuid=self.ctx.uuid):
+                    if result.is_final and result.text:
+                        if _is_noise(result.text):
+                            logger.debug(f"[{self.ctx.uuid}] 宽容期 ASR 过滤噪声: {result.text!r}")
+                        else:
+                            result_text = result.text
+                            logger.info(f"[{self.ctx.uuid}] 宽容期 ASR: {result.text!r}")
+                            break
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.ctx.uuid}] 宽容期超时 ({tolerance_sec}s)，未检测到语音")
+        except Exception as e:
+            logger.debug(f"[{self.ctx.uuid}] 宽容期 ASR 异常: {e}")
+        finally:
+            adapter.stop()
+
+        return result_text
 
     # ─────────────────────────────────────────────────────────
     # 动作处理器
