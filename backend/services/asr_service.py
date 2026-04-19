@@ -297,6 +297,7 @@ class QwenRealtimeASRClient(BaseASR):
                 enable_input_audio_transcription=True,
                 enable_turn_detection=False,  # 禁用对话模式，只做纯转录
                 transcription_params=transcription_params,
+                turn_detection_threshold=0.4,
             )
 
             # 发送音频
@@ -345,6 +346,19 @@ class QwenRealtimeASRClient(BaseASR):
 
             send_task = asyncio.create_task(_send())
 
+            # 等待发送完成
+            await send_task
+
+            # ★ 关键修复：发送完成后立即调用 end_session_async() 触发服务器处理音频
+            #   enable_turn_detection=False 时，服务器 VAD 不会自动检测语音结束，
+            #   必须发送 session.finish 才能触发转录结果返回。
+            #   之前 end_session() 只在 finally 中调用，导致接收循环先超时（20s 无结果），
+            #   现在改为发送完成就触发，ASR 可在 2-5s 内返回结果。
+            try:
+                conversation.end_session_async()
+            except Exception as e:
+                logger.warning(f"Qwen ASR end_session_async 异常: {e}")
+
             # 接收结果
             result_count = 0
             t0 = time.time()
@@ -376,16 +390,11 @@ class QwenRealtimeASRClient(BaseASR):
             logger.error(f"Qwen ASR 异常: {e}", exc_info=True)
             yield ASRResult(text="", is_final=True)
         finally:
-            try:
-                conversation.end_session()
-            except Exception:
-                pass
+            # end_session_async() 已在发送完成后调用，此处直接关闭连接
             try:
                 conversation.close()
             except Exception:
                 pass
-            send_task.cancel()
-            await asyncio.gather(send_task, return_exceptions=True)
 
         # 保存调试音频
         if dump_list:
