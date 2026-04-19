@@ -78,7 +78,10 @@ async def get_system_prompt_for_call(script_id: str, customer_info: dict) -> str
 
 {customer_profile}
 
-{output_contract}"""
+{output_contract}
+
+
+"""
 
 
 async def get_opening_for_call(script_id: str, customer_info: dict) -> dict:
@@ -139,6 +142,8 @@ async def get_barge_in_config(
             ),
             "protect_start_sec": 3,
             "protect_end_sec": 3,
+            "tolerance_enabled": True,
+            "tolerance_ms": 1000,
         }
 
     if speech_type == "opening":
@@ -146,16 +151,22 @@ async def get_barge_in_config(
             "barge_in_enabled": script_config.opening_barge_in,
             "protect_start_sec": script_config.barge_in_protect_start,
             "protect_end_sec": script_config.barge_in_protect_end,
+            "tolerance_enabled": script_config.tolerance_enabled,
+            "tolerance_ms": script_config.tolerance_ms,
         }
     elif speech_type == "closing":
         return {
             "barge_in_enabled": script_config.closing_barge_in,
             "protect_start_sec": script_config.barge_in_protect_start,
             "protect_end_sec": script_config.barge_in_protect_end,
+            "tolerance_enabled": script_config.tolerance_enabled,
+            "tolerance_ms": script_config.tolerance_ms,
         }
     else:  # conversation
         return {
             "barge_in_enabled": script_config.conversation_barge_in,
             "protect_start_sec": script_config.barge_in_protect_start,
             "protect_end_sec": script_config.barge_in_protect_end,
+            "tolerance_enabled": script_config.tolerance_enabled,
+            "tolerance_ms": script_config.tolerance_ms,
         }
