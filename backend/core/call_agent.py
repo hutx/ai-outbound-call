@@ -272,7 +272,6 @@ class CallAgent:
         self._last_barge_in_config = {
             "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
         }
-        self._tolerance_text: str = ""  # 宽容期内捕获的用户语音
 
         # 注册状态机动作
         self.sm.register_handler("transfer",  self._do_transfer)
@@ -359,11 +358,14 @@ class CallAgent:
             # 监听用户（继续 _say 期间未完成的 ASR 监听）
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             cfg = self._last_barge_in_config
+            tolerance_config = await get_barge_in_config(self.ctx.script_id, "conversation")
             user_text, is_all_silent, is_asr_timeout = await self._listen_user(
                 barge_in_enabled=cfg["enabled"],
                 protect_start_ms=cfg["protect_start_ms"],
                 protect_end_ms=cfg["protect_end_ms"],
                 total_duration_ms=cfg["duration_ms"],
+                tolerance_enabled=tolerance_config.get("tolerance_enabled", True),
+                tolerance_ms=tolerance_config.get("tolerance_ms", 1000),
             )
             logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r} is_all_silent={is_all_silent} asr_timeout={is_asr_timeout}")
 
@@ -402,21 +404,6 @@ class CallAgent:
             if reply_text and action not in ("transfer",):
                 await self._say(reply_text)
 
-            # 宽容期等待：TTS 播放完成后，等待用户补充说话
-            tolerance_config = await get_barge_in_config(self.ctx.script_id, "conversation")
-            if tolerance_config.get("tolerance_enabled", True):
-                tolerance_ms = tolerance_config.get("tolerance_ms", 1000)
-                self._tolerance_text = await self._tolerance_listen(tolerance_ms)
-                if self._tolerance_text:
-                    logger.info(f"[{self.ctx.uuid}] 宽容期捕获用户语音: {self._tolerance_text!r}")
-                    self.ctx.messages.append({
-                        "role": "user",
-                        "content": self._tolerance_text,
-                        "timestamp": int(time.time() * 1000),
-                    })
-                    self.ctx.user_utterances += 1
-                    self._tolerance_text = ""
-
             if action == "end":
                 break
 
@@ -436,7 +423,9 @@ class CallAgent:
     # ─────────────────────────────────────────────────────────
     async def _listen_user(self, *, barge_in_enabled: bool = True,
                            protect_start_ms: int = 3000, protect_end_ms: int = 3000,
-                           total_duration_ms: float = 0) -> tuple[str, bool, bool]:
+                           total_duration_ms: float = 0,
+                           tolerance_enabled: bool = True,
+                           tolerance_ms: int = 1000) -> tuple[str, bool, bool]:
         """监听用户语音。
 
         Returns:
@@ -492,16 +481,32 @@ class CallAgent:
 
         final_text = ""
         asr_timed_out = False
+        first_valid_ts = 0.0  # 第一次拿到有效语音的时间戳
+
+        # 宽容期内额外等待时间：tolerance_ms 基础上加 3 秒给 ASR 处理
+        tolerance_extra_sec = max(3.0, tolerance_ms / 1000.0)
+        total_timeout = ASR_TIMEOUT + (tolerance_extra_sec if tolerance_enabled else 0)
+
         try:
-            async with asyncio.timeout(ASR_TIMEOUT):
+            async with asyncio.timeout(total_timeout):
                 async for result in self._asr_with_retry(adapter.stream()):
                     if result.is_final and result.text:
                         if _is_noise_word(result.text):
                             logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
+                            continue  # 噪声词不 break，继续等
+                        final_text = result.text
+                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f})")
+                        if first_valid_ts == 0.0:
+                            first_valid_ts = time.time()
+                        # ★ 宽容期：第一次拿到有效语音后，额外等 tolerance_extra_sec
+                        if tolerance_enabled and first_valid_ts > 0:
+                            elapsed = time.time() - first_valid_ts
+                            if elapsed >= tolerance_extra_sec:
+                                logger.debug(f"[{self.ctx.uuid}] 宽容期超时 ({elapsed:.1f}s >= {tolerance_extra_sec:.1f}s)")
+                                break
                         else:
-                            final_text = result.text
-                            logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f})")
-                        break
+                            # 不启用宽容期时，拿到有效语音后立即退出
+                            break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
             asr_timed_out = True
@@ -732,66 +737,6 @@ class CallAgent:
             logger.error(f"[{self.ctx.uuid}] TTS/播放失败: {e}", exc_info=True)
         finally:
             self._barge_in.set()  # 播放结束，允许新一轮录音
-
-    # ─────────────────────────────────────────────────────────
-    # 宽容期监听
-    # ─────────────────────────────────────────────────────────
-    async def _tolerance_listen(self, tolerance_ms: int) -> str:
-        """在 TTS 播放后等待 tolerance_ms，若用户说话则返回识别文本。
-
-        Returns:
-            宽容期内识别到的用户语音文本，超时或无语音返回空字符串。
-        """
-        if not self.session._connected:
-            return ""
-
-        try:
-            audio_queue = await self.session.start_audio_capture()
-        except Exception as e:
-            logger.warning(f"[{self.ctx.uuid}] 宽容期音频采集失败: {e}")
-            return ""
-
-        adapter = AudioStreamAdapter(
-            audio_queue,
-            vad_silence_ms=config.asr.vad_silence_ms,
-            barge_in_enabled=False,  # 宽容期不需要 barge-in
-        )
-
-        noise_words = {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
-                       "你好", "你好。", "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
-                       "好", "好。", "是", "是。"}
-
-        def _is_noise(text: str) -> bool:
-            t = text.strip()
-            if not t:
-                return True
-            if t in noise_words:
-                return True
-            if len(t) == 2 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and t[1] in {"。", "！", "?", "…"}:
-                return True
-            return False
-
-        tolerance_sec = tolerance_ms / 1000.0
-        result_text = ""
-
-        try:
-            async with asyncio.timeout(tolerance_sec):
-                async for result in self.asr.recognize_stream(adapter.stream(), call_uuid=self.ctx.uuid):
-                    if result.is_final and result.text:
-                        if _is_noise(result.text):
-                            logger.debug(f"[{self.ctx.uuid}] 宽容期 ASR 过滤噪声: {result.text!r}")
-                        else:
-                            result_text = result.text
-                            logger.info(f"[{self.ctx.uuid}] 宽容期 ASR: {result.text!r}")
-                            break
-        except asyncio.TimeoutError:
-            logger.debug(f"[{self.ctx.uuid}] 宽容期超时 ({tolerance_sec}s)，未检测到语音")
-        except Exception as e:
-            logger.debug(f"[{self.ctx.uuid}] 宽容期 ASR 异常: {e}")
-        finally:
-            adapter.stop()
-
-        return result_text
 
     # ─────────────────────────────────────────────────────────
     # 动作处理器
