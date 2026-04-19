@@ -42,7 +42,9 @@ SEED_SCRIPTS = [
         "closing_barge_in": False,
         "conversation_barge_in": True,
         "barge_in_protect_start": 3,
-        "barge_in_protect_end": 3
+        "barge_in_protect_end": 3,
+        "tolerance_enabled": True,
+        "tolerance_ms": 1000
     },
     {
         "script_id": "insurance_renewal",
@@ -69,7 +71,9 @@ SEED_SCRIPTS = [
         "closing_barge_in": False,
         "conversation_barge_in": True,
         "barge_in_protect_start": 3,
-        "barge_in_protect_end": 3
+        "barge_in_protect_end": 3,
+        "tolerance_enabled": True,
+        "tolerance_ms": 1000
     },
     {
         "script_id": "loan_followup",
@@ -96,7 +100,9 @@ SEED_SCRIPTS = [
         "closing_barge_in": False,
         "conversation_barge_in": True,
         "barge_in_protect_start": 3,
-        "barge_in_protect_end": 3
+        "barge_in_protect_end": 3,
+        "tolerance_enabled": True,
+        "tolerance_ms": 1000
     },
     {
         "script_id": "marketing_event",
@@ -123,7 +129,9 @@ SEED_SCRIPTS = [
         "closing_barge_in": False,
         "conversation_barge_in": True,
         "barge_in_protect_start": 3,
-        "barge_in_protect_end": 3
+        "barge_in_protect_end": 3,
+        "tolerance_enabled": True,
+        "tolerance_ms": 1000
     }
 ]
 
@@ -176,7 +184,9 @@ async def seed_scripts(force: bool = False) -> list[str]:
                 closing_barge_in=seed.get("closing_barge_in", False),
                 conversation_barge_in=seed.get("conversation_barge_in", True),
                 barge_in_protect_start=seed.get("barge_in_protect_start", 3),
-                barge_in_protect_end=seed.get("barge_in_protect_end", 3)
+                barge_in_protect_end=seed.get("barge_in_protect_end", 3),
+                tolerance_enabled=seed.get("tolerance_enabled", True),
+                tolerance_ms=seed.get("tolerance_ms", 1000)
             )
             session.add(new_script)
             results.append(f"[新增] {sid} - {seed['name']}")
