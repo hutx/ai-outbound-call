@@ -351,7 +351,7 @@ class CallAgent:
             await self._cleanup()
 
     async def _conversation_loop(self):
-        """多轮对话主循环"""
+        """多轮对话主循环 — 先发后改策略"""
         # 开场白
         logger.info(f"[{self.ctx.uuid}] 🎙️ 播放开场白")
         await self._say_opening()
@@ -359,28 +359,22 @@ class CallAgent:
         silence_retries = 0
 
         while self.sm.should_continue() and self.session._connected:
-            # 监听用户（继续 _say 期间未完成的 ASR 监听）
+            # ★ 先发：监听用户，收到第一个有效文本后立即返回
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             cfg = self._last_barge_in_config
-            tolerance_config = await get_barge_in_config(self.ctx.script_id, "conversation")
             user_text, is_all_silent, is_asr_timeout = await self._listen_user(
                 barge_in_enabled=cfg["enabled"],
                 protect_start_ms=cfg["protect_start_ms"],
                 protect_end_ms=cfg["protect_end_ms"],
                 total_duration_ms=cfg["duration_ms"],
-                tolerance_enabled=tolerance_config.get("tolerance_enabled", True),
-                tolerance_ms=tolerance_config.get("tolerance_ms", 1000),
             )
             logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r} is_all_silent={is_all_silent} asr_timeout={is_asr_timeout}")
 
             if not user_text:
                 if is_all_silent:
-                    # 全程静音（VAD 未检测到有效语音），不算作无响应，继续等待
                     logger.info(f"[{self.ctx.uuid}] 本轮全静音，不计入无响应，继续监听")
                     continue
                 if is_asr_timeout:
-                    # ASR 超时但检测到人声，可能是背景噪音或用户自言自语
-                    # 累计计数，达到上限后主动询问
                     silence_retries += 1
                     if silence_retries > MAX_SILENCE_RETRIES:
                         logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
@@ -399,9 +393,47 @@ class CallAgent:
 
             logger.info(f"[{self.ctx.uuid}] 👤 {user_text}")
 
-            # LLM 推理
-            logger.info(f"[{self.ctx.uuid}] 🧠 开始调用 LLM...")
-            reply_text, action = await self._think_and_reply(user_text)
+            # ★ 先发后改：启动 LLM 任务 + 宽容期监听并行
+            tolerance_config = await get_barge_in_config(self.ctx.script_id, "conversation")
+            tolerance_enabled = tolerance_config.get("tolerance_enabled", False)
+            tolerance_ms = tolerance_config.get("tolerance_ms", 1000)
+
+            if tolerance_enabled:
+                # 先发：立即启动 LLM 任务
+                llm_task = asyncio.create_task(self._think_and_reply(user_text))
+                # 后改：并行启动宽容期监听
+                tolerance_task = asyncio.create_task(
+                    self._listen_tolerance(tolerance_ms)
+                )
+
+                done, pending = await asyncio.wait(
+                    [llm_task, tolerance_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if tolerance_task in done:
+                    # 宽容期内收到新文本 → 取消 LLM，合并后重新调用
+                    new_text = tolerance_task.result()
+                    if new_text:
+                        combined = f"{user_text} {new_text}".strip()
+                        logger.info(f"[{self.ctx.uuid}] 宽容期内合并文本: {combined!r}")
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        # 用合并后的文本重新调用 LLM
+                        reply_text, action = await self._think_and_reply(combined)
+                    else:
+                        # 宽容期无新文本，等待 LLM 完成
+                        reply_text, action = await llm_task
+                else:
+                    # LLM 先完成（宽容期内没收到新文本或超时）
+                    tolerance_task.cancel()
+                    await asyncio.gather(tolerance_task, return_exceptions=True)
+                    reply_text, action = await llm_task
+            else:
+                # 无宽容期：直接调用 LLM
+                reply_text, action = await self._think_and_reply(user_text)
+
             logger.info(f"[{self.ctx.uuid}] 🧠 LLM 返回: reply={reply_text[:50]!r} action={action}")
 
             # 播报（transfer 时先播再转，end 时先说再挂）
@@ -427,9 +459,7 @@ class CallAgent:
     # ─────────────────────────────────────────────────────────
     async def _listen_user(self, *, barge_in_enabled: bool = True,
                            protect_start_ms: int = 3000, protect_end_ms: int = 3000,
-                           total_duration_ms: float = 0,
-                           tolerance_enabled: bool = True,
-                           tolerance_ms: int = 1000) -> tuple[str, bool, bool]:
+                           total_duration_ms: float = 0) -> tuple[str, bool, bool]:
         """监听用户语音。
 
         Returns:
@@ -458,6 +488,18 @@ class CallAgent:
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
 
+        # ★ 清空队列中积累的残留音频（TTS 播放期间 forkzstream 持续捕获，
+        #    队列中可能包含 TTS 回声，导致 ASR 先识别到噪声而非用户语音）
+        drained = 0
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained > 0:
+            logger.info(f"[{self.ctx.uuid}] 🔊 清空残留音频队列: {drained} chunks")
+
         adapter = AudioStreamAdapter(
             audio_queue,
             vad_silence_ms=config.asr.vad_silence_ms,
@@ -470,9 +512,20 @@ class CallAgent:
         )
 
         # 噪声词过滤
-        NOISE_WORDS = {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
-                        "你好", "你好。", "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
-                        "好", "好。", "是", "是。"}
+        NOISE_WORDS = {
+            # 基础单字
+            "嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
+            "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
+            "好", "好。", "是", "是。",
+            "你好", "你好。",
+            # 重复语气词
+            "嗯嗯", "嗯嗯。", "好好", "好好。", "对对", "对对。", "哦哦", "哦哦。",
+            # 常见短语
+            "嗯，对吧。", "嗯，可以。", "就是。", "就是", "好吧。", "好吧",
+            "没事。", "没事",
+            # 常见英文
+            "ok", "ok。", "yes", "yes。", "no", "no。", "system", "system。",
+        }
 
         def _is_noise_word(text: str) -> bool:
             t = text.strip()
@@ -480,38 +533,47 @@ class CallAgent:
                 return True
             if t in NOISE_WORDS:
                 return True
-            if len(t) == 2 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and t[1] in {"。", "！", "?", "…"}:
+
+            # 规则1：纯英文单词（无中文字符，长度 < 10）
+            if not any('\u4e00' <= c <= '\u9fff' for c in t) and len(t) < 10:
                 return True
+
+            # 规则2：重复字符模式（如"嗯嗯。"），同一字符连续出现 ≥2 次 + 可选标点
+            stripped = t.rstrip('。！？?!，,、')
+            if len(stripped) >= 2 and len(set(stripped)) == 1:
+                return True
+
+            # 规则3：逗号分隔的语气词组合（如"嗯，对吧。"）
+            import re
+            if re.match(r'^[嗯哦啊呃哎喂好是对行你]+，[嗯哦啊呃哎喂好是对行你]+[。！？]?$', t):
+                return True
+
+            # 规则4：单字 + 标点（原有逻辑）
+            if len(t) <= 3 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and len(t) >= 2 and t[1] in {"。", "！", "?", "…", "，", "、"}:
+                return True
+
             return False
 
         final_text = ""
         asr_timed_out = False
-        first_valid_ts = 0.0  # 第一次拿到有效语音的时间戳
-
-        # 宽容期内额外等待时间：tolerance_ms 基础上加 3 秒给 ASR 处理
-        tolerance_extra_sec = max(3.0, tolerance_ms / 1000.0)
-        total_timeout = ASR_TIMEOUT + (tolerance_extra_sec if tolerance_enabled else 0)
 
         try:
-            async with asyncio.timeout(total_timeout):
+            async with asyncio.timeout(ASR_TIMEOUT):
                 async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
                     if result.is_final and result.text:
+                        # ★ 过滤 1：噪声词
                         if _is_noise_word(result.text):
                             logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
-                            continue  # 噪声词不 break，继续等
+                            continue  # 噪声词不 break，继续消费下一个语音段
+                        # ★ 过滤 2：RMS 能量过低（ASR VAD 误识别环境噪音）
+                        #    真实语音 RMS > 1500，噪音 RMS < 1000
+                        if adapter._max_rms < 1500:
+                            logger.info(f"[{self.ctx.uuid}] ASR 过滤低能量段: {result.text!r} (max_rms={adapter._max_rms} < 1500)")
+                            continue
+                        # ★ 先发后改：第一次拿到有效语音后立即返回
                         final_text = result.text
-                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f})")
-                        if first_valid_ts == 0.0:
-                            first_valid_ts = time.time()
-                        # ★ 宽容期：第一次拿到有效语音后，额外等 tolerance_extra_sec
-                        if tolerance_enabled and first_valid_ts > 0:
-                            elapsed = time.time() - first_valid_ts
-                            if elapsed >= tolerance_extra_sec:
-                                logger.debug(f"[{self.ctx.uuid}] 宽容期超时 ({elapsed:.1f}s >= {tolerance_extra_sec:.1f}s)")
-                                break
-                        else:
-                            # 不启用宽容期时，拿到有效语音后立即退出
-                            break
+                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, speech_ms={adapter._speech_ms:.0f}ms)")
+                        break
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
             asr_timed_out = True
@@ -537,6 +599,82 @@ class CallAgent:
 
         return final_text, adapter._is_all_silent, asr_timed_out
 
+    async def _listen_tolerance(self, tolerance_ms: int) -> str:
+        """宽容期内继续监听补充语音。
+
+        在 _listen_user 返回第一个有效文本后启动，
+        如果在 tolerance_ms 内收到新的非噪声有效文本，返回补充文本；
+        否则超时返回空字符串。
+
+        Returns:
+            补充文本（有新内容）或空字符串（超时/无有效内容）
+        """
+        # 复用 _is_noise_word 逻辑
+        NOISE_WORDS = {
+            "嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
+            "你", "你。", "对", "对。", "行", "行。", "喂", "喂。",
+            "好", "好。", "是", "是。",
+            "你好", "你好。",
+            "嗯嗯", "嗯嗯。", "好好", "好好。", "对对", "对对。", "哦哦", "哦哦。",
+            "嗯，对吧。", "嗯，可以。", "就是。", "就是", "好吧。", "好吧",
+            "没事。", "没事",
+            "ok", "ok。", "yes", "yes。", "no", "no。", "system", "system。",
+        }
+
+        def _is_noise(text: str) -> bool:
+            t = text.strip()
+            if not t:
+                return True
+            if t in NOISE_WORDS:
+                return True
+            if not any('\u4e00' <= c <= '\u9fff' for c in t) and len(t) < 10:
+                return True
+            stripped = t.rstrip('。！？?!，,、')
+            if len(stripped) >= 2 and len(set(stripped)) == 1:
+                return True
+            import re
+            if re.match(r'^[嗯哦啊呃哎喂好是对行你]+，[嗯哦啊呃哎喂好是对行你]+[。！？]?$', t):
+                return True
+            if len(t) <= 3 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and len(t) >= 2 and t[1] in {"。", "！", "?", "…", "，", "、"}:
+                return True
+            return False
+
+        try:
+            async with asyncio.timeout(tolerance_ms / 1000.0):
+                # 重新启动音频捕获和 ASR
+                audio_queue = await self.session.start_audio_capture()
+                # 清空残留
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                adapter = AudioStreamAdapter(
+                    audio_queue,
+                    vad_silence_ms=config.asr.vad_silence_ms,
+                    server_vad_mode=True,
+                )
+
+                async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
+                    if result.is_final and result.text:
+                        if _is_noise(result.text):
+                            logger.debug(f"[{self.ctx.uuid}] 宽容期过滤噪声: {result.text!r}")
+                            continue
+                        # ★ RMS 能量过滤（同主路径）
+                        if adapter._max_rms < 1500:
+                            logger.info(f"[{self.ctx.uuid}] 宽容期过滤低能量段: {result.text!r} (max_rms={adapter._max_rms})")
+                            continue
+                        adapter.stop()
+                        logger.info(f"[{self.ctx.uuid}] 宽容期收到补充语音: {result.text!r}")
+                        return result.text
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.ctx.uuid}] 宽容期超时 ({tolerance_ms}ms)")
+        except Exception as e:
+            logger.debug(f"[{self.ctx.uuid}] 宽容期异常: {e}")
+
+        return ""
+
     async def _barge_in_asr_loop_with_queue(self, adapter: AudioStreamAdapter,
                                              audio_capture_task: asyncio.Task):
         """后台 ASR 循环，等待音频队列就绪后再开始 barge-in 检测。
@@ -561,7 +699,7 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] barge-in 音频队列已就绪, 大小={audio_queue.qsize()}")
 
             async with asyncio.timeout(ASR_TIMEOUT):
-                async for result in self._asr_with_retry(adapter.stream()):
+                async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
                     if result.is_final and result.text:
                         # 过滤噪音词（背景噪音被 ASR 误识别）
                         if result.text.strip() in {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。", "喂", "喂。"}:
@@ -584,7 +722,7 @@ class CallAgent:
         """
         try:
             async with asyncio.timeout(ASR_TIMEOUT):
-                async for result in self._asr_with_retry(adapter.stream()):
+                async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
                     if result.is_final and result.text:
                         # 过滤噪音词（背景噪音被 ASR 误识别）
                         if result.text.strip() in {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。", "喂", "喂。"}:

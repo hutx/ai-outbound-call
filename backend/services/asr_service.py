@@ -240,6 +240,7 @@ class QwenRealtimeASRClient(BaseASR):
                         # 中间结果（实时转录文本）
                         text = (response.get('text', '') + response.get('stash', '')).strip()
                         if text:
+                            logger.info(f"Qwen ASR 中间结果: {text!r}")
                             try:
                                 result_queue.put_nowait(ASRResult(text=text, is_final=False))
                             except _queue.Full:
@@ -352,14 +353,13 @@ class QwenRealtimeASRClient(BaseASR):
 
             send_task = asyncio.create_task(_send())
 
-            # ★ 流式 ASR：发送和接收并发运行
-            #   Qwen 服务端 VAD 实时检测语音段结束，返回 is_final=True
-            #   收到后调用 adapter.stop() 让发送任务退出
+            # ★ 流式 ASR：发送和接收并发运行，保持连接持续监听多个语音段
+            #   直到 adapter.stop() 或超时才退出
             result_count = 0
             t0 = time.time()
+            keep_listening = True  # ★ 收到 is_final 后不关闭，继续等下一段
 
-            # 接收循环：收到 is_final=True 后立即停止发送
-            while True:
+            while keep_listening:
                 try:
                     item = await asyncio.wait_for(
                         loop.run_in_executor(None, result_queue.get, True, 15.0),
@@ -376,9 +376,8 @@ class QwenRealtimeASRClient(BaseASR):
                 yield item
                 if item.is_final:
                     final_text = item.text
-                    # ★ 收到最终结果，通知 adapter 停止发送
-                    adapter.stop()
-                    break
+                    # ★ 不再调用 adapter.stop()，保持连接继续监听下一段语音
+                    logger.debug(f"Qwen ASR: 产出 is_final={item.text!r}，继续监听...")
 
             # 等待发送任务完成（adapter.stop() 后会很快退出）
             send_task.cancel()

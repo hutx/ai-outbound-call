@@ -53,6 +53,8 @@ class ForkzstreamWebSocketServer:
         self._ready_events: dict[str, asyncio.Event] = {}
         # call_uuid → script_id 映射（从握手帧的 botid 字段提取）
         self._script_ids: dict[str, str] = {}
+        # call_uuid → bytearray 映射（TTS 发送音频，用于调试）
+        self._sent_audio: dict[str, bytearray] = {}
         # call_uuid → CallAgent task 映射
         self._call_agent_tasks: dict[str, asyncio.Task] = {}
         # 统计信息
@@ -177,6 +179,9 @@ class ForkzstreamWebSocketServer:
         try:
             await ws.send(chunk)
             self._stats["frames_sent"] += 1
+            # 🎵 收集发送的 TTS 音频
+            if call_uuid in self._sent_audio:
+                self._sent_audio[call_uuid].extend(chunk)
             return True
         except websockets.exceptions.ConnectionClosed:
             logger.warning(f"[forkzstream] 发送 TTS 音频时连接关闭: {call_uuid[:8]}")
@@ -291,6 +296,12 @@ class ForkzstreamWebSocketServer:
         call_uuid = None
         handshake_received = False
 
+        # 🎵 调试：分离保存 forkzstream 接收音频 + TTS 发送音频
+        import os
+        dump_dir = os.environ.get("FS_RECORDING_PATH", "/recordings") + "/debug"
+        os.makedirs(dump_dir, exist_ok=True)
+        recv_pcm = bytearray()
+
         try:
             async for frame in websocket:
                 if isinstance(frame, str):
@@ -310,6 +321,8 @@ class ForkzstreamWebSocketServer:
                                 queue = asyncio.Queue(maxsize=self.max_queue_size)
                                 self._sessions[call_uuid] = queue
                                 self._ws_connections[call_uuid] = websocket
+                                # 初始化 TTS 发送音频缓冲区
+                                self._sent_audio[call_uuid] = bytearray()
                                 # 存储话术 ID
                                 if botid:
                                     self._script_ids[call_uuid] = botid
@@ -351,6 +364,9 @@ class ForkzstreamWebSocketServer:
                         f"{len(frame)} bytes"
                     )
 
+                # 🎵 收集接收到的音频
+                recv_pcm.extend(frame)
+
                 # 入队
                 queue = self._sessions.get(call_uuid)
                 if queue is not None:
@@ -369,6 +385,30 @@ class ForkzstreamWebSocketServer:
         except Exception as e:
             logger.error(f"[forkzstream#{ws_id}] 连接异常: {e}")
         finally:
+            # 🎵 保存分离的音频文件
+            import time
+            import wave
+            tag = call_uuid[:8] if call_uuid else f"fs_{int(time.time())}"
+            if recv_pcm:
+                recv_path = os.path.join(dump_dir, f"forkzstream_recv_{tag}_{int(time.time())}.wav")
+                with wave.open(recv_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(bytes(recv_pcm))
+                dur = len(recv_pcm) / 16000.0
+                logger.info(f"[forkzstream#{ws_id}] 🎵 接收音频已保存: {recv_path} ({len(recv_pcm)} bytes, {dur:.1f}s)")
+            sent = self._sent_audio.pop(call_uuid, bytearray())
+            if sent:
+                sent_path = os.path.join(dump_dir, f"forkzstream_sent_{tag}_{int(time.time())}.wav")
+                with wave.open(sent_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(bytes(sent))
+                dur = len(sent) / 16000.0
+                logger.info(f"[forkzstream#{ws_id}] 🎵 发送音频已保存: {sent_path} ({len(sent)} bytes, {dur:.1f}s)")
+
             if call_uuid:
                 # ★ 断开信号：通知正在等待音频的 AudioStreamAdapter 快速退出，
                 #    避免 WS 断后 _listen_user 空等 15s 超时 → total_chunks=0。
