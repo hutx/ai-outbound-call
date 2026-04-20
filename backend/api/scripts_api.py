@@ -34,6 +34,11 @@ async def list_scripts(current_user: dict = Depends(require_auth)):
                 "barge_in_protect_end": s.barge_in_protect_end,
                 "tolerance_enabled": s.tolerance_enabled,
                 "tolerance_ms": s.tolerance_ms,
+                "no_response_timeout": s.no_response_timeout,
+                "no_response_mode": s.no_response_mode,
+                "no_response_max_count": s.no_response_max_count,
+                "no_response_hangup_msg": s.no_response_hangup_msg,
+                "no_response_hangup_enabled": s.no_response_hangup_enabled,
                 "is_active": s.is_active
             }
             for s in scripts
@@ -68,6 +73,11 @@ async def get_script(script_id: str, current_user: dict = Depends(require_auth))
             "barge_in_protect_end": script.barge_in_protect_end,
             "tolerance_enabled": script.tolerance_enabled,
             "tolerance_ms": script.tolerance_ms,
+            "no_response_timeout": script.no_response_timeout,
+            "no_response_mode": script.no_response_mode,
+            "no_response_max_count": script.no_response_max_count,
+            "no_response_hangup_msg": script.no_response_hangup_msg,
+            "no_response_hangup_enabled": script.no_response_hangup_enabled,
             "is_active": script.is_active
         }
     except HTTPException:
@@ -123,7 +133,12 @@ async def create_script(script_data: dict, current_user: dict = Depends(require_
             barge_in_protect_start=script_data.get("barge_in_protect_start", 3),
             barge_in_protect_end=script_data.get("barge_in_protect_end", 3),
             tolerance_enabled=script_data.get("tolerance_enabled", True),
-            tolerance_ms=script_data.get("tolerance_ms", 1000)
+            tolerance_ms=script_data.get("tolerance_ms", 1000),
+            no_response_timeout=script_data.get("no_response_timeout", 3),
+            no_response_mode=script_data.get("no_response_mode", "consecutive"),
+            no_response_max_count=script_data.get("no_response_max_count", 3),
+            no_response_hangup_msg=script_data.get("no_response_hangup_msg"),
+            no_response_hangup_enabled=script_data.get("no_response_hangup_enabled", True)
         )
 
         # 调用服务创建脚本
@@ -184,6 +199,16 @@ async def update_script(script_id: str, script_data: dict, current_user: dict = 
             update_data["tolerance_enabled"] = script_data["tolerance_enabled"]
         if "tolerance_ms" in script_data:
             update_data["tolerance_ms"] = script_data["tolerance_ms"]
+        if "no_response_timeout" in script_data:
+            update_data["no_response_timeout"] = script_data["no_response_timeout"]
+        if "no_response_mode" in script_data:
+            update_data["no_response_mode"] = script_data["no_response_mode"]
+        if "no_response_max_count" in script_data:
+            update_data["no_response_max_count"] = script_data["no_response_max_count"]
+        if "no_response_hangup_msg" in script_data:
+            update_data["no_response_hangup_msg"] = script_data["no_response_hangup_msg"]
+        if "no_response_hangup_enabled" in script_data:
+            update_data["no_response_hangup_enabled"] = script_data["no_response_hangup_enabled"]
 
         # 调用服务更新脚本
         success = await script_service.update_script(script_id, **update_data)
