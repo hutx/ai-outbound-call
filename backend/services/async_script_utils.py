@@ -174,3 +174,37 @@ async def get_barge_in_config(
             "tolerance_enabled": script_config.tolerance_enabled,
             "tolerance_ms": script_config.tolerance_ms,
         }
+
+
+async def get_no_response_config(script_id: str) -> dict:
+    """
+    获取话术的无回应配置。
+
+    Returns:
+        dict with keys:
+            timeout: int (秒), 默认 3
+            mode: str ("consecutive" | "cumulative"), 默认 "consecutive"
+            max_count: int, 默认 3
+            hangup_msg: str | None, 自定义挂断语
+            hangup_enabled: bool, 是否启用自定义挂断语
+            closing_script: str | None, 结束语（用于 hangup_enabled=False 时 fallback）
+    """
+    script_config = await script_service.get_script(script_id)
+    if not script_config:
+        return {
+            "timeout": 3,
+            "mode": "consecutive",
+            "max_count": 3,
+            "hangup_msg": None,
+            "hangup_enabled": True,
+            "closing_script": None,
+        }
+
+    return {
+        "timeout": script_config.no_response_timeout or 3,
+        "mode": script_config.no_response_mode if script_config.no_response_mode in ("consecutive", "cumulative") else "consecutive",
+        "max_count": script_config.no_response_max_count or 3,
+        "hangup_msg": script_config.no_response_hangup_msg,
+        "hangup_enabled": script_config.no_response_hangup_enabled if script_config.no_response_hangup_enabled is not None else True,
+        "closing_script": script_config.closing_script,
+    }
