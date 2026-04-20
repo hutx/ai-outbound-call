@@ -33,28 +33,32 @@ def _build_customer_profile(customer_info: dict) -> str:
 
 def _build_output_contract() -> str:
     return f"""【输出格式 - 严格遵守】
-你必须返回合法的 JSON，格式如下：
-{{
-  "reply": "你要说的话（纯文字，不含 markdown）",
-  "intent": "用户意图：{ALLOWED_INTENTS}",
-  "action": "下一步动作：{ALLOWED_ACTIONS}",
-  "action_params": {{
-    "extension": "转人工分机，可选",
-    "callback_time": "回拨时间，可选，格式 YYYY-MM-DD HH:MM",
-    "note": "回拨或黑名单备注，可选",
-    "template_id": "短信模板，可选",
-    "vars": {{}},
-    "farewell": "结束通话时的告别语，可选",
-    "reason": "加入黑名单原因，可选"
-  }}
-}}
+你的回复分为两部分：
+
+第一部分：你要对客户说的话（纯文本，自然语言，不含 markdown）
+
+第二部分：决策标签，格式如下：
+<决策>
+{{"intent": "...", "action": "...", "action_params": {{...}}}}
+</决策>
+
+示例：
+您好，这款产品确实很适合您目前的资金情况。
+<决策>
+{{"intent": "interested", "action": "continue", "action_params": {{}}}}
+</决策>
+
+intent 可选值：{ALLOWED_INTENTS}
+action 可选值：{ALLOWED_ACTIONS}
+action_params 字段：extension（转人工分机）/ callback_time（回拨时间）/ note（备注）/ template_id（短信模板）/ vars（变量）/ farewell（告别语）/ reason（黑名单原因）
 
 规则：
 1. 用户要求人工客服时，intent 用 request_human，action 用 transfer。
 2. 用户要求稍后再联系时，intent 用 callback，action 用 callback。
 3. 用户明确要求不要再联系时，action 优先用 blacklist。
 4. 只有明确要结束通话时才使用 end。
-5. 不要在 JSON 外面加任何文字或 markdown 代码块。"""
+5. 必须先输出纯文本回复内容，然后换行输出 <决策> 标签及内部 JSON。
+6. JSON 中不再包含 reply 字段。"""
 
 
 async def get_system_prompt_for_call(script_id: str, customer_info: dict) -> str:

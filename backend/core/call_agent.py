@@ -12,9 +12,10 @@ CallAgent — 生产级通话代理
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from backend.core.config import config
 from backend.core.state_machine import CallState, CallResult, CallContext, StateMachine
@@ -391,8 +392,8 @@ class CallAgent:
             tolerance_ms = tolerance_config.get("tolerance_ms", 1000)
 
             if tolerance_enabled:
-                # 先发：立即启动 LLM 任务
-                llm_task = asyncio.create_task(self._think_and_reply(user_text))
+                # 先发：立即启动 LLM 流式任务
+                llm_task = asyncio.create_task(self._think_and_reply_stream(user_text))
                 # 后改：并行启动宽容期监听
                 tolerance_task = asyncio.create_task(
                     self._listen_tolerance(tolerance_ms)
@@ -413,7 +414,7 @@ class CallAgent:
                             t.cancel()
                         await asyncio.gather(*pending, return_exceptions=True)
                         # 用合并后的文本重新调用 LLM
-                        reply_text, action = await self._think_and_reply(combined)
+                        reply_text, action = await self._think_and_reply_stream(combined)
                     else:
                         # 宽容期无新文本，等待 LLM 完成
                         reply_text, action = await llm_task
@@ -423,8 +424,8 @@ class CallAgent:
                     await asyncio.gather(tolerance_task, return_exceptions=True)
                     reply_text, action = await llm_task
             else:
-                # 无宽容期：直接调用 LLM
-                reply_text, action = await self._think_and_reply(user_text)
+                # 无宽容期：直接调用 LLM 流式
+                reply_text, action = await self._think_and_reply_stream(user_text)
 
             logger.info(f"[{self.ctx.uuid}] 🧠 LLM 返回: reply={reply_text[:50]!r} action={action}")
 
@@ -435,7 +436,7 @@ class CallAgent:
                     # TTS 被打断，但 ASR 已识别到有效文本，用该文本走 LLM
                     user_text = barge_text
                     logger.info(f"[{self.ctx.uuid}] ⚡ TTS 被打断，使用 barge-in 文本走 LLM: {user_text!r}")
-                    reply_text, action = await self._think_and_reply(user_text)
+                    reply_text, action = await self._think_and_reply_stream(user_text)
                     if reply_text:
                         await self._say(reply_text)
                     if action == "end":
@@ -701,22 +702,33 @@ class CallAgent:
         - 不阻塞 TTS 播放
         - 增加保护期检查：仅在保护期外才触发 barge-in
         """
-        # barge-in 噪声词过滤 — 比主路径宽松
-        # barge-in 场景：用户试图打断，任何语气词/单字都是有效打断信号
-        # 只过滤：纯英文（可能是系统噪声）+ 空文本
+        # barge-in 噪声词过滤 — 比主路径宽松，但也要过滤纯语气词
+        # barge-in 场景：用户试图打断时需要有一定语义内容
+        # 过滤：纯英文 + 空文本 + 纯单字语气词（用户听电话时的"嗯"不算打断）
         NOISE_WORDS = {
             "",  # 空文本
+            # 单字语气词 + 可选标点：用户听电话时的回应，不算有效打断
+            "嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。",
+            "喂", "喂。", "好", "好。", "对", "对。", "是", "是。",
+            "行", "行。", "你", "你。",
+            # 重复语气词
+            "嗯嗯", "嗯嗯。", "好好", "好好。", "对对", "对对。",
         }
 
         def _is_noise(text: str) -> bool:
-            """barge-in 宽松的噪声过滤：只丢弃纯英文和空文本"""
+            """barge-in 噪声过滤：丢弃纯英文、空文本、纯单字语气词"""
             t = text.strip()
             if not t:
+                return True
+            if t in NOISE_WORDS:
                 return True
             # 纯英文单词（无中文字符，长度 < 10）→ 可能是系统识别噪声
             if not any('\u4e00' <= c <= '\u9fff' for c in t) and len(t) < 10:
                 return True
-            # 不丢弃语气词！用户在打断场景说"嗯"/"好"/"对"就是有效的打断信号
+            # 单字 + 标点（如"嗯！""啊？"等变体）
+            if len(t) <= 3 and t[0] in {"嗯", "哦", "啊", "呃", "哎", "喂", "好", "是", "对", "行", "你"} and len(t) >= 2 and t[1] in {"。", "！", "?", "…", "，", "、"}:
+                return True
+            # 不是噪声，这是有效的打断内容
             return False
 
         try:
@@ -884,6 +896,97 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 🤖 {reply_text[:80]} [action={action}]")
 
         return reply_text, action
+
+    async def _think_and_reply_stream(self, user_text: str) -> tuple[str, str]:
+        """流式 LLM → 按句切分 → 逐句 TTS 播报 → 解析决策。
+
+        流程:
+        1. 启动 LLM 流式输出
+        2. 按句子边界（。！？）切分文本
+        3. 每凑够一句 → 立即调 _say() 播放（复用现有 TTS 流式 + barge-in）
+        4. 每句播放完检查 barge-in，如果被打断 → 取消 LLM stream，返回 barge-in 文本
+        5. LLM 流结束 → 解析 <决策> 获取 intent/action
+        6. 执行 action（transfer/end 等）
+
+        Returns:
+            ("", action) — reply_text 为空表示已逐句播报，调用方不应再调 _say()
+            或 (barge_text, "continue") — 被打断时返回 barge-in 文本
+        """
+        self.sm.transition(CallState.PROCESSING)
+        t0 = time.time()
+        sentence_buffer = ""
+        full_reply = ""
+        final_decision = None
+
+        try:
+            async for item in self.llm.chat_stream(
+                messages=self.ctx.messages,
+                system_prompt=self._system_prompt,
+            ):
+                if isinstance(item, dict):
+                    # 最终决策
+                    final_decision = item
+                    break
+
+                # item 是文本 token
+                sentence_buffer += item
+                full_reply += item
+
+                # 按句子边界切分
+                sentences = re.split(r'(?<=[。！？])', sentence_buffer)
+                if len(sentences) > 1:
+                    # 最后一项可能是不完整的句子（没有结束标点）
+                    complete_sentences = sentences[:-1]
+                    remainder = sentences[-1]
+                    sentence_buffer = remainder or ""
+
+                    for sentence in complete_sentences:
+                        sentence = sentence.strip()
+                        if not sentence:
+                            continue
+
+                        barge_occurred, barge_text = await self._say(sentence)
+                        if barge_occurred:
+                            # 播放期间被打断，停止后续句子，进入下一轮监听
+                            logger.info(f"[{self.ctx.uuid}] ⚡ 流式播报中被用户打断, text={barge_text!r}")
+                            return ("", "continue")
+
+            # 播放剩余的未完成句子（如有）
+            sentence_buffer = sentence_buffer.strip()
+            if sentence_buffer:
+                barge_occurred, _ = await self._say(sentence_buffer)
+                if barge_occurred:
+                    logger.info(f"[{self.ctx.uuid}] ⚡ 流式播报末尾被打断")
+                    return ("", "continue")
+
+            # 解析决策
+            if final_decision:
+                action = final_decision.get("action", "continue")
+            else:
+                # 未收到决策，用旧方法解析完整回复
+                parsed = self.llm._parse_response(full_reply)
+                action = parsed["action"]
+
+        except asyncio.CancelledError:
+            logger.info(f"[{self.ctx.uuid}] 流式 LLM 任务被取消")
+            return ("", "continue")
+        except Exception as e:
+            logger.error(f"[{self.ctx.uuid}] 流式 LLM 异常: {e}")
+            return ("抱歉，我这边网络有些问题，请问您方便稍后再聊吗？", "end")
+
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"[{self.ctx.uuid}] 流式 LLM 总耗时 {elapsed:.0f}ms, action={action}")
+
+        # 记录到对话历史
+        if full_reply.strip():
+            self.ctx.messages.append(
+                {"role": "assistant", "content": full_reply.strip(), "timestamp": int(time.time() * 1000)}
+            )
+            self.ctx.ai_utterances += 1
+            logger.info(f"[{self.ctx.uuid}] 🤖 {full_reply.strip()[:80]} [action={action}]")
+
+        # 返回空 reply_text 标记已逐句播报，_conversation_loop 不应再调 _say()
+        return ("", action)
 
     # ─────────────────────────────────────────────────────────
     # TTS + 播放（支持 barge-in，流式输出）
