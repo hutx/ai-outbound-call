@@ -27,7 +27,7 @@ from backend.services.forkzstream_session import ForkzstreamCallSession
 from backend.services.crm_service import crm
 from backend.utils.db import save_call_record
 from backend.utils.audio import SimpleVAD
-from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call, get_barge_in_config
+from backend.services.async_script_utils import get_system_prompt_for_call, get_opening_for_call, get_barge_in_config, get_no_response_config
 from backend.services.script_service import script_service
 
 logger = logging.getLogger(__name__)
@@ -349,7 +349,13 @@ class CallAgent:
         logger.info(f"[{self.ctx.uuid}] 🎙️ 播放开场白")
         await self._say_opening()
         logger.info(f"[{self.ctx.uuid}] 🎙️ 开场白播放完毕，进入监听模式")
-        silence_retries = 0
+        no_response_config = await get_no_response_config(self.ctx.script_id)
+        no_response_mode = no_response_config["mode"]
+        no_response_max_count = no_response_config["max_count"]
+        no_response_hangup_msg = no_response_config["hangup_msg"]
+        no_response_hangup_enabled = no_response_config["hangup_enabled"]
+        closing_script = no_response_config["closing_script"]
+        no_response_count = 0
 
         while self.sm.should_continue() and self.session._connected:
             # ★ 先发：监听用户，收到第一个有效文本后立即返回
@@ -364,25 +370,31 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 🔊 监听结束, user_text={user_text!r} is_all_silent={is_all_silent} asr_timeout={is_asr_timeout}")
 
             if not user_text:
+                # 无回应判定：VAD 全程静音 或 ASR 超时
                 if is_all_silent:
-                    logger.info(f"[{self.ctx.uuid}] 本轮全静音，不计入无响应，继续监听")
+                    logger.info(f"[{self.ctx.uuid}] 本轮全静音，不计入无回应，继续监听")
                     continue
-                if is_asr_timeout:
-                    silence_retries += 1
-                    if silence_retries > MAX_SILENCE_RETRIES:
-                        logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
-                        break
-                    logger.info(f"[{self.ctx.uuid}] 第 {silence_retries} 次无响应（ASR 超时），追问")
-                    await self._say("您好，请问您还在吗？")
-                    continue
-                silence_retries += 1
-                if silence_retries > MAX_SILENCE_RETRIES:
-                    logger.info(f"[{self.ctx.uuid}] 连续 {silence_retries} 次无响应，结束通话")
+
+                no_response_count += 1
+                if no_response_count >= no_response_max_count:
+                    # 达到最大次数，播放挂断语并结束
+                    if no_response_hangup_enabled and no_response_hangup_msg:
+                        hangup_msg = no_response_hangup_msg
+                    elif closing_script:
+                        hangup_msg = closing_script
+                    else:
+                        hangup_msg = "感谢接听，再见！"
+                    logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语并结束通话")
+                    await self._say(hangup_msg)
                     break
-                logger.info(f"[{self.ctx.uuid}] 第 {silence_retries} 次无响应，追问")
+
+                logger.info(f"[{self.ctx.uuid}] 第 {no_response_count} 次无回应（{no_response_mode}），追问")
                 await self._say("您好，请问您还在吗？")
                 continue
-            silence_retries = 0
+
+            # 用户有效回应
+            if no_response_mode == "consecutive":
+                no_response_count = 0
 
             logger.info(f"[{self.ctx.uuid}] 👤 {user_text}")
 
