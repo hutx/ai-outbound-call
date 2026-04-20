@@ -491,7 +491,7 @@ class CallAgent:
         # 通话已断开时跳过 ASR
         if not self.session._connected:
             logger.info(f"[{self.ctx.uuid}] 会话已断开，跳过 ASR")
-            return "", False
+            return "", False, False
 
         # ★ 优化5：如果 _say 设置了提前启动信号，等待它
         if not self._main_asr_ready.is_set():
