@@ -62,7 +62,10 @@
       "Bash(ldd:*)",
       "Bash(docker pull:*)",
       "Bash(do docker:*)",
-      "Bash(docker buildx:*)"
+      "Bash(docker buildx:*)",
+      "Bash(pip show:*)",
+      "Bash(git stash:*)",
+      "Bash(wc:*)"
     ]
   }
 }
