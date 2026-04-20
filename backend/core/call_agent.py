@@ -198,19 +198,9 @@ class AudioStreamAdapter:
                         #    导致 ASR 收到 0 chunks → NO_VALID_AUDIO_ERROR
                         #    ASR 服务端自己能处理静音音频，不需要我们过滤
 
-                # 检查打断策略：只有 enabled 且不在保护期才允许 barge-in
-                should_barge_in = False
-                if has_speech and self._barge_in_enabled and self._play_start_time is not None:
-                    elapsed_ms = (time.time() - self._play_start_time) * 1000
-                    in_protect_start = elapsed_ms < self._protect_start_ms
-                    in_protect_end = False
-                    if self._total_duration_ms > 0:
-                        remaining_ms = self._total_duration_ms - elapsed_ms
-                        in_protect_end = remaining_ms < self._protect_end_ms
-                    should_barge_in = not in_protect_start and not in_protect_end
-
-                if should_barge_in and self._barge_in_event and not self._barge_in_event.is_set():
-                    self._barge_in_event.set()
+                # ★ 修复：禁用本地 VAD 触发 barge-in
+                #    只让 ASR 识别到有意义文本后才触发 barge-in（在 _barge_in_asr_loop_with_queue 中）
+                #    本地 VAD 太敏感，会在 ASR 识别前就触发，导致 barge-in 文本为空
 
                 # 写入调试文件
                 dump_bytes += len(chunk)
@@ -269,6 +259,8 @@ class CallAgent:
         self._script_config = None  # 话术脚本配置，用于获取打断策略
         self._barge_in = asyncio.Event()
         self._barge_in.set()  # 初始置位（表示目前没有在播放）
+        self._barge_in_text: str = ""  # barge-in ASR 识别到的文本
+        self._barge_in_asr_task: Optional[asyncio.Task] = None  # 当前 barge-in ASR 任务
         # ★ 优化5：主 ASR 监听就绪信号（由 _say 在 TTS 播放结束前设置）
         self._main_asr_ready = asyncio.Event()
         self._main_asr_ready.set()  # 初始置位（第一次监听不需要等待）
@@ -438,7 +430,21 @@ class CallAgent:
 
             # 播报（transfer 时先播再转，end 时先说再挂）
             if reply_text and action not in ("transfer",):
-                await self._say(reply_text)
+                barge_in_occurred, barge_text = await self._say(reply_text)
+                if barge_in_occurred and barge_text:
+                    # TTS 被打断，但 ASR 已识别到有效文本，用该文本走 LLM
+                    user_text = barge_text
+                    logger.info(f"[{self.ctx.uuid}] ⚡ TTS 被打断，使用 barge-in 文本走 LLM: {user_text!r}")
+                    reply_text, action = await self._think_and_reply(user_text)
+                    if reply_text:
+                        await self._say(reply_text)
+                    if action == "end":
+                        break
+                    continue
+                elif barge_in_occurred:
+                    # TTS 被打断但没拿到文本，进入下一轮监听
+                    logger.info(f"[{self.ctx.uuid}] ⚡ TTS 被打断但无 barge-in 文本，进入下一轮监听")
+                    continue
 
             if action == "end":
                 break
@@ -485,6 +491,14 @@ class CallAgent:
             self._main_asr_ready.clear()
 
         audio_queue = await self.session.start_audio_capture()
+
+        # ★ 取消上一轮残留的 barge-in ASR 任务（防止两个 ASR 同时运行）
+        if self._barge_in_asr_task and not self._barge_in_asr_task.done():
+            self._barge_in_asr_task.cancel()
+            await asyncio.gather(self._barge_in_asr_task, return_exceptions=True)
+            self._barge_in_asr_task = None
+            logger.info(f"[{self.ctx.uuid}] 已取消残留的 barge-in ASR 任务")
+
         queue_size = audio_queue.qsize()
         logger.info(f"[{self.ctx.uuid}] 🔊 开始监听, 音频队列当前大小={queue_size}")
 
@@ -676,13 +690,35 @@ class CallAgent:
         return ""
 
     async def _barge_in_asr_loop_with_queue(self, adapter: AudioStreamAdapter,
-                                             audio_capture_task: asyncio.Task):
+                                             audio_capture_task: asyncio.Task,
+                                             protect_start_ms: int = 0,
+                                             protect_end_ms: int = 0,
+                                             tts_start_time: float = 0):
         """后台 ASR 循环，等待音频队列就绪后再开始 barge-in 检测。
 
         与 _barge_in_asr_loop 的区别：
         - 接收一个 Task（start_audio_capture），等待其完成后获取真实队列
         - 不阻塞 TTS 播放
+        - 增加保护期检查：仅在保护期外才触发 barge-in
         """
+        # barge-in 噪声词过滤 — 比主路径宽松
+        # barge-in 场景：用户试图打断，任何语气词/单字都是有效打断信号
+        # 只过滤：纯英文（可能是系统噪声）+ 空文本
+        NOISE_WORDS = {
+            "",  # 空文本
+        }
+
+        def _is_noise(text: str) -> bool:
+            """barge-in 宽松的噪声过滤：只丢弃纯英文和空文本"""
+            t = text.strip()
+            if not t:
+                return True
+            # 纯英文单词（无中文字符，长度 < 10）→ 可能是系统识别噪声
+            if not any('\u4e00' <= c <= '\u9fff' for c in t) and len(t) < 10:
+                return True
+            # 不丢弃语气词！用户在打断场景说"嗯"/"好"/"对"就是有效的打断信号
+            return False
+
         try:
             # 等待音频采集就绪（最多 10 秒）
             try:
@@ -699,15 +735,64 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] barge-in 音频队列已就绪, 大小={audio_queue.qsize()}")
 
             async with asyncio.timeout(ASR_TIMEOUT):
+                # ★ 调试：跟踪 barge-in ASR 中间结果和音频统计
+                _barge_asr_chunk_count = 0
+                _barge_asr_interim_count = 0
+
                 async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
-                    if result.is_final and result.text:
-                        # 过滤噪音词（背景噪音被 ASR 误识别）
-                        if result.text.strip() in {"嗯", "嗯。", "哦", "哦。", "啊", "啊。", "呃", "呃。", "哎", "哎。", "喂", "喂。"}:
+                    _barge_asr_chunk_count += 1
+                    if not result.is_final:
+                        _barge_asr_interim_count += 1
+                        # ★ 关键优化：用中间结果触发 barge-in（不等 is_final）
+                        #    is_final 需要用户说完后等 5-10s（服务端 VAD 静音超时），
+                        #    中间结果已经能证明用户在说话，足够触发打断。
+                        if result.text and not _is_noise(result.text):
+                            # 检查保护期
+                            in_protect = False
+                            if tts_start_time > 0:
+                                elapsed_ms = (time.time() - tts_start_time) * 1000
+                                if elapsed_ms < protect_start_ms:
+                                    in_protect = True
+                                    logger.debug(f"[{self.ctx.uuid}] barge-in 中间结果在保护期内: {result.text!r} ({elapsed_ms:.0f}ms < {protect_start_ms}ms)")
+                            if not in_protect:
+                                logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 中间结果触发: {result.text!r}")
+                                self._barge_in_text = result.text
+                                if not self._barge_in.is_set():
+                                    self._barge_in.set()
+                        else:
+                            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 中间结果 #{_barge_asr_interim_count}: {result.text!r}")
+                        continue
+                    if result.text:
+                        # ★ 过滤 1：噪声词（宽松版，只丢弃纯英文和空文本）
+                        if _is_noise(result.text):
                             logger.debug(f"[{self.ctx.uuid}] barge-in ASR 过滤噪声: {result.text!r}")
                             continue
-                        logger.info(f"[{self.ctx.uuid}] barge-in ASR: {result.text!r}")
+                        # ★ 不再过滤 RMS 能量过低
+                        #    barge-in 场景下，即使 RMS 低，ASR 识别到中文文本就是有效打断
+                        # if adapter._max_rms < 1500: ... ← 已移除
+                        # ★ 过滤 3：检查保护期
+                        if tts_start_time > 0:
+                            elapsed_ms = (time.time() - tts_start_time) * 1000
+                            if elapsed_ms < protect_start_ms:
+                                logger.debug(f"[{self.ctx.uuid}] barge-in ASR: 在保护期内（起始 {elapsed_ms:.0f}ms < {protect_start_ms}ms）")
+                                continue
+                            if protect_end_ms > 0:
+                                # 流式模式 total_duration_ms=0，跳过结束保护期检查
+                                pass
+
+                        logger.info(f"[{self.ctx.uuid}] ⚡ barge-in ASR 触发(is_final): {result.text!r}")
+                        # ★ 保存识别文本，供 _say() 返回给主循环使用
+                        self._barge_in_text = result.text
                         if not self._barge_in.is_set():
                             self._barge_in.set()
+
+                # ★ 调试：ASR 循环结束统计
+                logger.info(
+                    f"[{self.ctx.uuid}] barge-in ASR 循环结束: "
+                    f"chunks={_barge_asr_chunk_count}, interim={_barge_asr_interim_count}, "
+                    f"adapter_chunks={adapter._total_chunks}, adapter_speech={adapter._speech_chunks}, "
+                    f"adapter_max_rms={adapter._max_rms}, adapter_speech_ms={adapter._speech_ms:.0f}ms"
+                )
         except asyncio.TimeoutError:
             logger.debug(f"[{self.ctx.uuid}] barge-in ASR 超时")
         except Exception as e:
@@ -804,9 +889,16 @@ class CallAgent:
     # TTS + 播放（支持 barge-in，流式输出）
     # ─────────────────────────────────────────────────────────
     async def _say(self, text: str, record: bool = True,
-                   speech_type: str = "conversation"):
+                   speech_type: str = "conversation") -> tuple[bool, str]:
+        """播放 TTS 文本。
+
+        Returns:
+            (barge_in_occurred, barge_in_text)
+            - barge_in_occurred=True: 被打断，barge_in_text 为 ASR 识别到的文本（可能为空）
+            - barge_in_occurred=False: 正常播放完成，barge_in_text 为空
+        """
         if not text or not self.session._connected:
-            return
+            return False, ""
         self.sm.transition(CallState.AI_SPEAKING)
 
         # 获取打断策略配置
@@ -836,8 +928,10 @@ class CallAgent:
 
             # barge-in：如果用户已经开始说话则跳过播放
             if self._barge_in.is_set():
-                logger.debug(f"[{self.ctx.uuid}] barge-in 检测到，跳过播放")
-                return
+                barge_text = self._barge_in_text
+                self._barge_in_text = ""  # 清空
+                logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 检测到，跳过播放, text={barge_text!r}")
+                return True, barge_text
 
             # ★ 关键修复：在 TTS 播放期间启动后台 ASR 监听
             #    这样用户可以在 TTS 播放期间（除保护期外）打断 AI
@@ -855,25 +949,56 @@ class CallAgent:
             # 后台启动音频采集（不阻塞 TTS）
             audio_capture_task = asyncio.create_task(self.session.start_audio_capture())
             # 启动后台 ASR 任务（不阻塞 TTS 播放）
-            barge_in_asr_task = asyncio.create_task(
-                self._barge_in_asr_loop_with_queue(barge_in_adapter, audio_capture_task)
+            self._barge_in_asr_task = asyncio.create_task(
+                self._barge_in_asr_loop_with_queue(
+                    barge_in_adapter, audio_capture_task,
+                    protect_start_ms=protect_start_ms,
+                    protect_end_ms=protect_end_ms,
+                    tts_start_time=t0,
+                )
             )
             logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动（后台音频采集中）")
 
-            # TTS 播放：边合成边播（FIFO 流式）
-            await self.session.play_stream(
-                audio_chunks,
-                timeout=60.0,
-            )
+            # ★ TTS 播放：逐 chunk 检查 barge-in，被打断则立即停止
+            barge_in_detected = False
+            async for chunk in audio_chunks:
+                if not chunk:
+                    continue
+                # 每收到一个 TTS chunk 就检查是否被用户打断
+                if self._barge_in.is_set():
+                    logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 触发，停止 TTS 播放 (已播 {t0:.1f}s)")
+                    barge_in_detected = True
+                    # 停止 FreeSWITCH 端播放
+                    await self.session.stop_playback()
+                    break
+                # 发送音频 chunk
+                sent = await self.session.forkzstream_ws_server.send_audio(self.session._uuid, chunk)
+                if not sent:
+                    logger.warning(f"[{self.ctx.uuid}] TTS 音频发送失败")
+                    break
+
+            if barge_in_detected:
+                # 被打断：立即取消后台 ASR 任务，不等待超时
+                barge_in_adapter.stop()
+                self._barge_in_asr_task.cancel()
+                await asyncio.gather(self._barge_in_asr_task, return_exceptions=True)
+                self._barge_in_asr_task = None
+                # 获取 barge-in ASR 识别到的文本
+                barge_text = self._barge_in_text
+                self._barge_in_text = ""  # 清空
+                logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 处理完成, text={barge_text!r}")
+                return True, barge_text
 
             # TTS 播放完成后设置主 ASR 就绪
             self._main_asr_ready.set()
 
             logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
 
-            # 停止后台 ASR 任务
-            barge_in_adapter.stop()
-            await asyncio.gather(barge_in_asr_task, return_exceptions=True)
+            # ★ 关键修复：TTS 播放完成后不取消 barge-in ASR 任务
+            #    让它在 _listen_user 启动前继续监听用户语音（填补 TTS→listen 的空窗期）
+            #    barge-in ASR 会在 ASR_TIMEOUT 后自行退出，或被 _listen_user 的新 ASR 替代
+            # barge_in_adapter.stop()  ← 已移除
+            # await asyncio.gather(...) ← 已移除
 
         except asyncio.TimeoutError:
             logger.error(f"[{self.ctx.uuid}] TTS 超时")
@@ -881,6 +1006,8 @@ class CallAgent:
             logger.error(f"[{self.ctx.uuid}] TTS/播放失败: {e}", exc_info=True)
         finally:
             self._barge_in.set()  # 播放结束，允许新一轮录音
+
+        return False, ""
 
     # ─────────────────────────────────────────────────────────
     # 动作处理器
