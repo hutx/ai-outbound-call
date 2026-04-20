@@ -425,6 +425,37 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <label>宽容时间（毫秒）</label>
         <input id="sf-tolerance-ms" type="number" value="1000" min="0" max="10000" step="100"/>
       </div>
+      <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px;margin-bottom:12px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px">无回应配置</div>
+        <div class="form-group">
+          <label>计数模式</label>
+          <select id="sf-no-response-mode">
+            <option value="consecutive">连续无回应</option>
+            <option value="cumulative">累计无回应</option>
+          </select>
+          <div class="form-hint">连续：用户回应后清零；累计：整个通话累计计数</div>
+        </div>
+        <div style="display:flex;gap:16px">
+          <div class="form-group" style="flex:1">
+            <label>无回应超时（秒）</label>
+            <input id="sf-no-response-timeout" type="number" value="3" min="1" max="30"/>
+          </div>
+          <div class="form-group" style="flex:1">
+            <label>触发挂断次数</label>
+            <input id="sf-no-response-max-count" type="number" value="3" min="1" max="10"/>
+          </div>
+        </div>
+        <div class="form-group">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input id="sf-no-response-hangup-enabled" type="checkbox" checked/> 启用自定义挂断语
+          </label>
+        </div>
+        <div class="form-group">
+          <label>挂断语</label>
+          <textarea id="sf-no-response-hangup-msg" rows="2">感谢你的接听，让我们下次再联系，再见！</textarea>
+          <div class="form-hint">不启用时使用结束语替代</div>
+        </div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('script-modal')">取消</button>
@@ -771,6 +802,11 @@ function openCreateScript(){
   $('sf-protect-end').value=3;
   $('sf-tolerance-enabled').checked=true;
   $('sf-tolerance-ms').value=1000;
+  $('sf-no-response-mode').value='consecutive';
+  $('sf-no-response-timeout').value=3;
+  $('sf-no-response-max-count').value=3;
+  $('sf-no-response-hangup-enabled').checked=true;
+  $('sf-no-response-hangup-msg').value='感谢你的接听，让我们下次再联系，再见！';
   openModalDirect('script-modal');
 }
 
@@ -793,6 +829,11 @@ async function openEditScript(scriptId){
     $('sf-protect-end').value=d.barge_in_protect_end??3;
     $('sf-tolerance-enabled').checked=d.tolerance_enabled!==false;
     $('sf-tolerance-ms').value=d.tolerance_ms??1000;
+    $('sf-no-response-mode').value=d.no_response_mode||'consecutive';
+    $('sf-no-response-timeout').value=d.no_response_timeout??3;
+    $('sf-no-response-max-count').value=d.no_response_max_count??3;
+    $('sf-no-response-hangup-enabled').checked=d.no_response_hangup_enabled!==false;
+    $('sf-no-response-hangup-msg').value=d.no_response_hangup_msg||'感谢你的接听，让我们下次再联系，再见！';
     openModalDirect('script-modal');
   }catch(e){ notify('加载话术详情失败: '+e.message,'err') }
 }
@@ -823,7 +864,12 @@ async function saveScript(){
     barge_in_protect_start: parseInt($('sf-protect-start').value)||3,
     barge_in_protect_end: parseInt($('sf-protect-end').value)||3,
     tolerance_enabled: $('sf-tolerance-enabled').checked,
-    tolerance_ms: parseInt($('sf-tolerance-ms').value)||1000
+    tolerance_ms: parseInt($('sf-tolerance-ms').value)||1000,
+    no_response_mode: $('sf-no-response-mode').value,
+    no_response_timeout: parseInt($('sf-no-response-timeout').value)||3,
+    no_response_max_count: parseInt($('sf-no-response-max-count').value)||3,
+    no_response_hangup_enabled: $('sf-no-response-hangup-enabled').checked,
+    no_response_hangup_msg: $('sf-no-response-hangup-msg').value.trim()||null,
   };
 
   try{
@@ -875,6 +921,15 @@ async function viewScriptDetail(scriptId){
           <tr><td style="color:var(--muted);padding:6px 10px">开始保护期</td><td style="padding:6px 10px">${d.barge_in_protect_start??3} 秒</td></tr>
           <tr><td style="color:var(--muted);padding:6px 10px">结束保护期</td><td style="padding:6px 10px">${d.barge_in_protect_end??3} 秒</td></tr>
           <tr><td style="color:var(--muted);padding:6px 10px">宽容时间</td><td style="padding:6px 10px">${d.tolerance_enabled?d.tolerance_ms+' ms':'<span style="color:var(--muted)">未启用</span>'}</td></tr>
+        </table>
+      </div>
+      <div style="margin-top:14px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">无回应配置</div>
+        <table style="width:100%">
+          <tr><td style="color:var(--muted);width:100px;padding:6px 10px">计数模式</td><td style="padding:6px 10px">${d.no_response_mode==='cumulative'?'累计':'连续'}</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">无回应超时</td><td style="padding:6px 10px">${d.no_response_timeout??3} 秒</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">挂断次数</td><td style="padding:6px 10px">${d.no_response_max_count??3} 次</td></tr>
+          <tr><td style="color:var(--muted);padding:6px 10px">挂断语</td><td style="padding:6px 10px">${d.no_response_hangup_enabled?'<span style="color:var(--green)">● 已启用</span>':'<span style="color:var(--muted)">● 使用结束语</span>'}</td></tr>
         </table>
       </div>
     `;
