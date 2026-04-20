@@ -35,3 +35,10 @@ class CallScript(Base):
     # 宽容时间配置
     tolerance_enabled = Column(Boolean, nullable=False, default=True)  # 是否启用宽容时间
     tolerance_ms = Column(Integer, nullable=False, default=1000)  # TTS 播放后宽容时间（毫秒）
+
+    # 无回应配置
+    no_response_timeout = Column(Integer, nullable=False, default=3)  # 无回应判定超时（秒）
+    no_response_mode = Column(String(20), nullable=False, default='consecutive')  # consecutive / cumulative
+    no_response_max_count = Column(Integer, nullable=False, default=3)  # 触发挂断次数
+    no_response_hangup_msg = Column(Text)  # 自定义挂断语
+    no_response_hangup_enabled = Column(Boolean, nullable=False, default=True)  # 是否启用自定义挂断语
