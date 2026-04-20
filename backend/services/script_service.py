@@ -50,6 +50,11 @@ class ScriptConfig:
     barge_in_protect_end: int = 3
     tolerance_enabled: bool = True
     tolerance_ms: int = 1000
+    no_response_timeout: int = 3
+    no_response_mode: str = "consecutive"
+    no_response_max_count: int = 3
+    no_response_hangup_msg: Optional[str] = None
+    no_response_hangup_enabled: bool = True
 
 
 class ScriptService:
@@ -92,7 +97,12 @@ class ScriptService:
                     barge_in_protect_start=db_script.barge_in_protect_start,
                     barge_in_protect_end=db_script.barge_in_protect_end,
                     tolerance_enabled=db_script.tolerance_enabled,
-                    tolerance_ms=db_script.tolerance_ms
+                    tolerance_ms=db_script.tolerance_ms,
+                    no_response_timeout=db_script.no_response_timeout,
+                    no_response_mode=db_script.no_response_mode,
+                    no_response_max_count=db_script.no_response_max_count,
+                    no_response_hangup_msg=db_script.no_response_hangup_msg,
+                    no_response_hangup_enabled=db_script.no_response_hangup_enabled
                 )
 
                 # 加入缓存
@@ -128,7 +138,12 @@ class ScriptService:
                         barge_in_protect_start=db_script.barge_in_protect_start,
                         barge_in_protect_end=db_script.barge_in_protect_end,
                         tolerance_enabled=db_script.tolerance_enabled,
-                        tolerance_ms=db_script.tolerance_ms
+                        tolerance_ms=db_script.tolerance_ms,
+                        no_response_timeout=db_script.no_response_timeout,
+                        no_response_mode=db_script.no_response_mode,
+                        no_response_max_count=db_script.no_response_max_count,
+                        no_response_hangup_msg=db_script.no_response_hangup_msg,
+                        no_response_hangup_enabled=db_script.no_response_hangup_enabled
                     )
                     scripts.append(script_config)
 
@@ -193,7 +208,12 @@ class ScriptService:
                     barge_in_protect_start=script_config.barge_in_protect_start,
                     barge_in_protect_end=script_config.barge_in_protect_end,
                     tolerance_enabled=script_config.tolerance_enabled,
-                    tolerance_ms=script_config.tolerance_ms
+                    tolerance_ms=script_config.tolerance_ms,
+                    no_response_timeout=script_config.no_response_timeout,
+                    no_response_mode=script_config.no_response_mode,
+                    no_response_max_count=script_config.no_response_max_count,
+                    no_response_hangup_msg=script_config.no_response_hangup_msg,
+                    no_response_hangup_enabled=script_config.no_response_hangup_enabled
                 )
 
                 session.add(new_script)
