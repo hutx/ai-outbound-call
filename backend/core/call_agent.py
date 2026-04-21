@@ -926,10 +926,15 @@ class CallAgent:
 
                 # item 是文本 token
                 # ★ 过滤决策标签及其内容，防止泄漏到 full_reply 和消息历史
-                if "<决策>" in item:
-                    item = item.split("<决策>")[0]
+                #    注意：<决策> 可能被跨 token 分割（如 '<' 和 '决策>'），
+                #    所以需要在累积后的 sentence_buffer 中检测
+                if "<决策>" in item or "决策>" in item or "</决策>" in item:
+                    # 截断 item，只保留决策标签前的部分
+                    for marker in ("<决策>", "决策>", "</决策>"):
+                        if marker in item:
+                            item = item.split(marker)[0]
+                            break
                     if not item.strip():
-                        # 决策标签前的文本为空，跳过
                         continue
 
                 logger.debug(f"[{self.ctx.uuid}] LLM token: {item!r}, sentence_buffer 累计: {sentence_buffer!r}")
@@ -957,7 +962,12 @@ class CallAgent:
                             return ("", "continue")
 
             # 播放剩余的未完成句子（如有）
+            # ★ 清除 sentence_buffer 中可能残留的决策标签内容
             sentence_buffer = sentence_buffer.strip()
+            if "<" in sentence_buffer and ("决策" in sentence_buffer or "decision" in sentence_buffer.lower()):
+                # 截取到第一个 < 之前的内容
+                idx = sentence_buffer.find("<")
+                sentence_buffer = sentence_buffer[:idx].strip()
             logger.info(f"[{self.ctx.uuid}] 流式 LLM 结束, sentence_buffer={sentence_buffer!r}, full_reply 长度={len(full_reply)}")
             if sentence_buffer:
                 logger.info(f"[{self.ctx.uuid}] 📢 流式播报(残余): {sentence_buffer[:100]!r}")
@@ -985,10 +995,15 @@ class CallAgent:
         elapsed = (time.time() - t0) * 1000
         logger.info(f"[{self.ctx.uuid}] 流式 LLM 总耗时 {elapsed:.0f}ms, action={action}")
 
-        # 记录到对话历史
-        if full_reply.strip():
+        # 记录到对话历史 — 清除决策标签内容
+        full_reply_clean = full_reply.strip()
+        # 截断到第一个决策标记之前
+        for marker in ("<决策>", "决策>", "</决策>"):
+            if marker in full_reply_clean:
+                full_reply_clean = full_reply_clean.split(marker)[0].strip()
+        if full_reply_clean:
             self.ctx.messages.append(
-                {"role": "assistant", "content": full_reply.strip(), "timestamp": int(time.time() * 1000)}
+                {"role": "assistant", "content": full_reply_clean, "timestamp": int(time.time() * 1000)}
             )
             self.ctx.ai_utterances += 1
             logger.info(f"[{self.ctx.uuid}] 🤖 {full_reply.strip()[:80]} [action={action}]")
