@@ -171,8 +171,11 @@ class AppConfig:
     max_concurrent_calls: int = 50
     api_port: int = 8000
     debug: bool = False
-    # 单路通话最长时长（秒），超时强制挂断
+    # 单路通话最长时长（秒），超时强制挂断（保留兼容）
     max_call_duration: int = 300
+    # ★ 通话时长限制（新增）
+    max_call_duration_seconds: int = 300
+    call_end_buffer_seconds: int = 20
     # API 鉴权 Token（空 = 开放，仅限开发）
     api_token: str = ""
 
@@ -181,6 +184,9 @@ class AppConfig:
         self.api_port = _env_int("API_PORT", self.api_port)
         self.debug = _env_bool("DEBUG", self.debug)
         self.max_call_duration = _env_int("MAX_CALL_DURATION", self.max_call_duration)
+        # ★ 通话时长限制（新增）
+        self.max_call_duration_seconds = _env_int("MAX_CALL_DURATION_SECONDS", self.max_call_duration_seconds)
+        self.call_end_buffer_seconds = _env_int("CALL_END_BUFFER_SECONDS", self.call_end_buffer_seconds)
         self.api_token = _env("API_TOKEN", self.api_token)
         self.freeswitch = FreeSwitchConfig()
         self.asr = ASRConfig()
