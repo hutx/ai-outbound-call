@@ -153,18 +153,22 @@ class LLMService:
 
                             if in_decision:
                                 decision_buffer += text
+                                logger.debug(f"[LLM流式] <决策>内: {text!r}, 累计: {decision_buffer[:200]!r}")
                                 if "</决策>" in decision_buffer:
                                     json_str = decision_buffer.split("</决策>")[0].strip()
+                                    logger.info(f"[LLM流式] 决策标签完整: {json_str[:200]!r}")
                                     try:
                                         decision_json = json.loads(json_str)
+                                        logger.info(f"[LLM流式] 决策解析成功: intent={decision_json.get('intent')}, action={decision_json.get('action')}")
                                     except json.JSONDecodeError:
-                                        logger.warning(f"决策 JSON 解析失败: {json_str[:120]}")
+                                        logger.warning(f"[LLM流式] 决策 JSON 解析失败: {json_str[:200]}")
                                     break
                                 continue
 
                             reply_buffer += text
                             if "<决策>" in reply_buffer:
                                 pre, post = reply_buffer.split("<决策>", 1)
+                                logger.info(f"[LLM流式] 发现<决策>标签, reply={pre.strip()[:100]!r}")
                                 if pre.strip():
                                     yield pre.strip()
                                 reply_buffer = ""
@@ -172,14 +176,17 @@ class LLMService:
                                 in_decision = True
                                 if "</决策>" in decision_buffer:
                                     json_str = decision_buffer.split("</决策>")[0].strip()
+                                    logger.info(f"[LLM流式] 决策标签同行完整: {json_str[:200]!r}")
                                     try:
                                         decision_json = json.loads(json_str)
+                                        logger.info(f"[LLM流式] 决策解析成功: intent={decision_json.get('intent')}, action={decision_json.get('action')}")
                                     except json.JSONDecodeError:
-                                        logger.warning(f"决策 JSON 解析失败: {json_str[:120]}")
+                                        logger.warning(f"[LLM流式] 决策 JSON 解析失败: {json_str[:200]}")
                                     break
                                 continue
 
                             if any(c in text for c in "。！？\n"):
+                                logger.debug(f"[LLM流式] 切句: {reply_buffer!r}")
                                 yield reply_buffer
                                 reply_buffer = ""
 
@@ -201,9 +208,11 @@ class LLMService:
             return
 
         if reply_buffer.strip():
+            logger.debug(f"[LLM流式] 最终回复: {reply_buffer.strip()[:200]!r}")
             yield reply_buffer.strip()
 
         if decision_json:
+            logger.info(f"[LLM流式] 最终输出: reply={reply_buffer.strip()[:50]!r}, intent={decision_json.get('intent')}, action={decision_json.get('action')}")
             yield {
                 "reply": reply_buffer.strip() or "好的，请稍等。",
                 "intent": decision_json.get("intent", "unknown"),
