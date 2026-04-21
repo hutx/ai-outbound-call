@@ -395,17 +395,38 @@ class CallAgent:
                     else:
                         hangup_msg = "感谢接听，再见！"
                     logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语: {hangup_msg!r}")
-                    await self._say(hangup_msg, speech_type="closing")
-                    # 等待 FreeSWITCH 播放完缓冲区中的音频
-                    # TTS 发送完成后 FS 还需要额外时间播放，按文本长度估算（约 150ms/字）
-                    wait_ms = max(len(hangup_msg) * 150, 2000)
-                    logger.debug(f"[{self.ctx.uuid}] 等待挂断语播放完成: {wait_ms}ms")
+                    _, _, sent_bytes = await self._say(hangup_msg, speech_type="closing", barge_in_enabled=False)
+                    # ★ 基于实际发送字节数精确计算播放时长：
+                    #    sent_bytes / (8000 * 2) = 音频秒数 @ 8kHz 16bit mono
+                    #    额外 +2s 安全余量，覆盖 FreeSWITCH 内部队列延迟
+                    if sent_bytes > 0:
+                        audio_ms = (sent_bytes / 16000.0) * 1000
+                        wait_ms = audio_ms + 2000
+                        logger.info(f"[{self.ctx.uuid}] 挂断语: {sent_bytes} 字节, 音频≈{audio_ms:.0f}ms, 等待={wait_ms:.0f}ms")
+                    else:
+                        # 兼容 fallback：无字节数据时用 500ms/字，最低 5s
+                        wait_ms = max(len(hangup_msg) * 500, 5000)
+                        logger.info(f"[{self.ctx.uuid}] 挂断语 sent_bytes=0, fallback 等待={wait_ms}ms")
                     await asyncio.sleep(wait_ms / 1000.0)
                     break
 
                 logger.info(f"[{self.ctx.uuid}] 第 {no_response_count} 次无回应（{no_response_mode}），追问")
                 await self._say("您好，请问您还在吗？")
-                continue
+
+                # ★ 追问后快速检测：quick_timeout 内 VAD 未检测到语音 → 直接判定无回应；
+                #    检测到语音 → 继续等 ASR 返回（最多 ASR_TIMEOUT 宽限期）
+                quick_timeout = no_response_config.get("timeout", 3)
+                user_text, is_all_silent, is_asr_timeout = await self._listen_user(
+                    barge_in_enabled=cfg["enabled"],
+                    protect_start_ms=cfg["protect_start_ms"],
+                    protect_end_ms=cfg["protect_end_ms"],
+                    total_duration_ms=cfg["duration_ms"],
+                    quick_timeout=quick_timeout,
+                )
+                # 结果交由下面的 if not user_text 统一处理：
+                # - quick_timeout 触发 → is_all_silent=True → 继续监听
+                # - 有语音有文本 → 正常处理
+                # - 有语音无文本 → is_asr_timeout=True，进入后续逻辑
 
             # 用户有效回应
             if no_response_mode == "consecutive":
@@ -426,10 +447,22 @@ class CallAgent:
                     self._listen_tolerance(tolerance_ms)
                 )
 
+                # ★ 加入超时信号等待，超时可中断 LLM 流式播报
+                timeout_wait_task = asyncio.create_task(self._call_timeout.wait())
                 done, pending = await asyncio.wait(
-                    [llm_task, tolerance_task],
+                    [llm_task, tolerance_task, timeout_wait_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                # 如果超时先触发，取消 LLM 和宽容期任务
+                if timeout_wait_task in done:
+                    logger.info(f"[{self.ctx.uuid}] 通话超时（LLM 流式中），取消 LLM 任务")
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    await self._stop_tts_if_playing()
+                    await self._say_timeout_closing()
+                    break
 
                 if tolerance_task in done:
                     # 宽容期内收到新文本 → 取消 LLM，合并后重新调用
@@ -438,21 +471,47 @@ class CallAgent:
                         combined = f"{user_text} {new_text}".strip()
                         logger.info(f"[{self.ctx.uuid}] 宽容期内合并文本: {combined!r}")
                         for t in pending:
-                            t.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
+                            if t is not timeout_wait_task:
+                                t.cancel()
+                        await asyncio.gather(*[t for t in pending if t is not timeout_wait_task], return_exceptions=True)
+                        timeout_wait_task.cancel()
+                        await asyncio.gather(timeout_wait_task, return_exceptions=True)
                         # 用合并后的文本重新调用 LLM
                         reply_text, action = await self._think_and_reply_stream(combined)
                     else:
                         # 宽容期无新文本，等待 LLM 完成
+                        timeout_wait_task.cancel()
+                        await asyncio.gather(timeout_wait_task, return_exceptions=True)
                         reply_text, action = await llm_task
                 else:
                     # LLM 先完成（宽容期内没收到新文本或超时）
                     tolerance_task.cancel()
                     await asyncio.gather(tolerance_task, return_exceptions=True)
+                    timeout_wait_task.cancel()
+                    await asyncio.gather(timeout_wait_task, return_exceptions=True)
                     reply_text, action = await llm_task
             else:
                 # 无宽容期：直接调用 LLM 流式
-                reply_text, action = await self._think_and_reply_stream(user_text)
+                # ★ 加入超时信号等待，超时可中断 LLM 流式播报
+                llm_task = asyncio.create_task(self._think_and_reply_stream(user_text))
+                timeout_wait_task = asyncio.create_task(self._call_timeout.wait())
+                done, pending = await asyncio.wait(
+                    [llm_task, timeout_wait_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if timeout_wait_task in done:
+                    logger.info(f"[{self.ctx.uuid}] 通话超时（LLM 流式中），取消 LLM 任务")
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    await self._stop_tts_if_playing()
+                    await self._say_timeout_closing()
+                    break
+
+                timeout_wait_task.cancel()
+                await asyncio.gather(timeout_wait_task, return_exceptions=True)
+                reply_text, action = await llm_task
 
             logger.info(f"[{self.ctx.uuid}] 🧠 LLM 返回: reply={reply_text[:50]!r} action={action}")
 
@@ -465,7 +524,7 @@ class CallAgent:
 
             # 播报（transfer 时先播再转，end 时先说再挂）
             if reply_text and action not in ("transfer",):
-                barge_in_occurred, barge_text = await self._say(reply_text)
+                barge_in_occurred, barge_text, _ = await self._say(reply_text)
                 if barge_in_occurred and barge_text:
                     # TTS 被打断，但 ASR 已识别到有效文本，用该文本走 LLM
                     user_text = barge_text
@@ -500,8 +559,13 @@ class CallAgent:
     # ─────────────────────────────────────────────────────────
     async def _listen_user(self, *, barge_in_enabled: bool = True,
                            protect_start_ms: int = 3000, protect_end_ms: int = 3000,
-                           total_duration_ms: float = 0) -> tuple[str, bool, bool]:
+                           total_duration_ms: float = 0,
+                           quick_timeout: float = 0) -> tuple[str, bool, bool]:
         """监听用户语音。
+
+        Args:
+            quick_timeout: 快速超时（秒）。如果在该时间内 VAD 未检测到语音，
+                           提前退出返回 ("", True, True)。用于追问后快速判定无回应。
 
         Returns:
             (text, is_all_silent, is_asr_timeout)
@@ -605,24 +669,50 @@ class CallAgent:
 
         final_text = ""
         asr_timed_out = False
+        quick_timeout_triggered = False
+
+        async def _asr_listen():
+            nonlocal final_text
+            async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
+                if result.is_final and result.text:
+                    # ★ 过滤 1：噪声词
+                    if _is_noise_word(result.text):
+                        logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
+                        continue
+                    # ★ 过滤 2：RMS 能量过低
+                    if adapter._max_rms < 1500:
+                        logger.info(f"[{self.ctx.uuid}] ASR 过滤低能量段: {result.text!r} (max_rms={adapter._max_rms} < 1500)")
+                        continue
+                    final_text = result.text
+                    logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, speech_ms={adapter._speech_ms:.0f}ms)")
+                    break
+
+        async def _quick_timeout_check():
+            nonlocal quick_timeout_triggered
+            if quick_timeout > 0:
+                await asyncio.sleep(quick_timeout)
+                # 检查 VAD 是否在 timeout 内检测到语音
+                if not adapter._started_speaking:
+                    quick_timeout_triggered = True
+                    adapter.stop()
+                    logger.info(f"[{self.ctx.uuid}] 追问快速超时: {quick_timeout}s 内 VAD 未检测到语音")
 
         try:
-            async with asyncio.timeout(ASR_TIMEOUT):
-                async for result in self._asr_with_retry(adapter.stream(), adapter=adapter):
-                    if result.is_final and result.text:
-                        # ★ 过滤 1：噪声词
-                        if _is_noise_word(result.text):
-                            logger.info(f"[{self.ctx.uuid}] ASR 过滤噪声: {result.text!r}")
-                            continue  # 噪声词不 break，继续消费下一个语音段
-                        # ★ 过滤 2：RMS 能量过低（ASR VAD 误识别环境噪音）
-                        #    真实语音 RMS > 1500，噪音 RMS < 1000
-                        if adapter._max_rms < 1500:
-                            logger.info(f"[{self.ctx.uuid}] ASR 过滤低能量段: {result.text!r} (max_rms={adapter._max_rms} < 1500)")
-                            continue
-                        # ★ 先发后改：第一次拿到有效语音后立即返回
-                        final_text = result.text
-                        logger.info(f"[{self.ctx.uuid}] ASR ✓ {result.text!r} (conf={result.confidence:.2f}, speech_ms={adapter._speech_ms:.0f}ms)")
-                        break
+            if quick_timeout > 0:
+                # 并行：ASR 监听 + 快速超时检测
+                asr_task = asyncio.create_task(_asr_listen())
+                check_task = asyncio.create_task(_quick_timeout_check())
+                done, pending = await asyncio.wait(
+                    [asr_task, check_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # 清理残留任务
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            else:
+                async with asyncio.timeout(ASR_TIMEOUT):
+                    await _asr_listen()
         except asyncio.TimeoutError:
             logger.warning(f"[{self.ctx.uuid}] ASR 超时")
             asr_timed_out = True
@@ -630,6 +720,10 @@ class CallAgent:
             logger.error(f"[{self.ctx.uuid}] ASR 异常: {e}")
         finally:
             adapter.stop()
+
+        # ★ 快速超时触发：VAD 在 quick_timeout 内未检测到语音 → 判定无回应
+        if quick_timeout_triggered:
+            return "", True, True
 
         audio_stats = adapter.audio_stats()
         logger.info(
@@ -643,6 +737,7 @@ class CallAgent:
         logger.info(f"[{self.ctx.uuid}] 🔊 ASR 完成: final_text={final_text!r}")
 
         if final_text:
+            # TODO 是否应该有这处理打断，判断 tts是否播报 播报 清空tts
             self.ctx.user_utterances += 1
             self.ctx.messages.append({"role": "user", "content": final_text, "timestamp": int(time.time() * 1000)})
 
@@ -811,6 +906,14 @@ class CallAgent:
                         self._barge_in_text = result.text
                         if not self._barge_in.is_set():
                             self._barge_in.set()
+                        # ★ 主动打断正在进行的 TTS（不等 _say 的逐 chunk 被动检查）
+                        try:
+                            await self.session.stop_playback()
+                            logger.info(f"[{self.ctx.uuid}] ⚡ barge-in ASR 已发送 stop_playback 打断 TTS")
+                        except Exception as e:
+                            logger.debug(f"[{self.ctx.uuid}] barge-in stop_playback 失败（可能 TTS 已播完）: {e}")
+                        # 打断后退出 ASR 循环
+                        break
 
                 # ★ 调试：ASR 循环结束统计
                 logger.info(
@@ -974,7 +1077,7 @@ class CallAgent:
                             continue
 
                         logger.info(f"[{self.ctx.uuid}] 📢 流式播报: {sentence[:60]!r}")
-                        barge_occurred, barge_text = await self._say(sentence)
+                        barge_occurred, barge_text, _ = await self._say(sentence)
                         if barge_occurred:
                             # 播放期间被打断，停止后续句子，进入下一轮监听
                             logger.info(f"[{self.ctx.uuid}] ⚡ 流式播报中被用户打断, text={barge_text!r}")
@@ -990,7 +1093,7 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 流式 LLM 结束, sentence_buffer={sentence_buffer!r}, full_reply 长度={len(full_reply)}")
             if sentence_buffer:
                 logger.info(f"[{self.ctx.uuid}] 📢 流式播报(残余): {sentence_buffer[:100]!r}")
-                barge_occurred, _ = await self._say(sentence_buffer)
+                barge_occurred, _, _ = await self._say(sentence_buffer)
                 if barge_occurred:
                     logger.info(f"[{self.ctx.uuid}] ⚡ 流式播报末尾被打断")
                     return ("", "continue")
@@ -1034,21 +1137,24 @@ class CallAgent:
     # TTS + 播放（支持 barge-in，流式输出）
     # ─────────────────────────────────────────────────────────
     async def _say(self, text: str, record: bool = True,
-                   speech_type: str = "conversation") -> tuple[bool, str]:
+                   speech_type: str = "conversation",
+                   barge_in_enabled: Optional[bool] = None) -> tuple[bool, str, int]:
         """播放 TTS 文本。
 
         Returns:
-            (barge_in_occurred, barge_in_text)
+            (barge_in_occurred, barge_in_text, sent_bytes)
             - barge_in_occurred=True: 被打断，barge_in_text 为 ASR 识别到的文本（可能为空）
             - barge_in_occurred=False: 正常播放完成，barge_in_text 为空
+            - sent_bytes: 实际发送到 FreeSWITCH 的音频字节数（可用于计算播放时长）
         """
         if not text or not self.session._connected:
-            return False, ""
+            return False, "", 0
         self.sm.transition(CallState.AI_SPEAKING)
 
-        # 获取打断策略配置
+        # 获取打断策略配置（barge_in_enabled 参数可覆盖）
         barge_in_config = await get_barge_in_config(self.ctx.script_id, speech_type)
-        barge_in_enabled = barge_in_config["barge_in_enabled"]
+        if barge_in_enabled is None:
+            barge_in_enabled = barge_in_config["barge_in_enabled"]
         protect_start_ms = int(barge_in_config["protect_start_sec"] * 1000)
         protect_end_ms = int(barge_in_config["protect_end_sec"] * 1000)
 
@@ -1064,6 +1170,7 @@ class CallAgent:
         }
 
         self._barge_in.clear()  # 开始播放，barge-in 检测生效
+        sent_bytes = 0  # 追踪实际发送的音频字节数
 
         # ★ 修复：如果上一次 _say 触发了 barge-in（发送了 ttsstop_clean），
         #    需要发送 ttsstart 来恢复 FreeSWITCH 端的 TTS 管道
@@ -1083,41 +1190,43 @@ class CallAgent:
                 barge_text = self._barge_in_text
                 self._barge_in_text = ""  # 清空
                 logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 检测到，跳过播放, text={barge_text!r}")
-                return True, barge_text
+                return True, barge_text, 0
 
             # ★ 关键修复：在 TTS 播放期间启动后台 ASR 监听
-            #    这样用户可以在 TTS 播放期间（除保护期外）打断 AI
-            #    后台 ASR 检测到用户语音后会设置 _barge_in 事件
-            #    ★ 启动为后台任务，不阻塞 TTS 播放
-            barge_in_adapter = AudioStreamAdapter(
-                asyncio.Queue(),  # 占位队列，后续替换
-                vad_silence_ms=config.asr.vad_silence_ms,
-                barge_in_cb=self._barge_in,
-                barge_in_enabled=barge_in_enabled,
-                total_duration_ms=total_duration_ms,
-                protect_start_ms=protect_start_ms,
-                protect_end_ms=protect_end_ms,
-            )
-            # 后台启动音频采集（不阻塞 TTS）
-            audio_capture_task = asyncio.create_task(self.session.start_audio_capture())
-            # 启动后台 ASR 任务（不阻塞 TTS 播放）
-            self._barge_in_asr_task = asyncio.create_task(
-                self._barge_in_asr_loop_with_queue(
-                    barge_in_adapter, audio_capture_task,
+            if barge_in_enabled:
+                # 这样用户可以在 TTS 播放期间（除保护期外）打断 AI
+                # 后台 ASR 检测到用户语音后会设置 _barge_in 事件
+                # ★ 启动为后台任务，不阻塞 TTS 播放
+                barge_in_adapter = AudioStreamAdapter(
+                    asyncio.Queue(),  # 占位队列，后续替换
+                    vad_silence_ms=config.asr.vad_silence_ms,
+                    barge_in_cb=self._barge_in,
+                    barge_in_enabled=barge_in_enabled,
+                    total_duration_ms=total_duration_ms,
                     protect_start_ms=protect_start_ms,
                     protect_end_ms=protect_end_ms,
-                    tts_start_time=t0,
                 )
-            )
-            logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动（后台音频采集中）")
+                # 后台启动音频采集（不阻塞 TTS）
+                audio_capture_task = asyncio.create_task(self.session.start_audio_capture())
+                # 启动后台 ASR 任务（不阻塞 TTS 播放）
+                self._barge_in_asr_task = asyncio.create_task(
+                    self._barge_in_asr_loop_with_queue(
+                        barge_in_adapter, audio_capture_task,
+                        protect_start_ms=protect_start_ms,
+                        protect_end_ms=protect_end_ms,
+                        tts_start_time=t0,
+                    )
+                )
+                logger.info(f"[{self.ctx.uuid}] barge-in ASR 任务已启动（后台音频采集中）")
 
             # ★ TTS 播放：逐 chunk 检查 barge-in，被打断则立即停止
             barge_in_detected = False
+            sent_bytes = 0
             async for chunk in audio_chunks:
                 if not chunk:
                     continue
-                # 每收到一个 TTS chunk 就检查是否被用户打断
-                if self._barge_in.is_set():
+                # 每收到一个 TTS chunk 就检查是否被用户打断（仅在 barge-in 启用时）
+                if barge_in_enabled and self._barge_in.is_set():
                     logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 触发，停止 TTS 播放 (已播 {t0:.1f}s)")
                     barge_in_detected = True
                     # 停止 FreeSWITCH 端播放
@@ -1128,6 +1237,7 @@ class CallAgent:
                 if not sent:
                     logger.warning(f"[{self.ctx.uuid}] TTS 音频发送失败")
                     break
+                sent_bytes += len(chunk)
 
             if barge_in_detected:
                 # 被打断：立即取消后台 ASR 任务，不等待超时
@@ -1140,7 +1250,7 @@ class CallAgent:
                 barge_text = self._barge_in_text
                 self._barge_in_text = ""  # 清空
                 logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 处理完成, text={barge_text!r}")
-                return True, barge_text
+                return True, barge_text, sent_bytes
 
             # TTS 播放完成后设置主 ASR 就绪
             self._last_say_had_barge_in = False  # 正常播放完成，清除标记
@@ -1168,7 +1278,7 @@ class CallAgent:
         finally:
             self._barge_in.set()  # 播放结束，允许新一轮录音
 
-        return False, ""
+        return False, "", sent_bytes
 
     # ─────────────────────────────────────────────────────────
     # 动作处理器
@@ -1263,6 +1373,8 @@ class CallAgent:
                 await self.session.stop_playback()
             except Exception as e:
                 logger.debug(f"[{self.ctx.uuid}] 停止 TTS 失败（可忽略）: {e}")
+        # ★ 标记需要恢复 TTS 管道（下一次 _say 会发送 ttsstart）
+        self._last_say_had_barge_in = True
         # 取消残留的 barge-in ASR 任务
         if self._barge_in_asr_task and not self._barge_in_asr_task.done():
             self._barge_in_asr_task.cancel()
@@ -1271,7 +1383,7 @@ class CallAgent:
             logger.info(f"[{self.ctx.uuid}] 超时打断：已取消残留的 barge-in ASR 任务")
 
     async def _say_timeout_closing(self):
-        """播放超时结束语：硬编码前缀 + 话术 closing_script。"""
+        """播放超时结束语：用 _say 但禁用 barge-in，避免触发打断/管道恢复等逻辑。"""
         closing = ""
         if getattr(self, "_script_config", None):
             closing = getattr(self._script_config, "closing_script", "") or ""
@@ -1279,10 +1391,14 @@ class CallAgent:
             closing = "感谢您的接听，再见！"
         hangup_msg = f"您本次通话时长已结束。{closing}"
         logger.info(f"[{self.ctx.uuid}] 超时结束语: {hangup_msg!r}")
-        await self._say(hangup_msg, speech_type="closing")
-        # 等待播放完成（动态等待，复用挂断语等待逻辑）
-        wait_ms = max(len(hangup_msg) * 150, 2000)
-        logger.debug(f"[{self.ctx.uuid}] 等待超时结束语播放完成: {wait_ms}ms")
+        _, _, sent_bytes = await self._say(hangup_msg, speech_type="closing", barge_in_enabled=False)
+        # 基于实际发送字节数计算播放时长 + 2s 安全余量
+        if sent_bytes > 0:
+            audio_ms = (sent_bytes / 16000.0) * 1000
+            wait_ms = audio_ms + 2000
+            logger.info(f"[{self.ctx.uuid}] 超时结束语: {sent_bytes} 字节, 音频≈{audio_ms:.0f}ms, 等待={wait_ms:.0f}ms")
+        else:
+            wait_ms = max(len(hangup_msg) * 150, 2000)
         await asyncio.sleep(wait_ms / 1000.0)
 
     # ─────────────────────────────────────────────────────────

@@ -166,10 +166,22 @@ class ForkzstreamCallSession:
         except Exception as e:
             logger.warning(f"[{self._uuid}] forkzstream 音频中继异常: {e}")
 
-    async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0):
-        """流式发送 TTS 音频，边合成边播放，避免一次性发送导致的卡顿。"""
+    async def play_stream(self, audio_chunks, text: str = "", timeout: float = 60.0) -> int:
+        """流式发送 TTS 音频，边合成边播放，避免一次性发送导致的卡顿。
+
+        ★ 缓冲合并：将不定长的 TTS chunk 合并为固定大小（20ms/帧 = 320 字节 @ 8kHz 16bit）
+          再发送，确保 FreeSWITCH 端播放节奏稳定，避免一卡一卡的问题。
+
+        Returns:
+            实际发送到 FreeSWITCH 的字节数，可用于计算音频播放时长。
+        """
         total_bytes = 0
         chunk_count = 0
+        sent_bytes = 0
+
+        # 8kHz 16bit mono: 20ms = 8000 * 2 * 0.02 = 320 字节/帧
+        FRAME_SIZE = 320
+        buffer = bytearray()
 
         logger.info(f"[{self._uuid}] TTS 流式播放开始")
 
@@ -178,13 +190,30 @@ class ForkzstreamCallSession:
                 continue
             chunk_count += 1
             total_bytes += len(chunk)
-            # 每收到一个 TTS chunk 就立即发送
-            sent = await self.forkzstream_ws_server.send_audio(self._uuid, chunk)
-            if not sent:
-                logger.warning(f"[{self._uuid}] TTS 音频发送失败")
-                break
+            buffer.extend(chunk)
 
-        logger.info(f"[{self._uuid}] TTS 流式播放完成: {chunk_count} 块, {total_bytes} 字节")
+            # 缓冲合并：攒够一帧就发送
+            while len(buffer) >= FRAME_SIZE:
+                frame = bytes(buffer[:FRAME_SIZE])
+                buffer = buffer[FRAME_SIZE:]
+                sent = await self.forkzstream_ws_server.send_audio(self._uuid, frame)
+                if not sent:
+                    logger.warning(f"[{self._uuid}] TTS 音频发送失败")
+                    return sent_bytes
+                sent_bytes += len(frame)
+
+        # 发送剩余不足一帧的尾部音频（补齐到最近帧边界或直接发送）
+        if buffer:
+            sent = await self.forkzstream_ws_server.send_audio(self._uuid, bytes(buffer))
+            if sent:
+                sent_bytes += len(buffer)
+
+        audio_duration_ms = sent_bytes / 16  # 8kHz 16bit mono: 16000 bytes/s
+        logger.info(
+            f"[{self._uuid}] TTS 流式播放完成: {chunk_count} 块, {total_bytes} 字节, "
+            f"发送 {sent_bytes} 字节, 音频时长≈{audio_duration_ms:.0f}ms"
+        )
+        return sent_bytes
 
     async def stop_playback(self):
         """打断 TTS 播放。"""

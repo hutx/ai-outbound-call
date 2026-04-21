@@ -29,35 +29,36 @@ class TestCallTimeoutConfig:
             assert cfg.call_end_buffer_seconds == 30
 
 
+def _make_agent(mock_session, mock_ctx):
+    """创建 CallAgent 实例，提供 mock 依赖以避免连接真实服务。"""
+    from backend.core.call_agent import CallAgent
+
+    # 最小 mock ASR
+    mock_asr = type("MockASR", (), {
+        "start_session": lambda self: None,
+        "send_audio": lambda self, audio: None,
+        "stop_session": lambda self: None,
+    })()
+    # 最小 mock TTS
+    mock_tts = type("MockTTS", (), {
+        "synthesize": lambda self, text: b"",
+    })()
+    # 最小 mock LLM
+    mock_llm = type("MockLLM", (), {
+        "chat": lambda self, messages: "mock",
+    })()
+
+    return CallAgent(
+        session=mock_session,
+        context=mock_ctx,
+        asr=mock_asr,
+        tts=mock_tts,
+        llm=mock_llm,
+    )
+
+
 class TestCallAgentTimeout:
     """测试 CallAgent 超时处理辅助函数。"""
-
-    def _make_agent(self, mock_session, mock_ctx):
-        """创建 CallAgent 实例，提供 mock 依赖以避免连接真实服务。"""
-        from backend.core.call_agent import CallAgent
-
-        # 最小 mock ASR
-        mock_asr = type("MockASR", (), {
-            "start_session": lambda self: None,
-            "send_audio": lambda self, audio: None,
-            "stop_session": lambda self: None,
-        })()
-        # 最小 mock TTS
-        mock_tts = type("MockTTS", (), {
-            "synthesize": lambda self, text: b"",
-        })()
-        # 最小 mock LLM
-        mock_llm = type("MockLLM", (), {
-            "chat": lambda self, messages: "mock",
-        })()
-
-        return CallAgent(
-            session=mock_session,
-            context=mock_ctx,
-            asr=mock_asr,
-            tts=mock_tts,
-            llm=mock_llm,
-        )
 
     @pytest.mark.asyncio
     async def test_say_timeout_closing_with_closing_script(self):
@@ -73,7 +74,7 @@ class TestCallAgentTimeout:
             "result": None,
         })()
 
-        agent = self._make_agent(mock_session, mock_ctx)
+        agent = _make_agent(mock_session, mock_ctx)
         # 手动注入 _script_config（正常在 run() 中设置）
         agent._script_config = type("MockScript", (), {
             "closing_script": "感谢您的接听，再见！",
@@ -98,7 +99,7 @@ class TestCallAgentTimeout:
         mock_session = type("MockSession", (), {"stop_playback": lambda self: None})()
         mock_ctx = type("MockCtx", (), {"uuid": "test-uuid-002", "result": None})()
 
-        agent = self._make_agent(mock_session, mock_ctx)
+        agent = _make_agent(mock_session, mock_ctx)
         agent._script_config = type("MockScript", (), {"closing_script": None})()
         agent._say_captured = []
 
@@ -120,7 +121,7 @@ class TestCallAgentTimeout:
         mock_session = type("MockSession", (), {"stop_playback": lambda self: None})()
         mock_ctx = type("MockCtx", (), {"uuid": "test-uuid-003", "result": None})()
 
-        agent = self._make_agent(mock_session, mock_ctx)
+        agent = _make_agent(mock_session, mock_ctx)
         agent._barge_in_asr_task = asyncio.create_task(asyncio.sleep(100))
 
         await agent._stop_tts_if_playing()
@@ -154,7 +155,7 @@ class TestCallTimeoutIntegration:
             "state": None,
         })()
 
-        agent = self._make_agent(mock_session, mock_ctx)
+        agent = _make_agent(mock_session, mock_ctx)
         agent._script_config = type("MockScript", (), {
             "closing_script": "感谢您的接听，再见！",
         })()
@@ -207,7 +208,7 @@ class TestCallTimeoutIntegration:
             mock_config.max_call_duration_seconds = 3
             mock_config.call_end_buffer_seconds = 1
 
-            agent = self._make_agent(mock_session, mock_ctx)
+            agent = _make_agent(mock_session, mock_ctx)
             agent._start_timeout_watchdog()
 
             # 1.5 秒时不应触发（1.5 < 2）
@@ -243,7 +244,7 @@ class TestCallTimeoutIntegration:
             mock_config.max_call_duration_seconds = 3
             mock_config.call_end_buffer_seconds = 1
 
-            agent = self._make_agent(mock_session, mock_ctx)
+            agent = _make_agent(mock_session, mock_ctx)
             agent._start_timeout_watchdog()
 
             # 1.5 秒时不应触发（1.5 < 2）
@@ -278,7 +279,7 @@ class TestCallTimeoutIntegration:
             mock_config.max_call_duration_seconds = 0.5
             mock_config.call_end_buffer_seconds = 0.1
 
-            agent = self._make_agent(mock_session, mock_ctx)
+            agent = _make_agent(mock_session, mock_ctx)
             agent._start_timeout_watchdog()
 
             # 0.6 秒时不应触发（0.6 < 1）
@@ -324,7 +325,7 @@ class TestCallTimeoutIntegration:
             "state": CallState.CONNECTED,
         })()
 
-        agent = self._make_agent(mock_session, mock_ctx)
+        agent = _make_agent(mock_session, mock_ctx)
         agent._script_config = type("MockScript", (), {
             "closing_script": "再见！",
         })()
