@@ -769,45 +769,25 @@ class CallAgent:
                     _barge_asr_chunk_count += 1
                     if not result.is_final:
                         _barge_asr_interim_count += 1
-                        # ★ 关键优化：用中间结果触发 barge-in（不等 is_final）
-                        #    is_final 需要用户说完后等 5-10s（服务端 VAD 静音超时），
-                        #    中间结果已经能证明用户在说话，足够触发打断。
-                        if result.text and not _is_noise(result.text):
-                            # 检查保护期
-                            in_protect = False
-                            if tts_start_time > 0:
-                                elapsed_ms = (time.time() - tts_start_time) * 1000
-                                if elapsed_ms < protect_start_ms:
-                                    in_protect = True
-                                    logger.debug(f"[{self.ctx.uuid}] barge-in 中间结果在保护期内: {result.text!r} ({elapsed_ms:.0f}ms < {protect_start_ms}ms)")
-                            if not in_protect:
-                                logger.info(f"[{self.ctx.uuid}] ⚡ barge-in 中间结果触发: {result.text!r}")
-                                self._barge_in_text = result.text
-                                if not self._barge_in.is_set():
-                                    self._barge_in.set()
-                        else:
-                            logger.debug(f"[{self.ctx.uuid}] barge-in ASR 中间结果 #{_barge_asr_interim_count}: {result.text!r}")
+                        # 中间结果仅用于调试，不触发 barge-in
+                        logger.debug(f"[{self.ctx.uuid}] barge-in ASR 中间结果 #{_barge_asr_interim_count}: {result.text!r}")
                         continue
                     if result.text:
-                        # ★ 过滤 1：噪声词（宽松版，只丢弃纯英文和空文本）
+                        # ★ 用 is_final 最终结果触发 barge-in，确保识别准确
                         if _is_noise(result.text):
                             logger.debug(f"[{self.ctx.uuid}] barge-in ASR 过滤噪声: {result.text!r}")
                             continue
-                        # ★ 不再过滤 RMS 能量过低
-                        #    barge-in 场景下，即使 RMS 低，ASR 识别到中文文本就是有效打断
-                        # if adapter._max_rms < 1500: ... ← 已移除
-                        # ★ 过滤 3：检查保护期
+                        # 检查保护期
                         if tts_start_time > 0:
                             elapsed_ms = (time.time() - tts_start_time) * 1000
                             if elapsed_ms < protect_start_ms:
                                 logger.debug(f"[{self.ctx.uuid}] barge-in ASR: 在保护期内（起始 {elapsed_ms:.0f}ms < {protect_start_ms}ms）")
                                 continue
                             if protect_end_ms > 0:
-                                # 流式模式 total_duration_ms=0，跳过结束保护期检查
                                 pass
 
                         logger.info(f"[{self.ctx.uuid}] ⚡ barge-in ASR 触发(is_final): {result.text!r}")
-                        # ★ 保存识别文本，供 _say() 返回给主循环使用
+                        # 保存识别文本，供 _say() 返回给主循环使用
                         self._barge_in_text = result.text
                         if not self._barge_in.is_set():
                             self._barge_in.set()
