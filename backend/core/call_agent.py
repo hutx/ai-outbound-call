@@ -386,8 +386,9 @@ class CallAgent:
                         hangup_msg = closing_script
                     else:
                         hangup_msg = "感谢接听，再见！"
-                    logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语并结束通话")
-                    await self._say(hangup_msg)
+                    logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语: {hangup_msg!r}")
+                    await self._say(hangup_msg, speech_type="closing")
+                    await asyncio.sleep(0.5)  # 等待 TTS 播放完成
                     break
 
                 logger.info(f"[{self.ctx.uuid}] 第 {no_response_count} 次无回应（{no_response_mode}），追问")
