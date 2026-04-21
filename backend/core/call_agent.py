@@ -395,6 +395,8 @@ class CallAgent:
                     else:
                         hangup_msg = "感谢接听，再见！"
                     logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语: {hangup_msg!r}")
+                    # ★ 播报前清空 TTS 队列
+                    await self._stop_tts_if_playing()
                     _, _, sent_bytes = await self._say(hangup_msg, speech_type="closing", barge_in_enabled=False)
                     # ★ 基于实际发送字节数精确计算播放时长：
                     #    sent_bytes / (8000 * 2) = 音频秒数 @ 8kHz 16bit mono
@@ -1063,6 +1065,12 @@ class CallAgent:
                 sentence_buffer += item
                 full_reply += item
 
+                # ★ 播报前先清空 TTS 队列，避免残留内容影响播放
+                try:
+                    await self.session.stop_playback()
+                except Exception:
+                    pass
+
                 # 按句子边界切分
                 sentences = re.split(r'(?<=[。！？])', sentence_buffer)
                 if len(sentences) > 1:
@@ -1391,6 +1399,8 @@ class CallAgent:
             closing = "感谢您的接听，再见！"
         hangup_msg = f"您本次通话时长已结束。{closing}"
         logger.info(f"[{self.ctx.uuid}] 超时结束语: {hangup_msg!r}")
+        # ★ 播报前清空 TTS 队列
+        await self._stop_tts_if_playing()
         _, _, sent_bytes = await self._say(hangup_msg, speech_type="closing", barge_in_enabled=False)
         # 基于实际发送字节数计算播放时长 + 2s 安全余量
         if sent_bytes > 0:
