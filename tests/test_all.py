@@ -623,9 +623,8 @@ class TestCallAgent:
         )
 
     def test_production_timeouts_defined(self):
-        from backend.core.call_agent import ASR_TIMEOUT, LLM_TIMEOUT, MAX_CALL_DURATION, TTS_TIMEOUT
+        from backend.core.call_agent import ASR_TIMEOUT, LLM_TIMEOUT, TTS_TIMEOUT
 
-        assert MAX_CALL_DURATION == 300
         assert LLM_TIMEOUT == 30.0
         assert TTS_TIMEOUT == 10.0
         assert ASR_TIMEOUT == 15.0

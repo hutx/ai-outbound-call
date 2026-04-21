@@ -32,8 +32,6 @@ from backend.services.script_service import script_service
 
 logger = logging.getLogger(__name__)
 
-# 单路通话最长时长（秒），防止 LLM 循环或静音时挂死
-MAX_CALL_DURATION = int(config.__dict__.get("max_call_duration", 300))
 # 用户无响应后最大重问次数
 MAX_SILENCE_RETRIES = 3
 # LLM 超时（秒）
@@ -323,15 +321,11 @@ class CallAgent:
             # 6. 写通话开始变量到 CDR
             await self.session.set_variable("ai_call_started", "true")
 
-            # 7. 主对话循环，整体超时保护
-            try:
-                await asyncio.wait_for(
-                    self._conversation_loop(),
-                    timeout=MAX_CALL_DURATION,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"[{self.ctx.uuid}] 通话超过最大时长 {MAX_CALL_DURATION}s，强制结束")
-                await self._say("感谢您的耐心，通话时间已到，再见！", record=False)
+            # 7. 启动通话超时看门狗
+            self._start_timeout_watchdog()
+
+            # 8. 主对话循环（超时信号在循环内处理）
+            await self._conversation_loop()
 
             event_task.cancel()
             await asyncio.gather(event_task, return_exceptions=True)
@@ -346,6 +340,10 @@ class CallAgent:
             logger.error(f"[{self.ctx.uuid}] 未预期异常: {e}", exc_info=True)
             self.ctx.result = CallResult.ERROR
         finally:
+            # 清理超时看门狗任务
+            if self._call_timeout_task and not self._call_timeout_task.done():
+                self._call_timeout_task.cancel()
+                await asyncio.gather(self._call_timeout_task, return_exceptions=True)
             await self._cleanup()
 
     async def _conversation_loop(self):
@@ -363,6 +361,13 @@ class CallAgent:
         no_response_count = 0
 
         while self.sm.should_continue() and self.session._connected:
+            # ★ 检查通话超时
+            if self._call_timeout.is_set():
+                logger.info(f"[{self.ctx.uuid}] 通话超时，打断当前播报（如有），发送超时结束语")
+                await self._stop_tts_if_playing()
+                await self._say_timeout_closing()
+                break
+
             # ★ 先发：监听用户，收到第一个有效文本后立即返回
             logger.info(f"[{self.ctx.uuid}] 🔊 开始监听用户 (session._connected={self.session._connected})")
             cfg = self._last_barge_in_config
@@ -450,6 +455,13 @@ class CallAgent:
                 reply_text, action = await self._think_and_reply_stream(user_text)
 
             logger.info(f"[{self.ctx.uuid}] 🧠 LLM 返回: reply={reply_text[:50]!r} action={action}")
+
+            # ★ 检查通话超时（防止 LLM 流式输出期间超时）
+            if self._call_timeout.is_set():
+                logger.info(f"[{self.ctx.uuid}] 通话超时（LLM 返回后），打断当前播报（如有），发送超时结束语")
+                await self._stop_tts_if_playing()
+                await self._say_timeout_closing()
+                break
 
             # 播报（transfer 时先播再转，end 时先说再挂）
             if reply_text and action not in ("transfer",):
