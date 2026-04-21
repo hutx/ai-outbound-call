@@ -388,7 +388,11 @@ class CallAgent:
                         hangup_msg = "感谢接听，再见！"
                     logger.info(f"[{self.ctx.uuid}] {no_response_mode} {no_response_count} 次无回应，播放挂断语: {hangup_msg!r}")
                     await self._say(hangup_msg, speech_type="closing")
-                    await asyncio.sleep(0.5)  # 等待 TTS 播放完成
+                    # 等待 FreeSWITCH 播放完缓冲区中的音频
+                    # TTS 发送完成后 FS 还需要额外时间播放，按文本长度估算（约 150ms/字）
+                    wait_ms = max(len(hangup_msg) * 150, 2000)
+                    logger.debug(f"[{self.ctx.uuid}] 等待挂断语播放完成: {wait_ms}ms")
+                    await asyncio.sleep(wait_ms / 1000.0)
                     break
 
                 logger.info(f"[{self.ctx.uuid}] 第 {no_response_count} 次无回应（{no_response_mode}），追问")
