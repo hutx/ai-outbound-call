@@ -1100,11 +1100,18 @@ class CallAgent:
 
             logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")
 
-            # ★ 关键修复：TTS 播放完成后不取消 barge-in ASR 任务
-            #    让它在 _listen_user 启动前继续监听用户语音（填补 TTS→listen 的空窗期）
-            #    barge-in ASR 会在 ASR_TIMEOUT 后自行退出，或被 _listen_user 的新 ASR 替代
-            # barge_in_adapter.stop()  ← 已移除
-            # await asyncio.gather(...) ← 已移除
+            # ★ 关键修复：TTS 播放完成后立即取消 barge-in ASR 任务
+            #    无回应超时从 TTS 完成后开始计算，barge-in ASR 不应独立运行消耗时间
+            #    _listen_user() 会立刻接管监听，ASR 超时从此时开始
+            if self._barge_in_asr_task and not self._barge_in_asr_task.done():
+                # 检查 barge-in ASR 是否在等待期间检测到了用户语音
+                barge_in_occurred = self._barge_in.is_set()
+                self._barge_in_asr_task.cancel()
+                await asyncio.gather(self._barge_in_asr_task, return_exceptions=True)
+                self._barge_in_asr_task = None
+                if barge_in_occurred:
+                    logger.info(f"[{self.ctx.uuid}] TTS 播放完成后检测到 barge-in，文本={self._barge_in_text!r}")
+                    # barge-in 已触发，_barge_in 事件会在下一轮 _say() 中处理
 
         except asyncio.TimeoutError:
             logger.error(f"[{self.ctx.uuid}] TTS 超时")
