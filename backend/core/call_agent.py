@@ -265,6 +265,9 @@ class CallAgent:
         # ★ 优化5：主 ASR 监听就绪信号（由 _say 在 TTS 播放结束前设置）
         self._main_asr_ready = asyncio.Event()
         self._main_asr_ready.set()  # 初始置位（第一次监听不需要等待）
+        # 通话超时看门狗
+        self._call_timeout = asyncio.Event()
+        self._call_timeout_task: Optional[asyncio.Task] = None
         # 最近一次 _say 的打断配置，用于传递给 _listen_user
         self._last_barge_in_config = {
             "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
@@ -1212,6 +1215,63 @@ class CallAgent:
         await crm.add_to_blacklist(self.ctx.phone_number, reason)
         self.ctx.result = CallResult.BLACKLISTED
         self.sm.transition(CallState.ENDING)
+
+    # ─────────────────────────────────────────────────────────
+    # 超时看门狗 & 超时处理
+    # ─────────────────────────────────────────────────────────
+    def _start_timeout_watchdog(self):
+        """启动通话超时看门狗。"""
+        total = config.max_call_duration_seconds
+        buffer = config.call_end_buffer_seconds
+        trigger_at = max(total - buffer, 1)
+        logger.info(
+            f"[{self.ctx.uuid}] 通话超时看门狗启动: 总时长={total}s, "
+            f"缓冲={buffer}s, 触发点={trigger_at}s"
+        )
+        self._call_timeout_task = asyncio.create_task(
+            self._timeout_watchdog(trigger_at)
+        )
+
+    async def _timeout_watchdog(self, trigger_at: float):
+        """倒计时到触发点后设置超时信号。"""
+        try:
+            await asyncio.sleep(trigger_at)
+            logger.warning(f"[{self.ctx.uuid}] 通话时长即将结束，触发超时信号")
+            self._call_timeout.set()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[{self.ctx.uuid}] 超时看门狗异常: {e}")
+            self._call_timeout.set()  # 异常降级：立即触发超时
+
+    async def _stop_tts_if_playing(self):
+        """超时触发时立即停止 TTS 播报。"""
+        if self.session:
+            try:
+                await self.session.stop_playback()
+            except Exception as e:
+                logger.debug(f"[{self.ctx.uuid}] 停止 TTS 失败（可忽略）: {e}")
+        # 取消残留的 barge-in ASR 任务
+        if self._barge_in_asr_task and not self._barge_in_asr_task.done():
+            self._barge_in_asr_task.cancel()
+            await asyncio.gather(self._barge_in_asr_task, return_exceptions=True)
+            self._barge_in_asr_task = None
+            logger.info(f"[{self.ctx.uuid}] 超时打断：已取消残留的 barge-in ASR 任务")
+
+    async def _say_timeout_closing(self):
+        """播放超时结束语：硬编码前缀 + 话术 closing_script。"""
+        closing = ""
+        if getattr(self, "_script_config", None):
+            closing = getattr(self._script_config, "closing_script", "") or ""
+        if not closing:
+            closing = "感谢您的接听，再见！"
+        hangup_msg = f"您本次通话时长已结束。{closing}"
+        logger.info(f"[{self.ctx.uuid}] 超时结束语: {hangup_msg!r}")
+        await self._say(hangup_msg, speech_type="closing")
+        # 等待播放完成（动态等待，复用挂断语等待逻辑）
+        wait_ms = max(len(hangup_msg) * 150, 2000)
+        logger.debug(f"[{self.ctx.uuid}] 等待超时结束语播放完成: {wait_ms}ms")
+        await asyncio.sleep(wait_ms / 1000.0)
 
     # ─────────────────────────────────────────────────────────
     # 清理
