@@ -919,10 +919,19 @@ class CallAgent:
             ):
                 if isinstance(item, dict):
                     # 最终决策
+                    logger.info(f"[{self.ctx.uuid}] 🧠 收到 LLM 决策: {item}")
                     final_decision = item
                     break
 
                 # item 是文本 token
+                # ★ 过滤决策标签及其内容，防止泄漏到 full_reply 和消息历史
+                if "<决策>" in item:
+                    item = item.split("<决策>")[0]
+                    if not item.strip():
+                        # 决策标签前的文本为空，跳过
+                        continue
+
+                logger.debug(f"[{self.ctx.uuid}] LLM token: {item!r}, sentence_buffer 累计: {sentence_buffer!r}")
                 sentence_buffer += item
                 full_reply += item
 
@@ -939,6 +948,7 @@ class CallAgent:
                         if not sentence:
                             continue
 
+                        logger.info(f"[{self.ctx.uuid}] 📢 流式播报: {sentence[:60]!r}")
                         barge_occurred, barge_text = await self._say(sentence)
                         if barge_occurred:
                             # 播放期间被打断，停止后续句子，进入下一轮监听
@@ -947,7 +957,9 @@ class CallAgent:
 
             # 播放剩余的未完成句子（如有）
             sentence_buffer = sentence_buffer.strip()
+            logger.info(f"[{self.ctx.uuid}] 流式 LLM 结束, sentence_buffer={sentence_buffer!r}, full_reply 长度={len(full_reply)}")
             if sentence_buffer:
+                logger.info(f"[{self.ctx.uuid}] 📢 流式播报(残余): {sentence_buffer[:100]!r}")
                 barge_occurred, _ = await self._say(sentence_buffer)
                 if barge_occurred:
                     logger.info(f"[{self.ctx.uuid}] ⚡ 流式播报末尾被打断")
@@ -956,6 +968,7 @@ class CallAgent:
             # 解析决策
             if final_decision:
                 action = final_decision.get("action", "continue")
+                logger.info(f"[{self.ctx.uuid}] 最终 action={action}, full_reply={full_reply.strip()[:100]!r}")
             else:
                 # 未收到决策，用旧方法解析完整回复
                 parsed = self.llm._parse_response(full_reply)
