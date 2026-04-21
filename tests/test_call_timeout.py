@@ -1,6 +1,7 @@
 """
 通话时长限制功能测试
 """
+import pytest
 from unittest.mock import patch
 
 
@@ -26,9 +27,6 @@ class TestCallTimeoutConfig:
             cfg = config_module.AppConfig()
             assert cfg.max_call_duration_seconds == 600
             assert cfg.call_end_buffer_seconds == 30
-
-
-import pytest
 
 
 class TestCallAgentTimeout:
