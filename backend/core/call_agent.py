@@ -269,6 +269,8 @@ class CallAgent:
         self._last_barge_in_config = {
             "enabled": True, "protect_start_ms": 3000, "protect_end_ms": 3000, "duration_ms": 0
         }
+        # 记录上一次 _say 是否触发 barge-in（用于 ttsstop_clean 后恢复 TTS）
+        self._last_say_had_barge_in = False
 
         # 注册状态机动作
         self.sm.register_handler("transfer",  self._do_transfer)
@@ -1035,6 +1037,13 @@ class CallAgent:
 
         self._barge_in.clear()  # 开始播放，barge-in 检测生效
 
+        # ★ 修复：如果上一次 _say 触发了 barge-in（发送了 ttsstop_clean），
+        #    需要发送 ttsstart 来恢复 FreeSWITCH 端的 TTS 管道
+        if self._last_say_had_barge_in:
+            self._last_say_had_barge_in = False
+            await self.session.restart_playback()
+            logger.info(f"[{self.ctx.uuid}] 已发送 ttsstart，恢复 TTS 管道")
+
         try:
             t0 = time.time()
             # 流式 TTS：边合成边播
@@ -1094,6 +1103,7 @@ class CallAgent:
 
             if barge_in_detected:
                 # 被打断：立即取消后台 ASR 任务，不等待超时
+                self._last_say_had_barge_in = True  # 标记，供下次 _say 发送 ttsstart
                 barge_in_adapter.stop()
                 self._barge_in_asr_task.cancel()
                 await asyncio.gather(self._barge_in_asr_task, return_exceptions=True)
@@ -1105,6 +1115,7 @@ class CallAgent:
                 return True, barge_text
 
             # TTS 播放完成后设置主 ASR 就绪
+            self._last_say_had_barge_in = False  # 正常播放完成，清除标记
             self._main_asr_ready.set()
 
             logger.debug(f"[{self.ctx.uuid}] TTS 播放完成，耗时 {(time.time()-t0)*1000:.0f}ms")

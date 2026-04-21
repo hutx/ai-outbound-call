@@ -190,6 +190,10 @@ class ForkzstreamCallSession:
         """打断 TTS 播放。"""
         await self.forkzstream_ws_server.send_command(self._uuid, "ttsstop_clean")
 
+    async def restart_playback(self):
+        """恢复 TTS 播放（打断后发送新音频前调用）。"""
+        await self.forkzstream_ws_server.send_command(self._uuid, "ttsstart")
+
     async def execute(self, app: str, arg: str = "", lock: bool = True) -> str:
         """通过 ESL Inbound pool 执行 FreeSWITCH API。"""
         if not self._connected:
