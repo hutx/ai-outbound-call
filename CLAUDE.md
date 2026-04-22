@@ -41,44 +41,6 @@
 | 8767 | mod_audio_stream WebSocket（保留，非主用） |
 | 8000 | FastAPI REST API |
 
-## 已验证失败的方案（不要再试）
-
-### 1. ❌ &park() + uuid_transfer 到 AI_Handler (9998)
-- **命令**：`originate {vars}user/1002@domain &park()` → `uuid_transfer 9998 XML internal`
-- **问题**：通道卡在 `CS_EXECUTE` 状态，dialplan 不继续执行
-- **日期**：2026-04-14
-
-### 2. ❌ dialplan audio_fork 应用
-- **命令**：`<action application="audio_fork" data="ws://..."/>`
-- **问题**：mod_audio_fork **不提供** dialplan application，只提供 `uuid_audio_fork` API 命令
-- **日期**：2026-04-15
-
-### 3. ❌ socket(async) 不用 full
-- **命令**：`<action application="socket" data="backend:9999 async"/>`
-- **问题**：`async` 模式下 socket 不接管媒体路径，uuid_broadcast TTS 无法送达
-- **日期**：2026-04-14
-
-### 4. ❌ audio_stream 挂载在 loopback B-leg
-- **问题**：loopback B-leg 的 read 方向在 bridge(sofia ↔ loopback) 中捕获不到 sofia 侧的用户语音
-- **现象**：WebSocket 收到完整音频帧但全是静音（max_rms=0）
-- **日期**：2026-04-14
-
-### 5. ❌ sofia profile 级 proxy-media 参数不生效
-- **注意**：`proxy-media` 是 channel variable，不是 profile 级参数
-- **日期**：2026-04-15
-
-### 6. ❌ mod_audio_fork 在 sofia A-leg 上推送静音
-- **结论**：`proxy_media=true` 能确保 RTP 经过 FreeSWITCH 软件层，但 mod_audio_fork 的 media bug 在 sofia leg 上就是捕获不到音频帧
-- **替代方案**：mod_forkzstream 替代 mod_audio_fork（已验证有效）
-
-### 7. ✅ Docker RTP 端口映射限制 — 已修复
-- **修复**：`vars.xml` 中 `rtp_start_port=16384` + `rtp_end_port=17384`，docker-compose 端口映射 `"16384-17384:16384-17384/udp"`
-- **日期**：2026-04-15
-
-### 8. ❌ drachtio/drachtio-freeswitch-mrf 镜像不适用
-- **原因**：容器启动时 entrypoint 的 sed 命令在只读挂载卷上失败
-- **日期**：2026-04-15
-
 ## 当前外呼策略（已验证有效）
 
 ### forkzstream 架构（主方案）
@@ -141,7 +103,11 @@
   - **现在**：丢弃纯英文 + 空文本 + **单字语气词**（嗯/哦/啊/呃/哎/喂/好/是/对/行/你 + 可选标点）+ 重复语气词（嗯嗯/好好/对对）。只有有实质语义内容的 ASR 结果才触发打断。
   - **不丢弃 RMS 能量过低**：barge-in 场景下即使 RMS 低，ASR 识别到有实质语义的中文就是有效打断。
 - **TTS 播放完不取消 barge-in ASR**：让它在 TTS→listen 空窗期继续监听用户语音，填补间隙。
-- **_listen_user() 启动时取消残留 barge-in ASR**：防止两个 ASR 同时运行。
+- **barge-in ASR 超时修复**（2026-04-22）：
+  - **问题**：barge-in 监听在收到 `user_text` 后启动（`_start_barge_in_listener`），ASR 有 15s 超时。如果 LLM 思考超过 15s，barge-in ASR 已退出，TTS 播报期间没有 ASR 监听，无法触发打断。
+  - **修复**：`_say()` 在 TTS 播放前检查 `_barge_in_asr_task` 是否仍在运行，如果不在运行（已超时或已结束），重新启动 barge-in 监听。确保 TTS 播报期间一定有 ASR 在监听用户说话。
+  - **改动**：`_conversation_loop` 不再负责启动 barge-in，统一由 `_say()` 管理启动/重启。
+  - **代码位置**：`backend/core/call_agent.py` — `_say()` 开头处的 barge-in 重启检查
 - **文本携带**：barge-in 触发时保存识别文本到 `_barge_in_text`，`_say()` 返回给主循环，用该文本走 LLM。
 - **代码位置**：`backend/core/call_agent.py` — `_say()` + `_barge_in_asr_loop_with_queue()` + `_is_noise()`（宽松版）
 
