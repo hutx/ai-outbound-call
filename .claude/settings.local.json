@@ -65,7 +65,9 @@
       "Bash(docker buildx:*)",
       "Bash(pip show:*)",
       "Bash(git stash:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(echo exit: $?:*)",
+      "Bash(md5:*)"
     ]
   }
 }

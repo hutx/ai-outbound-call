@@ -109,9 +109,8 @@ services:
   # ── FunASR 本地 ASR 服务（可选，替换云端 ASR）────────────────
   # 如果使用云端 ASR（讯飞等），注释掉这个服务
   funasr:
-#    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.10
-    image: drachtio/drachtio-freeswitch-mrf:v1.10.1-full
-    container_name: outbound_funasr1
+    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.10
+    container_name: outbound_funasr
     restart: unless-stopped
     ports:
       - "10095:10095"
@@ -119,13 +118,8 @@ services:
       - ./funasr_models:/workspace/models
     environment:
       MODELSCOPE_CACHE: /workspace/models
-    command: >
-      bash -c "cd /workspace/FunASR/runtime && python funasr_wss_server.py
-      --host 0.0.0.0 --port 10095
-      --asr_model paraformer-zh
-      --vad_model fsmn-vad
-      --punc_model ct-punc
-      --itn True"
+
+
     healthcheck:
       test: [ "CMD", "python", "-c", "import websockets" ]
       interval: 60s

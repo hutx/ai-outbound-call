@@ -1,0 +1,17 @@
+## kamctlrc - kamctl 配置文件
+## Kamailio 使用 PostgreSQL 数据库存储用户凭证和注册信息
+
+SIP_DOMAIN=localhost
+DBENGINE=PGSQL
+DBHOST=postgres
+DBPORT=5432
+DBNAME=kamailio
+DBRWUSER=postgres
+DBRWPW=postgres
+DBROUSER=postgres
+DBROPW=postgres
+DBACCESSHOST=postgres
+INSTALL_EXTRA_TABLES=yes
+INSTALL_PRESENCE_TABLES=no
+INSTALL_DBUID_TABLES=no
+STORE_PLAINTEXT_PW=1
