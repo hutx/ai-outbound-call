@@ -18,8 +18,7 @@ class Settings(BaseSettings):
     sip_domain: str = ""
 
     # ---- Aliyun ASR (Paraformer) ----
-    aliyun_asr_access_token: str = ""
-    aliyun_asr_app_key: str = ""
+    aliyun_asr_api_key: str = ""
     aliyun_asr_model: str = "paraformer-realtime-v2"
     aliyun_asr_ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 

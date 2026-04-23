@@ -67,7 +67,10 @@
       "Bash(git stash:*)",
       "Bash(wc:*)",
       "Bash(echo exit: $?:*)",
-      "Bash(md5:*)"
+      "Bash(md5:*)",
+      "Bash(gh api:*)",
+      "Bash(sudo:*)",
+      "Bash(netstat:*)"
     ]
   }
 }

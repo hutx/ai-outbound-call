@@ -19,6 +19,8 @@ services:
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
+      # RTP 媒体端口范围（与 sip-config.yaml rtp_port 对应）
+      # - "50000-60000:50000-60000/udp"
     volumes:
       - ./sip-config.yaml:/sip/config.yaml
     environment:
@@ -131,7 +133,7 @@ services:
 
   # Kamailio SIP Server - 软电话注册与路由
   # 使用 bridge 模式 + 端口映射 5080:5060
-  # kamailio.cfg 中配置了 advertise 192.168.5.14:5080，确保 Via/Record-Route 使用可达地址
+  # kamailio.cfg 中配置了 advertise 192.168.5.15:5080，确保 Via/Record-Route 使用可达地址
   # 同时启用 fix_nated_sdp 修复 SDP 中的 NAT 地址，解决 RTP 媒体流不通问题
   kamailio:
     image: kamailio/kamailio-ci:5.4.7-alpine

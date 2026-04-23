@@ -122,7 +122,7 @@ class AliyunSTT(stt.STT):
                 interim_results=True,
             )
         )
-        self._api_key = api_key or settings.aliyun_asr_access_token
+        self._api_key = api_key or settings.aliyun_asr_api_key
         self._model = model or settings.aliyun_asr_model
         self._ws_url = ws_url or settings.aliyun_asr_ws_url
         self._language_hints = language_hints or ["zh", "en"]
@@ -130,7 +130,7 @@ class AliyunSTT(stt.STT):
         if not self._api_key:
             raise ValueError(
                 "AliyunSTT: API Key 未配置。"
-                "请设置 aliyun_asr_access_token 配置项或传入 api_key 参数。"
+                "请设置 aliyun_asr_api_key 配置项或传入 api_key 参数。"
             )
 
     @property
@@ -406,16 +406,31 @@ class AliyunSTTStream(stt.RecognizeStream):
     async def _send_audio_loop(self) -> None:
         """从 input_ch 读取 AudioFrame 并发送到 WebSocket"""
         assert self._ws is not None
+        frame_count = 0
+        total_bytes = 0
+        ws_send_count = 0
 
         try:
             # 使用 RecognizeStream 的 _input_ch 读取音频帧
             async for item in self._input_ch:
                 if isinstance(item, self._FlushSentinel):
                     # flush 信号：发送 finish-task 并等待剩余结果
+                    logger.info(
+                        f"AliyunSTTStream: 收到 flush 信号，已接收 {frame_count} 帧 "
+                        f"({total_bytes} bytes), WebSocket 发送 {ws_send_count} 次"
+                    )
                     await self._ws.send(_build_finish_task_message(self._task_id))
                     continue
 
                 frame: rtc.AudioFrame = item
+                frame_count += 1
+                total_bytes += len(frame.data)
+                if frame_count <= 5:
+                    logger.info(
+                        f"AliyunSTTStream: 接收音频帧 #{frame_count}, "
+                        f"sr={frame.sample_rate}, ch={frame.num_channels}, "
+                        f"samples={frame.samples_per_channel}, bytes={len(frame.data)}"
+                    )
                 # 基类 RecognizeStream 已处理重采样到 16kHz
                 audio_bytes = frame.data.tobytes() if hasattr(frame.data, "tobytes") else bytes(frame.data)
 
@@ -425,6 +440,7 @@ class AliyunSTTStream(stt.RecognizeStream):
                     chunk = audio_bytes[offset : offset + _SEND_CHUNK_SIZE]
                     try:
                         await self._ws.send(chunk)
+                        ws_send_count += 1
                     except websockets.exceptions.ConnectionClosed:
                         logger.warning("AliyunSTTStream: 发送音频时连接已关闭")
                         return

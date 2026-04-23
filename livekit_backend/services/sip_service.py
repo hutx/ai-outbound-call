@@ -113,7 +113,7 @@ class SipService:
                 sip_call_to=phone,
                 participant_identity=f"sip_{phone}",
                 participant_name=f"Phone {phone}",
-                play_dialtone=False,
+                play_dialtone=True,
             )
         )
 
