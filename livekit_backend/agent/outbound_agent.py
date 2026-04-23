@@ -2,11 +2,12 @@
 import json
 import logging
 import asyncio
+import re
 import time
 from datetime import datetime
 from typing import Optional
 
-from livekit import agents, rtc
+from livekit import agents, api as livekit_api, rtc
 from livekit.agents import Agent, AgentSession, AutoSubscribe
 from livekit.agents.voice.turn import TurnHandlingOptions
 from livekit.plugins import silero
@@ -30,7 +31,7 @@ from livekit_backend.utils import db
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONVERSATION_ROUNDS = 50
+_MAX_CONVERSATION_ROUNDS = 6
 
 
 class OutboundCallAgent:
@@ -108,7 +109,7 @@ class OutboundCallAgent:
 
             # 5. 构建系统提示
             self._system_prompt = build_system_prompt(
-                script.get("main_prompt", "你是一个智能外呼助手。"),
+                script.get("main_prompt", "请根据用户的回答进行自然的对话。"),
                 self.customer_info,
             )
 
@@ -133,7 +134,11 @@ class OutboundCallAgent:
 
             # 9. 设置用户输入监听队列
             self._transcript_queue = asyncio.Queue()
-            self._session.on(agents.UserInputTranscribedEvent, self._on_user_input)
+            # 注意：LiveKit Agents SDK 1.5.x 的 EventEmitter 不允许直接注册 async 回调
+            # 必须用同步包装器，内部通过 asyncio.create_task() 调用异步方法
+            def _on_user_input_sync(evt):
+                asyncio.create_task(self._on_user_input(evt))
+            self._session.on("user_input_transcribed", _on_user_input_sync)
 
             # 10. 连接到 Room
             await self.ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -166,13 +171,16 @@ class OutboundCallAgent:
                     await asyncio.sleep(pause_ms / 1000.0)
 
             # 14. 多轮对话循环
-            await self._conversation_loop(script)
+            loop_result = await self._conversation_loop(script)
 
-            # 15. 播放结束语
-            closing_text = script.get("closing_text", "")
-            if closing_text:
-                logger.info(f"播放结束语: {closing_text[:50]}...")
-                await self._speak(closing_text, allow_interruptions=script.get("barge_in_closing", False))
+            # 15. 根据结束原因决定是否播放结束语
+            # - "no_response_hangup": 无响应挂断，hangup_text 已在循环内播完，不再播 closing_text
+            # - "intent_end" / 其他: 用户意图结束，播放结束语并等待完毕后再断开
+            if loop_result != "no_response_hangup":
+                closing_text = script.get("closing_text", "")
+                if closing_text:
+                    logger.info(f"播放结束语: {closing_text[:50]}...")
+                    await self._speak(closing_text, allow_interruptions=script.get("barge_in_closing", False))
 
         except Exception as e:
             logger.error(f"Agent 异常: {e}", exc_info=True)
@@ -186,6 +194,8 @@ class OutboundCallAgent:
         finally:
             # 16. 保存最终 CDR
             await self._finalize_cdr()
+            # 17. 挂断 SIP 通话（删除 Room → SIP BYE → Zoiper 端通话结束）
+            await self._hangup_sip_call()
             # 清理 session
             if self._session is not None:
                 try:
@@ -198,13 +208,22 @@ class OutboundCallAgent:
     # 对话循环
     # ------------------------------------------------------------------
 
-    async def _conversation_loop(self, script: dict):
-        """多轮对话主循环"""
+    async def _conversation_loop(self, script: dict) -> str:
+        """多轮对话主循环
+
+        Returns:
+            结束原因字符串:
+            - "no_response_hangup": 连续无响应达到阈值，hangup_text 已播报完毕
+            - "intent_end": LLM 决策结束（closing_text 将在循环外播报）
+            - "max_rounds": 达到最大轮次
+        """
         for round_num in range(_MAX_CONVERSATION_ROUNDS):
             logger.info(f"--- 第 {round_num + 1} 轮对话 ---")
 
             # A. 等待用户说话（带超时）
+            t_wait_start = time.monotonic()
             user_text = await self._wait_for_user_input()
+            t_wait_end = time.monotonic()
 
             if user_text is None:
                 # 无响应处理
@@ -215,15 +234,18 @@ class OutboundCallAgent:
                 )
                 await self._speak(result["prompt_text"])
                 if result["should_hangup"]:
-                    break
+                    logger.info("无响应达到阈值，hangup_text 已播报完毕，直接结束通话（不再播 closing_text）")
+                    return "no_response_hangup"
                 continue
 
             # B. 宽容期处理
+            t_tolerance_start = time.monotonic()
             if self.dialog_mgr.tolerance.enabled:
                 user_text = await self.dialog_mgr.wait_with_tolerance(
                     user_text,
                     listen_func=self._listen_additional,
                 )
+            t_tolerance_end = time.monotonic()
 
             # C. 记录用户输入
             self.dialog_mgr.on_user_responded(user_text)
@@ -234,19 +256,21 @@ class OutboundCallAgent:
                 "timestamp": time.time(),
                 "duration_sec": 0,
             })
-            logger.info(f"用户: {user_text}")
+            t_user_received = time.monotonic()
+            logger.info(
+                f"用户: {user_text} "
+                f"[perf: 等待={(t_wait_end - t_wait_start)*1000:.0f}ms, "
+                f"宽容期={(t_tolerance_end - t_tolerance_start)*1000:.0f}ms]"
+            )
 
-            # D. LLM 推理
-            llm_response = await self._get_llm_response()
+            # D. LLM 推理 + 流式播报（边生成边播，降低延迟）
+            llm_response = await self._stream_llm_and_speak(
+                allow_interruptions=self.dialog_mgr.barge_in.enabled,
+            )
 
-            # E. 播报 AI 回复
+            # E. 记录 AI 回复
             if llm_response.text:
                 logger.info(f"AI: {llm_response.text[:100]}...")
-                self.dialog_mgr.on_ai_speaking_start()
-                await self._speak(
-                    llm_response.text,
-                    allow_interruptions=self.dialog_mgr.barge_in.enabled,
-                )
                 self.dialog_mgr.on_ai_speaking_end()
 
                 self.messages.append({"role": "assistant", "content": llm_response.text})
@@ -259,33 +283,37 @@ class OutboundCallAgent:
 
             # F. 处理动作
             if llm_response.action == CallAction.END:
-                logger.info("LLM 决策: 结束通话")
-                break
+                logger.info("LLM 决策: 结束通话，将在循环外播报 closing_text")
+                return "intent_end"
             elif llm_response.action == CallAction.TRANSFER:
                 logger.info("LLM 决策: 转接人工")
                 # TODO: 实现转接逻辑
-                break
+                return "intent_end"
             elif llm_response.action == CallAction.CALLBACK:
                 logger.info("LLM 决策: 预约回拨")
                 # TODO: 实现回拨逻辑
-                break
+                return "intent_end"
             elif llm_response.action == CallAction.BLACKLIST:
                 logger.info("LLM 决策: 加入黑名单")
                 # TODO: 实现黑名单逻辑
-                break
+                return "intent_end"
+
+        # 达到最大轮次
+        return "max_rounds"
 
     # ------------------------------------------------------------------
     # 用户输入监听
     # ------------------------------------------------------------------
 
-    def _on_user_input(self, evt: agents.UserInputTranscribedEvent):
+    async def _on_user_input(self, evt):
         """处理用户语音转录事件"""
         if not evt.is_final:
             return
         text = (evt.transcript or "").strip()
         if not text:
             return
-        logger.debug(f"STT 转录: {text}")
+        t_now = time.monotonic()
+        logger.info(f"STT 转录（final）: {text} [perf: monotonic={t_now:.3f}]")
         if self._transcript_queue is not None:
             self._transcript_queue.put_nowait(text)
 
@@ -323,17 +351,163 @@ class OutboundCallAgent:
         return " ".join(parts) if parts else None
 
     # ------------------------------------------------------------------
-    # LLM 调用
+    # LLM 调用（流式 + 实时 TTS）
     # ------------------------------------------------------------------
 
-    async def _get_llm_response(self) -> LLMResponse:
-        """调用 LLM 获取回复（流式）"""
+    # 句末标点：在这些标点处可以切分句子交给 TTS
+    _SENTENCE_END_RE = re.compile(r'[。！？;；]')
+
+    @staticmethod
+    def _split_at_sentence(text: str):
+        """在句末标点处切分，返回 (complete_sentence, remaining)。
+
+        如果没有句末标点则返回 (None, text)，让调用方继续缓冲。
+        """
+        m = OutboundCallAgent._SENTENCE_END_RE.search(text)
+        if m is None:
+            return None, text
+        idx = m.end()  # 包含句末标点
+        return text[:idx], text[idx:]
+
+    async def _stream_llm_and_speak(
+        self,
+        allow_interruptions: bool = True,
+    ) -> LLMResponse:
+        """流式调用 LLM，边生成边播报（首句即播），降低端到端延迟。
+
+        与旧逻辑 _get_llm_response + _speak 的区别：
+          - 旧：LLM 全部输出 → 再全部交给 TTS → 等待播完
+          - 新：LLM 每产出一个完整句子 → 立即 session.say() 交给 TTS
+                  用户在 LLM 仍在生成后续句子时就能听到第一句
+        """
         # 构建 ChatContext
         chat_ctx = agents.ChatContext()
-        # 系统提示
         if self._system_prompt:
             chat_ctx.add_message(role="system", content=self._system_prompt)
-        # 对话历史
+        for msg in self.messages:
+            chat_ctx.add_message(role=msg["role"], content=msg["content"])
+
+        parser = StreamingResponseParser()
+        sentence_buf = ""
+        speech_handles: list = []
+        t0 = time.monotonic()  # 整体起始时间
+        t_llm_start = t0
+        first_token_received = False
+        first_sentence_sent = False
+        t_first_token = None
+        t_first_sentence = None
+
+        def _speak_now(txt: str):
+            """将文本交给 session.say()（非阻塞），同时记录 handle"""
+            if not txt or not txt.strip():
+                return
+            if self._session is None:
+                return
+            t_speak_now = time.monotonic()
+            handle = self._session.say(
+                txt.strip(),
+                allow_interruptions=allow_interruptions,
+                add_to_chat_ctx=False,
+            )
+            speech_handles.append(handle)
+            logger.info(
+                f"[perf] session.say() 调度: text={txt.strip()[:30]}... "
+                f"耗时={(time.monotonic() - t_speak_now)*1000:.0f}ms"
+            )
+
+        try:
+            t_stream_start = time.monotonic()
+            stream = self._llm.chat(chat_ctx=chat_ctx)
+            logger.info(f"[perf] LLM chat() 创建: {(time.monotonic() - t_stream_start)*1000:.0f}ms")
+
+            chunk_count = 0
+            async for chunk in stream:
+                delta = chunk.delta
+                if not (delta and delta.content):
+                    continue
+                chunk_count += 1
+                if not first_token_received:
+                    first_token_received = True
+                    t_first_token = time.monotonic()
+                    ttft = t_first_token - t_llm_start
+                    logger.info(f"[perf] LLM TTFT(首token延迟): {ttft*1000:.0f}ms")
+
+                out = parser.feed(delta.content)
+                if not out:
+                    continue
+                sentence_buf += out
+                # 尽早切分并播报
+                while True:
+                    sentence, sentence_buf = self._split_at_sentence(sentence_buf)
+                    if sentence is None:
+                        break
+                    if not first_sentence_sent:
+                        t_first_sentence = time.monotonic()
+                        latency = t_first_sentence - t0
+                        logger.info(
+                            f"[perf] 首句延迟: {latency*1000:.0f}ms "
+                            f"(TTFT={((t_first_token or t0) - t_llm_start)*1000:.0f}ms + "
+                            f"句子累积={(t_first_sentence - (t_first_token or t0))*1000:.0f}ms)"
+                        )
+                        first_sentence_sent = True
+                    _speak_now(sentence)
+
+            # 刷新解析器
+            remaining = parser.flush()
+            if remaining:
+                sentence_buf += remaining
+
+            # 把剩余文本也播报
+            if sentence_buf.strip():
+                _speak_now(sentence_buf)
+
+            t_llm_done = time.monotonic()
+            logger.info(
+                f"[perf] LLM 流式完成: 总耗时={(t_llm_done - t_llm_start)*1000:.0f}ms, "
+                f"chunks={chunk_count}, sentences={len(speech_handles)}"
+            )
+
+        except Exception as e:
+            logger.error(f"LLM 调用异常: {e}", exc_info=True)
+            return LLMResponse(text="抱歉，我这边有点问题，请您稍后再试。")
+
+        # 等待所有播报完成
+        t_playout_start = time.monotonic()
+        for h in speech_handles:
+            try:
+                await h.wait_for_playout()
+            except Exception as e:
+                logger.warning(f"等待播报完成时出错: {e}")
+        t_playout_done = time.monotonic()
+        logger.info(f"[perf] 播放完成: 耗时={(t_playout_done - t_playout_start)*1000:.0f}ms")
+
+        result = parser.get_result()
+        if not result.text:
+            # 兜底：parser 没提取到文本但 TTS 可能已经播了一些
+            all_spoken = []
+            for h in speech_handles:
+                txt = getattr(h, 'text', '') or ''
+                if txt:
+                    all_spoken.append(txt)
+            if all_spoken:
+                result.text = ' '.join(all_spoken)
+
+        total_e2e = time.monotonic() - t0
+        logger.info(
+            f"[perf] 端到端: {total_e2e*1000:.0f}ms | "
+            f"LLM 响应: intent={result.intent.value}, action={result.action.value}, "
+            f"text={result.text[:80]}..."
+        )
+        return result
+
+    async def _get_llm_response(self) -> LLMResponse:
+        """调用 LLM 获取回复（流式，仅收集不播报）
+
+        仅用于无响应追问等不需要流式播报的简单场景。
+        """
+        chat_ctx = agents.ChatContext()
+        if self._system_prompt:
+            chat_ctx.add_message(role="system", content=self._system_prompt)
         for msg in self.messages:
             chat_ctx.add_message(role=msg["role"], content=msg["content"])
 
@@ -345,22 +519,17 @@ class OutboundCallAgent:
             async for chunk in stream:
                 delta = chunk.delta
                 if delta and delta.content:
-                    token = delta.content
-                    out = parser.feed(token)
+                    out = parser.feed(delta.content)
                     if out:
                         full_text_parts.append(out)
-
-            # 刷新缓冲区
             remaining = parser.flush()
             if remaining:
                 full_text_parts.append(remaining)
-
         except Exception as e:
             logger.error(f"LLM 调用异常: {e}", exc_info=True)
             return LLMResponse(text="抱歉，我这边有点问题，请您稍后再试。")
 
         result = parser.get_result()
-        # 如果流式解析器没有提取到文本，使用完整拼接文本
         if not result.text and full_text_parts:
             result.text = " ".join(full_text_parts).strip()
 
@@ -459,6 +628,36 @@ class OutboundCallAgent:
             logger.error(f"保存最终 CDR 失败: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
+    # SIP 挂断
+    # ------------------------------------------------------------------
+
+    async def _hangup_sip_call(self):
+        """挂断 SIP 通话：通过 LiveKit API 删除 Room，触发 SIP BYE 信令。
+
+        Agent 进程无法访问 API 服务的 SipService 实例，
+        因此在此处直接创建 LiveKit API 客户端来删除 Room。
+        删除 Room 后，所有参与者（包括 SIP 参与者）都会被断开，
+        LiveKit SIP 网关会向对端发送 SIP BYE，Zoiper 端通话结束。
+        """
+        try:
+            api_url = settings.livekit_url.replace("ws://", "http://").replace("wss://", "https://")
+            lk_api = livekit_api.LiveKitAPI(
+                url=api_url,
+                api_key=settings.livekit_api_key,
+                api_secret=settings.livekit_api_secret,
+            )
+            try:
+                await lk_api.room.delete_room(
+                    livekit_api.DeleteRoomRequest(room=self.call_id)
+                )
+                logger.info(f"SIP 通话已挂断（Room 已删除）: call_id={self.call_id}")
+            finally:
+                await lk_api.aclose()
+        except Exception as e:
+            # Room 可能已被删除（如用户先挂断），忽略此类错误
+            logger.warning(f"挂断 SIP 通话时出错（可能 Room 已不存在）: {e}")
+
+    # ------------------------------------------------------------------
     # 默认话术
     # ------------------------------------------------------------------
 
@@ -472,9 +671,7 @@ class OutboundCallAgent:
             "opening_text": "您好，我是智能客服助手。",
             "opening_pause_ms": 2000,
             "main_prompt": (
-                "你是一个智能外呼助手。请用自然、礼貌的中文与用户对话。"
-                "每次回复后，在 <decision>{\"intent\": \"...\", \"action\": \"...\"}</decision> "
-                "中标注用户意向和你的决策动作。"
+                "你是一个专业的电话客服助手，请根据用户的回答进行自然的对话。"
             ),
             "closing_text": "感谢您的接听，再见！",
             "barge_in_opening": False,
@@ -483,7 +680,7 @@ class OutboundCallAgent:
             "barge_in_protect_start_sec": 1.0,
             "barge_in_protect_end_sec": 1.0,
             "tolerance_enabled": True,
-            "tolerance_ms": 1000,
+            "tolerance_ms": 500,
             "no_response_timeout_sec": 5,
             "no_response_mode": "consecutive",
             "no_response_max_count": 3,

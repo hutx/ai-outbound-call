@@ -59,11 +59,25 @@ def _build_run_task_message(
     sample_rate: int = 16000,
     format: str = "pcm",
     language_hints: list[str] | None = None,
+    max_sentence_silence: int = 400,
+    semantic_sentence_detection: bool = True,
 ) -> str:
-    """构造 Paraformer run-task 指令"""
+    """构造 Paraformer run-task 指令
+
+    Args:
+        max_sentence_silence: 句尾静默检测时间(ms)，默认400ms(原默认800ms)。
+            缩短此值可更快检测到用户说完一句话，降低STT延迟。
+        semantic_sentence_detection: 是否启用语义断句，默认True。
+            开启后模型会根据语义判断句尾，而不是仅依赖静默时长。
+    """
     parameters: dict = {
         "format": format,
         "sample_rate": sample_rate,
+        "enable_intermediate_result": True,
+        "enable_punctuation_prediction": True,
+        "enable_inverse_text_normalization": True,
+        "max_sentence_silence": max_sentence_silence,
+        "semantic_sentence_detection": semantic_sentence_detection,
     }
     if language_hints:
         parameters["language_hints"] = language_hints
@@ -515,6 +529,11 @@ class AliyunSTTStream(stt.RecognizeStream):
 
         if not text:
             return
+
+        logger.info(
+            f"AliyunSTT result: text='{text}', sentence_end={sentence_end}, "
+            f"begin={begin_time}, end={end_time}, confidence={confidence:.2f}"
+        )
 
         lang = self._language_hints[0] if self._language_hints else "zh"
 

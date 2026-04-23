@@ -518,9 +518,9 @@ class AliyunTTSStreamAdapter(tts.SynthesizeStream):
 
     工作流程:
       1. 从 _input_ch 读取文本片段
-      2. 对每个片段建立独立的 WebSocket 连接进行合成
-      3. 通过 output_emitter.push() 推送音频数据
-      4. 使用 start_segment / end_segment 管理段落
+      2. 对每个片段立即建立 WebSocket 连接进行合成（流式逐句播报）
+      3. 相邻短片段合并以减少 WebSocket 连接开销
+      4. 通过 output_emitter.push() 推送音频数据
     """
 
     def __init__(
@@ -535,11 +535,10 @@ class AliyunTTSStreamAdapter(tts.SynthesizeStream):
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         """SynthesizeStream 核心方法 — 处理输入文本流并输出音频流
 
-        关键修复：LiveKit Agents SDK 会将文本按标点拆分为多个片段
-        （例如将 "您好？" 拆为 "您好" + "？"），CosyVoice API 会拒绝
-        纯标点片段。因此需要：
-        1. 过滤掉纯标点文本片段（避免 InvalidParameter 错误）
-        2. 将多个有效文本片段合并为一个合成请求（减少 WebSocket 连接数）
+        关键优化：每个文本片段独立合成并立即推送音频，
+        而非等待所有文本收集完毕后再合成。
+        这样 LLM 生成第一句后，TTS 就能立即开始合成，
+        用户在 LLM 仍在生成后续句子时就能听到第一句。
         """
         output_emitter.initialize(
             request_id=utils.shortuuid(),
@@ -549,45 +548,76 @@ class AliyunTTSStreamAdapter(tts.SynthesizeStream):
             mime_type="audio/pcm",
         )
 
-        # 收集所有有效文本片段，最后合并为一次合成
-        # 这样可以避免 SDK 拆分文本导致的纯标点片段问题
-        text_parts: list[str] = []
-        got_flush = False
+        # 逐段合成：收到有效文本片段后立即合成，不等待所有片段
+        # 相邻短片段（<=4字）与下一个片段合并，减少 WebSocket 开销
+        pending_short: list[str] = []  # 短片段缓冲
+        seg_idx = 0
 
         async for data in self._input_ch:
             if isinstance(data, self._FlushSentinel):
-                got_flush = True
+                # flush 前先把缓冲的短片段合并合成
+                if pending_short:
+                    combined = " ".join(pending_short)
+                    pending_short = []
+                    if not _is_punctuation_only(combined):
+                        seg_id = f"seg_{seg_idx}"
+                        seg_idx += 1
+                        output_emitter.start_segment(segment_id=seg_id)
+                        await _ws_synthesize(
+                            self._tts_instance, combined, output_emitter, seg_id
+                        )
+                        output_emitter.end_segment()
+                output_emitter.flush()
                 continue
 
-            # data 为文本片段
             text = data.strip() if isinstance(data, str) else ""
             if not text:
                 continue
 
-            # 过滤纯标点片段（CosyVoice 会拒绝 InvalidParameter）
+            # 过滤纯标点片段
             if _is_punctuation_only(text):
-                logger.info(
-                    f"AliyunTTS stream: 跳过纯标点片段: {text!r}"
-                )
+                logger.info(f"AliyunTTS stream: 跳过纯标点片段: {text!r}")
                 continue
 
-            text_parts.append(text)
+            # 短片段（<=4字）合并到缓冲区，等下一个片段一起合成
+            if len(text) <= 4 and pending_short is not None:
+                pending_short.append(text)
+                continue
 
-        # 合并所有有效文本片段为一次合成
-        if text_parts:
-            combined_text = " ".join(text_parts)
-            segment_id = "seg_0"
-            output_emitter.start_segment(segment_id=segment_id)
+            # 有短片段缓冲 + 当前片段 → 合并
+            if pending_short:
+                combined = " ".join(pending_short + [text])
+                pending_short = []
+            else:
+                combined = text
+
+            # 立即合成当前片段
+            seg_id = f"seg_{seg_idx}"
+            seg_idx += 1
+            output_emitter.start_segment(segment_id=seg_id)
             logger.info(
-                f"AliyunTTS stream: 合并合成, parts={len(text_parts)}, "
-                f"combined_text={combined_text!r:.100}..."
+                f"AliyunTTS stream: 逐段合成, seg={seg_id}, "
+                f"text={combined!r:.80}..."
             )
             await _ws_synthesize(
-                self._tts_instance, combined_text, output_emitter, segment_id
+                self._tts_instance, combined, output_emitter, seg_id
             )
             output_emitter.end_segment()
 
-        if got_flush:
-            output_emitter.flush()
+        # 循环结束，处理剩余短片段
+        if pending_short:
+            combined = " ".join(pending_short)
+            if not _is_punctuation_only(combined):
+                seg_id = f"seg_{seg_idx}"
+                seg_idx += 1
+                output_emitter.start_segment(segment_id=seg_id)
+                logger.info(
+                    f"AliyunTTS stream: 尾段合成, seg={seg_id}, "
+                    f"text={combined!r:.80}..."
+                )
+                await _ws_synthesize(
+                    self._tts_instance, combined, output_emitter, seg_id
+                )
+                output_emitter.end_segment()
 
         # 所有文本处理完毕，_main_task 会调用 output_emitter.end_input()

@@ -20,7 +20,7 @@ class BargeInConfig:
 class ToleranceConfig:
     """宽容期配置"""
     enabled: bool = True
-    duration_ms: int = 1000  # 宽容期时长
+    duration_ms: int = 500  # 宽容期时长（从1000ms降至500ms，降低等待延迟）
 
 
 @dataclass

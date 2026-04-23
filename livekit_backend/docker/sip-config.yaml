@@ -4,3 +4,12 @@ api_secret: secret
 ws_url: ws://livekit-server:7880
 redis:
   address: redis:6379
+
+# SIP NAT 配置：解决 Docker bridge 网络下 RTP 上行单向不通
+# nat_1_to_1_ip 设置后，SDP 中的 Via/Contact/媒体地址都会使用该 IP（而非 Docker 内网 IP）
+# rtp_port 限制动态端口范围，便于在 docker-compose.yml 中做 UDP 端口映射
+# use_external_ip 和 nat_1_to_1_ip 不能同时设置
+nat_1_to_1_ip: "192.168.5.15"
+media_nat_1_to_1_ip: "192.168.5.15"
+sip_port: 5060
+rtp_port: "10000-10100"

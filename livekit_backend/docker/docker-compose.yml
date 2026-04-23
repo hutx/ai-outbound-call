@@ -20,7 +20,8 @@ services:
       - "5060:5060/udp"
       - "5060:5060/tcp"
       # RTP 媒体端口范围（与 sip-config.yaml rtp_port 对应）
-      # - "50000-60000:50000-60000/udp"
+      # 必须暴露 UDP 端口，否则 Zoiper 发送到 external_ip:RTP_PORT 的包无法到达容器
+      - "10000-10100:10000-10100/udp"
     volumes:
       - ./sip-config.yaml:/sip/config.yaml
     environment:

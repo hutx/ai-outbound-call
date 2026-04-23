@@ -109,19 +109,6 @@ VALUES (
     '默认话术',
     'general',
     '您好，我是智能助手，请问有什么可以帮助您的吗？',
-    '你是一个专业的电话客服助手。请根据用户的回答进行自然的对话。
-
-在每次回复时，你需要输出两部分：
-1. 你要说的话（纯文本）
-2. 决策信息（JSON格式，用 <decision> 标签包裹）
-
-决策JSON格式：
-<decision>{"intent": "interested|need_more_info|not_interested|busy|request_human|callback|unknown", "action": "continue|transfer|end|callback|send_sms|blacklist"}</decision>
-
-注意：
-- 保持回复简洁，每次不超过3句话
-- 根据用户意图判断下一步动作
-- 如果用户明确拒绝，action 设为 end
-- 如果用户要求转人工，action 设为 transfer',
+    '你是一个专业的电话客服助手。请根据用户的回答进行自然的对话。',
     '感谢您的接听，祝您生活愉快，再见！'
 ) ON CONFLICT (script_id) DO NOTHING;
