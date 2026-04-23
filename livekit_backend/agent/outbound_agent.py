@@ -117,7 +117,11 @@ class OutboundCallAgent:
             stt = AliyunSTT()
             self._llm = create_qwen_llm()
             tts_engine = AliyunTTS()
-            vad = silero.VAD.load()
+            vad = silero.VAD.load(
+                activation_threshold=0.5,
+                min_speech_duration=0.2,   # 200ms → 0.2s
+                min_silence_duration=0.5,   # 500ms → 0.5s
+            )
 
             # 7. 创建 Agent（手动回合模式，由我们控制对话循环）
             self._agent = Agent(
@@ -126,7 +130,18 @@ class OutboundCallAgent:
                 llm=self._llm,
                 tts=tts_engine,
                 vad=vad,
-                turn_handling=TurnHandlingOptions(turn_detection="manual"),
+                turn_handling=TurnHandlingOptions(
+                    turn_detection="manual",
+                    interruption={
+                        "enabled": True,
+                        "mode": "vad",
+                        "min_duration": 0.3,   # 用户说话≥300ms 触发打断
+                        "min_words": 0,         # 无需等待关键词，开口即打断
+                    },
+                    preemptive_generation={
+                        "enabled": False,        # 非预测模式（节省 Token）
+                    },
+                ),
             )
 
             # 8. 创建 AgentSession
