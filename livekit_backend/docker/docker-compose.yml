@@ -1,7 +1,8 @@
 services:
   # LiveKit Server - 实时音视频服务器
+  # 注意: 版本需与 egress 兼容，pin 到同一发布版本
   livekit-server:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.7.2
     ports:
       - "7880:7880"   # HTTP/WebSocket
       - "7881:7881"   # RTC (TCP)
@@ -156,6 +157,47 @@ services:
       default:
         aliases:
           - kamailio
+
+  # MinIO - S3 兼容存储（录音文件存储）
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${LK_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${LK_MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ./minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+  # LiveKit Egress - 录制/导出服务
+  # 注意: 版本需与 livekit-server 兼容，pin 到同一发布版本
+  livekit-egress:
+    image: livekit/egress:v1.8.2
+    container_name: livekit-egress
+    environment:
+      EGRESS_CONFIG_BODY: |
+        log_level: debug
+        api_key: ${LK_LIVEKIT_API_KEY}
+        api_secret: ${LK_LIVEKIT_API_SECRET}
+        ws_url: ws://livekit-server:7880
+        redis:
+          address: redis:6379
+        s3:
+          access_key: ${LK_MINIO_ACCESS_KEY:-minioadmin}
+          secret: ${LK_MINIO_SECRET_KEY:-minioadmin}
+          region: us-east-1
+          endpoint: http://minio:9000
+          bucket: ${LK_MINIO_BUCKET:-lk-recordings}
+          force_path_style: true
+    depends_on:
+      - livekit-server
+      - redis
+      - minio
+    restart: unless-stopped
 
 volumes:
   postgres_data:

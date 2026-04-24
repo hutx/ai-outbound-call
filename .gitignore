@@ -20,6 +20,9 @@ docker/recordings/
 docker/docker/
 docker/logs/
 docker/redis_data/
+docker/minio_data/
+livekit_backend/docker/minio_data/
+*.egg-info/
 docker/.env
 
 # Logs

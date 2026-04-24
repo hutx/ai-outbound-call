@@ -50,7 +50,9 @@ LIVEKIT_URL = _raw_url.replace("ws://", "http://").replace("wss://", "https://")
 LIVEKIT_API_KEY = os.getenv("LK_LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LK_LIVEKIT_API_SECRET", "secret")
 OUTBOUND_NUMBER = os.getenv("LK_SIP_OUTBOUND_NUMBER", "+8610000000")
-KAMAILIO_DOMAIN = os.getenv("LK_KAMAILIO_SIP_DOMAIN", "kamailio")
+# Outbound Trunk 目标地址：使用 Docker 内部主机名，而非外部 IP
+# LK_KAMAILIO_SIP_DOMAIN 是外部可达地址（给软电话用），不适合容器间通信
+OUTBOUND_HOST = os.getenv("LK_SIP_OUTBOUND_HOST", "kamailio")
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -113,28 +115,54 @@ async def init_sip_trunk() -> None:
 # Outbound Trunk
 # ---------------------------------------------------------------------------
 async def _ensure_outbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
-    """检查并创建 Outbound SIP Trunk，返回 trunk_id。"""
+    """检查并创建 Outbound SIP Trunk，返回 trunk_id。
+
+    如果同名 Trunk 已存在但 numbers 不同，先删除再重建。
+    """
     logger.info("检查 Outbound SIP Trunk ...")
 
     resp = await lk.sip.list_sip_outbound_trunk(
         livekit_api.ListSIPOutboundTrunkRequest()
     )
+    expected_address = f"{OUTBOUND_HOST}:5060"
     for trunk in resp.items:
         if trunk.name == OUTBOUND_TRUNK_NAME:
-            logger.info("Outbound Trunk 已存在: %s (id=%s)，跳过创建", trunk.name, trunk.sip_trunk_id)
+            # 检查 numbers 和 address 是否与当前配置一致
+            need_rebuild = False
+            if OUTBOUND_NUMBER not in trunk.numbers:
+                logger.warning(
+                    "Outbound Trunk numbers 不一致: 当前=%s, 期望=%s，需要重建",
+                    trunk.numbers, [OUTBOUND_NUMBER],
+                )
+                need_rebuild = True
+            if trunk.address != expected_address:
+                logger.warning(
+                    "Outbound Trunk address 不一致: 当前=%s, 期望=%s，需要重建",
+                    trunk.address, expected_address,
+                )
+                need_rebuild = True
+            if need_rebuild:
+                await lk.sip.delete_sip_trunk(
+                    livekit_api.DeleteSIPTrunkRequest(
+                        sip_trunk_id=trunk.sip_trunk_id,
+                    )
+                )
+                logger.info("旧 Outbound Trunk 已删除: id=%s", trunk.sip_trunk_id)
+                break  # 退出循环，继续创建新 Trunk
+            logger.info("Outbound Trunk 已存在: %s (id=%s, address=%s)，跳过创建", trunk.name, trunk.sip_trunk_id, trunk.address)
             return trunk.sip_trunk_id
 
-    logger.info("创建 Outbound SIP Trunk: name=%s, address=%s:5060", OUTBOUND_TRUNK_NAME, KAMAILIO_DOMAIN)
+    logger.info("创建 Outbound SIP Trunk: name=%s, address=%s:5060", OUTBOUND_TRUNK_NAME, OUTBOUND_HOST)
     trunk = await lk.sip.create_sip_outbound_trunk(
         livekit_api.CreateSIPOutboundTrunkRequest(
             trunk=livekit_api.SIPOutboundTrunkInfo(
                 name=OUTBOUND_TRUNK_NAME,
-                address=f"{KAMAILIO_DOMAIN}:5060",
+                address=f"{OUTBOUND_HOST}:5060",
                 numbers=[OUTBOUND_NUMBER],
             )
         )
     )
-    logger.info("Outbound Trunk 创建成功: id=%s", trunk.sip_trunk_id)
+    logger.info("Outbound Trunk 创建成功: id=%s, numbers=%s", trunk.sip_trunk_id, [OUTBOUND_NUMBER])
     return trunk.sip_trunk_id
 
 
@@ -142,7 +170,10 @@ async def _ensure_outbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
 # Inbound Trunk
 # ---------------------------------------------------------------------------
 async def _ensure_inbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
-    """检查并创建 Inbound SIP Trunk，返回 trunk_id。"""
+    """检查并创建 Inbound SIP Trunk，返回 trunk_id。
+
+    如果同名 Trunk 已存在但 numbers 不同，先删除再重建。
+    """
     logger.info("检查 Inbound SIP Trunk ...")
 
     resp = await lk.sip.list_sip_inbound_trunk(
@@ -150,6 +181,19 @@ async def _ensure_inbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
     )
     for trunk in resp.items:
         if trunk.name == INBOUND_TRUNK_NAME:
+            # 检查 numbers 是否与当前配置一致
+            if OUTBOUND_NUMBER not in trunk.numbers:
+                logger.warning(
+                    "Inbound Trunk numbers 不一致: 当前=%s, 期望=%s，删除并重建",
+                    trunk.numbers, [OUTBOUND_NUMBER],
+                )
+                await lk.sip.delete_sip_trunk(
+                    livekit_api.DeleteSIPTrunkRequest(
+                        sip_trunk_id=trunk.sip_trunk_id,
+                    )
+                )
+                logger.info("旧 Inbound Trunk 已删除: id=%s", trunk.sip_trunk_id)
+                break  # 退出循环，继续创建新 Trunk
             logger.info("Inbound Trunk 已存在: %s (id=%s)，跳过创建", trunk.name, trunk.sip_trunk_id)
             return trunk.sip_trunk_id
 
@@ -163,7 +207,7 @@ async def _ensure_inbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
             )
         )
     )
-    logger.info("Inbound Trunk 创建成功: id=%s", trunk.sip_trunk_id)
+    logger.info("Inbound Trunk 创建成功: id=%s, numbers=%s", trunk.sip_trunk_id, [OUTBOUND_NUMBER])
     return trunk.sip_trunk_id
 
 
@@ -171,7 +215,10 @@ async def _ensure_inbound_trunk(lk: livekit_api.LiveKitAPI) -> str:
 # Dispatch Rule
 # ---------------------------------------------------------------------------
 async def _ensure_dispatch_rule(lk: livekit_api.LiveKitAPI, inbound_trunk_id: str) -> str:
-    """检查并创建 SIP Dispatch Rule，返回 rule_id。"""
+    """检查并创建 SIP Dispatch Rule，返回 rule_id。
+
+    如果同名 Rule 已存在但 trunk_ids 不匹配，先删除再重建。
+    """
     logger.info("检查 SIP Dispatch Rule ...")
 
     resp = await lk.sip.list_sip_dispatch_rule(
@@ -179,6 +226,19 @@ async def _ensure_dispatch_rule(lk: livekit_api.LiveKitAPI, inbound_trunk_id: st
     )
     for rule in resp.items:
         if rule.name == DISPATCH_RULE_NAME:
+            # 检查 trunk_ids 是否包含当前 inbound_trunk_id
+            if inbound_trunk_id not in rule.trunk_ids:
+                logger.warning(
+                    "Dispatch Rule trunk_ids 不一致: 当前=%s, 期望包含=%s，删除并重建",
+                    rule.trunk_ids, [inbound_trunk_id],
+                )
+                await lk.sip.delete_sip_dispatch_rule(
+                    livekit_api.DeleteSIPDispatchRuleRequest(
+                        sip_dispatch_rule_id=rule.sip_dispatch_rule_id,
+                    )
+                )
+                logger.info("旧 Dispatch Rule 已删除: id=%s", rule.sip_dispatch_rule_id)
+                break  # 退出循环，继续创建新 Rule
             logger.info("Dispatch Rule 已存在: %s (id=%s)，跳过创建", rule.name, rule.sip_dispatch_rule_id)
             return rule.sip_dispatch_rule_id
 
@@ -195,7 +255,7 @@ async def _ensure_dispatch_rule(lk: livekit_api.LiveKitAPI, inbound_trunk_id: st
             name=DISPATCH_RULE_NAME,
         )
     )
-    logger.info("Dispatch Rule 创建成功: id=%s", rule.sip_dispatch_rule_id)
+    logger.info("Dispatch Rule 创建成功: id=%s, trunk_ids=%s", rule.sip_dispatch_rule_id, [inbound_trunk_id])
     return rule.sip_dispatch_rule_id
 
 
@@ -215,7 +275,7 @@ def _print_summary(outbound_id: str, inbound_id: str, dispatch_id: str) -> None:
     print("  请将以下值填入 .env 文件（如尚未配置）：")
     print(f"  LK_SIP_TRUNK_ID={outbound_id}")
     print(f"  LK_SIP_OUTBOUND_NUMBER={OUTBOUND_NUMBER}")
-    print(f"  LK_SIP_DOMAIN={KAMAILIO_DOMAIN}")
+    print(f"  LK_SIP_DOMAIN={OUTBOUND_HOST}")
     print("=" * 52)
     print()
 

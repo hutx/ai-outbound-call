@@ -112,3 +112,62 @@ VALUES (
     '你是一个专业的电话客服助手。请根据用户的回答进行自然的对话。',
     '感谢您的接听，祝您生活愉快，再见！'
 ) ON CONFLICT (script_id) DO NOTHING;
+
+-- ============================================================
+-- 文件信息表
+-- ============================================================
+CREATE TABLE IF NOT EXISTS lk_files (
+    id SERIAL PRIMARY KEY,
+    file_id VARCHAR(128) UNIQUE NOT NULL,
+    call_id VARCHAR(128),
+    file_type VARCHAR(32) NOT NULL,
+    storage_path TEXT NOT NULL,
+    storage_bucket VARCHAR(64),
+    file_name VARCHAR(256),
+    mime_type VARCHAR(64),
+    file_size_bytes BIGINT DEFAULT 0,
+    duration_sec REAL DEFAULT 0,
+    sample_rate INTEGER,
+    download_url TEXT,
+    egress_id VARCHAR(128),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_call_id ON lk_files(call_id);
+CREATE INDEX IF NOT EXISTS idx_files_file_type ON lk_files(file_type);
+
+-- ============================================================
+-- 通话记录详情表（问答形式）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS lk_call_record_details (
+    id SERIAL PRIMARY KEY,
+    call_record_id INTEGER NOT NULL REFERENCES lk_call_records(id),
+    call_id VARCHAR(128) NOT NULL,
+    round_num INTEGER NOT NULL,
+    question TEXT,
+    question_audio_file_id VARCHAR(128),
+    question_duration_sec REAL DEFAULT 0,
+    answer_content TEXT,
+    answer_audio_file_id VARCHAR(128),
+    answer_duration_sec REAL DEFAULT 0,
+    is_interrupted BOOLEAN DEFAULT FALSE,
+    interrupted_at_sec REAL,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    stt_latency_ms INTEGER,
+    llm_latency_ms INTEGER,
+    tts_latency_ms INTEGER,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_record_details_call_id ON lk_call_record_details(call_id);
+CREATE INDEX IF NOT EXISTS idx_call_record_details_record_id ON lk_call_record_details(call_record_id);
+CREATE INDEX IF NOT EXISTS idx_call_record_details_round ON lk_call_record_details(call_id, round_num);
+
+-- ============================================================
+-- 扩展通话记录表
+-- ============================================================
+ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS recording_file_id VARCHAR(128);
+ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS egress_id VARCHAR(128);
+ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS total_duration_sec REAL DEFAULT 0;

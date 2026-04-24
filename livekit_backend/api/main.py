@@ -16,8 +16,10 @@ from livekit_backend.utils import db
 from livekit_backend.api.scripts_api import router as scripts_router
 from livekit_backend.api.tasks_api import router as tasks_router
 from livekit_backend.api.monitor_api import router as monitor_router
+from livekit_backend.api.calls_api import router as calls_router
 from livekit_backend.services import task_service
 from livekit_backend.services.sip_service import SipService
+from livekit_backend.services.minio_service import minio_service
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,13 @@ async def lifespan(app: FastAPI):
     # 初始化数据库连接池
     await db.get_pool()
     logger.info("数据库连接池已就绪")
+
+    # 初始化 MinIO bucket（确保 lk-recordings 存在）
+    try:
+        await minio_service.ensure_bucket()
+        logger.info("MinIO bucket 已就绪")
+    except Exception as e:
+        logger.warning(f"MinIO bucket 初始化失败（录音存储可能不可用）: {e}")
 
     # 初始化 SIP 服务（task_service 模块共享同一实例）
     await sip_service.initialize()
@@ -78,6 +87,7 @@ app.add_middleware(
 app.include_router(scripts_router)
 app.include_router(tasks_router)
 app.include_router(monitor_router)
+app.include_router(calls_router)
 
 # 静态文件（前端）
 frontend_dir = Path(__file__).parent.parent / "frontend"

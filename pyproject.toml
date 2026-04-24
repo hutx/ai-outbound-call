@@ -48,11 +48,12 @@ dependencies = [
     # 工具
     "rich==13.8.1",
     "click==8.1.7",
+    # 对象存储
+    "minio>=7.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "uv",
     "pytest",
     "pytest-asyncio",
     "black",

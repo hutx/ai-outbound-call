@@ -21,6 +21,10 @@ class LLMResponse:
     intent: CallIntent = CallIntent.UNKNOWN
     action: CallAction = CallAction.CONTINUE
     action_params: dict = None
+    # 性能延迟指标（由 _stream_llm_and_speak 填充）
+    llm_latency_ms: Optional[int] = None    # LLM 首 token 延迟
+    tts_latency_ms: Optional[int] = None    # 首句 TTS 延迟（首句从提交到播放的耗时）
+    was_interrupted: bool = False            # AI 回答是否被用户打断
 
     def __post_init__(self):
         if self.action_params is None:

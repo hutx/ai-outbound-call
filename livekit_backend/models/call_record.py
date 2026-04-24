@@ -39,6 +39,9 @@ class CallRecordUpdate(BaseModel):
     sip_code: Optional[int] = Field(None, description="SIP 响应码")
     hangup_cause: Optional[str] = Field(None, max_length=64, description="挂断原因")
     recording_url: Optional[str] = Field(None, description="录音URL")
+    recording_file_id: Optional[str] = Field(None, max_length=128, description="录音文件ID")
+    egress_id: Optional[str] = Field(None, max_length=128, description="LiveKit Egress ID")
+    total_duration_sec: Optional[float] = Field(None, ge=0, description="总时长（秒）")
     answered_at: Optional[datetime] = Field(None, description="接听时间")
     ended_at: Optional[datetime] = Field(None, description="结束时间")
 
@@ -62,6 +65,9 @@ class CallRecordResponse(BaseModel):
     sip_code: Optional[int]
     hangup_cause: Optional[str]
     recording_url: Optional[str]
+    recording_file_id: Optional[str]
+    egress_id: Optional[str]
+    total_duration_sec: Optional[float]
     started_at: Optional[datetime]
     answered_at: Optional[datetime]
     ended_at: Optional[datetime]

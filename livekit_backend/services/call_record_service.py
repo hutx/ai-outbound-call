@@ -68,6 +68,9 @@ async def update_record(call_id: str, data: CallRecordUpdate) -> Optional[Dict[s
         "sip_code": data.sip_code,
         "hangup_cause": data.hangup_cause,
         "recording_url": data.recording_url,
+        "recording_file_id": data.recording_file_id,
+        "egress_id": data.egress_id,
+        "total_duration_sec": data.total_duration_sec,
         "answered_at": data.answered_at,
         "ended_at": data.ended_at,
     }

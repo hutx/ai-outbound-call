@@ -1,6 +1,7 @@
 """LiveKit 智能外呼系统配置管理"""
 import os
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import Optional
 
 
@@ -68,6 +69,13 @@ class Settings(BaseSettings):
     sip_provider_port: int = 6922
     sip_provider_caller_id: str = "202603311547"
     sip_provider_prefix: str = "97776"
+
+    # ---- MinIO 对象存储 ----
+    minio_endpoint: str = Field(default="minio:9000", alias="LK_MINIO_ENDPOINT")
+    minio_access_key: str = Field(default="minioadmin", alias="LK_MINIO_ACCESS_KEY")
+    minio_secret_key: str = Field(default="minioadmin", alias="LK_MINIO_SECRET_KEY")
+    minio_bucket: str = Field(default="livekit-recordings", alias="LK_MINIO_BUCKET")
+    minio_secure: bool = Field(default=False, alias="LK_MINIO_SECURE")
 
     model_config = {"env_file": ".env", "env_prefix": "LK_", "case_sensitive": False, "extra": "ignore"}
 

@@ -91,5 +91,8 @@ click==8.1.7                    # CLI 工具
 # 监控：Prometheus + Grafana（/metrics 接口已内置，无需额外包）
 # Prometheus 拉取 http://your-host:8000/metrics 即可
 
+# 对象存储
+minio>=7.2.0                    # MinIO 客户端
+
 # 数据库：MySQL 备选
 # pip install aiomysql

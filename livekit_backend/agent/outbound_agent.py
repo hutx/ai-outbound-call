@@ -4,6 +4,7 @@ import logging
 import asyncio
 import re
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -28,10 +29,16 @@ from livekit_backend.services import call_record_service
 from livekit_backend.models.call_record import CallRecordCreate, CallRecordUpdate, TranscriptEntry
 from livekit_backend.agent.dialog_manager import DialogManager
 from livekit_backend.utils import db
+from livekit_backend.services.egress_service import EgressService
+from livekit_backend.services.file_service import create_file_record
+from livekit_backend.services.call_record_detail_service import create_detail
+from livekit_backend.services.minio_service import minio_service
+from livekit_backend.models.call_record_detail import CallRecordDetailCreate
+from livekit_backend.models.file import FileRecordCreate
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONVERSATION_ROUNDS = 6
+_MAX_CONVERSATION_ROUNDS = 10
 
 
 class OutboundCallAgent:
@@ -73,6 +80,12 @@ class OutboundCallAgent:
         self._transcript_queue: Optional[asyncio.Queue] = None
         self.dialog_mgr: Optional[DialogManager] = None
 
+        # 录音 & 详情记录
+        self._call_record_id: Optional[int] = None   # CDR 主键 ID
+        self._egress_service: Optional[EgressService] = None
+        self._egress_id: Optional[str] = None          # Egress 任务 ID
+        self._answered_at: Optional[datetime] = None   # 接听时间（用于计算总时长）
+
     async def run(self):
         """主运行函数"""
         logger.info(
@@ -85,7 +98,7 @@ class OutboundCallAgent:
             await db.get_pool()
 
             # 2. 创建 CDR 记录
-            await call_record_service.create_record(
+            cdr = await call_record_service.create_record(
                 CallRecordCreate(
                     call_id=self.call_id,
                     task_id=self.task_id,
@@ -93,10 +106,12 @@ class OutboundCallAgent:
                     script_id=self.script_id,
                 )
             )
+            self._call_record_id = cdr.get("id")
             await call_record_service.update_record(
                 self.call_id,
-                CallRecordUpdate(status=CallState.CONNECTED),
+                CallRecordUpdate(status=CallState.CONNECTED, answered_at=datetime.now()),
             )
+            self._answered_at = datetime.now()
 
             # 3. 加载话术
             script = await script_service.get_script(self.script_id)
@@ -173,6 +188,24 @@ class OutboundCallAgent:
                 )
                 return
 
+            # 11.5 启动 Egress 录制
+            try:
+                # 确保 MinIO bucket 存在
+                await minio_service.ensure_bucket()
+                self._egress_service = EgressService()
+                await self._egress_service.initialize()
+                self._egress_id = await self._egress_service.start_room_composite_egress(
+                    room_name=self.call_id, call_id=self.call_id,
+                )
+                await call_record_service.update_record(
+                    self.call_id,
+                    CallRecordUpdate(egress_id=self._egress_id),
+                )
+                logger.info(f"Egress 录制已启动: egress_id={self._egress_id}")
+            except Exception as e:
+                logger.warning(f"启动 Egress 录制失败（不影响通话）: {e}")
+                self._egress_id = None
+
             # 12. 启动 AgentSession
             await self._session.start(self._agent, room=self.ctx.room)
 
@@ -207,6 +240,12 @@ class OutboundCallAgent:
             except Exception as ex:
                 logger.error(f"保存异常 CDR 失败: {ex}")
         finally:
+            # 15.5 停止 Egress 录制并保存录音文件信息
+            # 使用 asyncio.shield 防止 SDK 取消 entrypoint 时中断清理逻辑
+            try:
+                await asyncio.shield(self._stop_recording())
+            except asyncio.CancelledError:
+                pass  # shield 内部已完成，忽略外层取消
             # 16. 保存最终 CDR
             await self._finalize_cdr()
             # 17. 挂断 SIP 通话（删除 Room → SIP BYE → Zoiper 端通话结束）
@@ -223,6 +262,14 @@ class OutboundCallAgent:
     # 对话循环
     # ------------------------------------------------------------------
 
+    def _is_session_alive(self) -> bool:
+        """检查 AgentSession 是否仍在运行"""
+        if self._session is None:
+            return False
+        # AgentSession 在关闭后 _running 标志为 False
+        # 兼容不同版本：优先检查 _running 属性，若不存在则假设存活
+        return getattr(self._session, '_running', True)
+
     async def _conversation_loop(self, script: dict) -> str:
         """多轮对话主循环
 
@@ -230,88 +277,137 @@ class OutboundCallAgent:
             结束原因字符串:
             - "no_response_hangup": 连续无响应达到阈值，hangup_text 已播报完毕
             - "intent_end": LLM 决策结束（closing_text 将在循环外播报）
+            - "session_closed": Session 已关闭（SIP 断开等）
             - "max_rounds": 达到最大轮次
         """
         for round_num in range(_MAX_CONVERSATION_ROUNDS):
+            # 每轮开始前检查 session 是否存活
+            if not self._is_session_alive():
+                logger.warning("AgentSession 已关闭，退出对话循环")
+                return "session_closed"
+
             logger.info(f"--- 第 {round_num + 1} 轮对话 ---")
 
-            # A. 等待用户说话（带超时）
-            t_wait_start = time.monotonic()
-            user_text = await self._wait_for_user_input()
-            t_wait_end = time.monotonic()
+            # 轮次计时起点
+            round_start_time = datetime.now()
+            t_stt_start = time.monotonic()
 
-            if user_text is None:
-                # 无响应处理
-                result = self.dialog_mgr.on_no_response()
-                logger.info(
-                    f"无响应: consecutive={result['consecutive_count']}, "
-                    f"cumulative={result['cumulative_count']}, hangup={result['should_hangup']}"
-                )
-                await self._speak(result["prompt_text"])
-                if result["should_hangup"]:
-                    logger.info("无响应达到阈值，hangup_text 已播报完毕，直接结束通话（不再播 closing_text）")
-                    return "no_response_hangup"
-                continue
+            try:
+                # A. 等待用户说话（带超时）
+                t_wait_start = time.monotonic()
+                user_text = await self._wait_for_user_input()
+                t_wait_end = time.monotonic()
 
-            # B. 宽容期处理
-            t_tolerance_start = time.monotonic()
-            if self.dialog_mgr.tolerance.enabled:
-                user_text = await self.dialog_mgr.wait_with_tolerance(
-                    user_text,
-                    listen_func=self._listen_additional,
-                )
-            t_tolerance_end = time.monotonic()
+                if user_text is None:
+                    # 无响应处理
+                    result = self.dialog_mgr.on_no_response()
+                    logger.info(
+                        f"无响应: consecutive={result['consecutive_count']}, "
+                        f"cumulative={result['cumulative_count']}, hangup={result['should_hangup']}"
+                    )
+                    await self._speak(result["prompt_text"])
+                    if result["should_hangup"]:
+                        logger.info("无响应达到阈值，hangup_text 已播报完毕，直接结束通话（不再播 closing_text）")
+                        return "no_response_hangup"
+                    continue
 
-            # C. 记录用户输入
-            self.dialog_mgr.on_user_responded(user_text)
-            self.messages.append({"role": "user", "content": user_text})
-            self.transcript.append({
-                "role": "user",
-                "text": user_text,
-                "timestamp": time.time(),
-                "duration_sec": 0,
-            })
-            t_user_received = time.monotonic()
-            logger.info(
-                f"用户: {user_text} "
-                f"[perf: 等待={(t_wait_end - t_wait_start)*1000:.0f}ms, "
-                f"宽容期={(t_tolerance_end - t_tolerance_start)*1000:.0f}ms]"
-            )
+                # B. 宽容期处理
+                t_tolerance_start = time.monotonic()
+                if self.dialog_mgr.tolerance.enabled:
+                    user_text = await self.dialog_mgr.wait_with_tolerance(
+                        user_text,
+                        listen_func=self._listen_additional,
+                    )
+                t_tolerance_end = time.monotonic()
 
-            # D. LLM 推理 + 流式播报（边生成边播，降低延迟）
-            llm_response = await self._stream_llm_and_speak(
-                allow_interruptions=self.dialog_mgr.barge_in.enabled,
-            )
+                # STT 延迟：从轮次开始（等待用户输入开始）到用户文字完全接收
+                t_stt_end = time.monotonic()
+                stt_latency_ms = int((t_stt_end - t_stt_start) * 1000)
 
-            # E. 记录 AI 回复
-            if llm_response.text:
-                logger.info(f"AI: {llm_response.text[:100]}...")
-                self.dialog_mgr.on_ai_speaking_end()
-
-                self.messages.append({"role": "assistant", "content": llm_response.text})
+                # C. 记录用户输入
+                self.dialog_mgr.on_user_responded(user_text)
+                self.messages.append({"role": "user", "content": user_text})
                 self.transcript.append({
-                    "role": "ai",
-                    "text": llm_response.text,
+                    "role": "user",
+                    "text": user_text,
                     "timestamp": time.time(),
                     "duration_sec": 0,
                 })
+                t_user_received = time.monotonic()
+                logger.info(
+                    f"用户: {user_text} "
+                    f"[perf: 等待={(t_wait_end - t_wait_start)*1000:.0f}ms, "
+                    f"宽容期={(t_tolerance_end - t_tolerance_start)*1000:.0f}ms]"
+                )
 
-            # F. 处理动作
-            if llm_response.action == CallAction.END:
-                logger.info("LLM 决策: 结束通话，将在循环外播报 closing_text")
-                return "intent_end"
-            elif llm_response.action == CallAction.TRANSFER:
-                logger.info("LLM 决策: 转接人工")
-                # TODO: 实现转接逻辑
-                return "intent_end"
-            elif llm_response.action == CallAction.CALLBACK:
-                logger.info("LLM 决策: 预约回拨")
-                # TODO: 实现回拨逻辑
-                return "intent_end"
-            elif llm_response.action == CallAction.BLACKLIST:
-                logger.info("LLM 决策: 加入黑名单")
-                # TODO: 实现黑名单逻辑
-                return "intent_end"
+                # D. LLM 推理 + 流式播报（边生成边播，降低延迟）
+                llm_response = await self._stream_llm_and_speak(
+                    allow_interruptions=self.dialog_mgr.barge_in.enabled,
+                )
+
+                # E. 记录 AI 回复
+                if llm_response.text:
+                    logger.info(f"AI: {llm_response.text[:100]}...")
+                    self.dialog_mgr.on_ai_speaking_end()
+
+                    self.messages.append({"role": "assistant", "content": llm_response.text})
+                    self.transcript.append({
+                        "role": "ai",
+                        "text": llm_response.text,
+                        "timestamp": time.time(),
+                        "duration_sec": 0,
+                    })
+
+                # 轮次结束时间
+                round_end_time = datetime.now()
+
+                # E2. 记录本轮问答详情
+                try:
+                    if self._call_record_id and llm_response.text:
+                        detail = CallRecordDetailCreate(
+                            call_record_id=self._call_record_id,
+                            call_id=self.call_id,
+                            round_num=round_num + 1,
+                            question=user_text,
+                            answer_content=llm_response.text,
+                            is_interrupted=llm_response.was_interrupted,
+                            start_time=round_start_time,
+                            end_time=round_end_time,
+                            stt_latency_ms=stt_latency_ms,
+                            llm_latency_ms=llm_response.llm_latency_ms,
+                            tts_latency_ms=llm_response.tts_latency_ms,
+                        )
+                        await create_detail(detail)
+                        logger.info(
+                            f"轮次详情已记录: round={round_num + 1}, "
+                            f"stt={stt_latency_ms}ms, "
+                            f"llm={llm_response.llm_latency_ms}ms, "
+                            f"tts={llm_response.tts_latency_ms}ms, "
+                            f"interrupted={llm_response.was_interrupted}"
+                        )
+                except Exception as e:
+                    logger.warning(f"记录轮次详情失败（不影响通话）: {e}")
+
+                # F. 处理动作
+                if llm_response.action == CallAction.END:
+                    logger.info("LLM 决策: 结束通话，将在循环外播报 closing_text")
+                    return "intent_end"
+                elif llm_response.action == CallAction.TRANSFER:
+                    logger.info("LLM 决策: 转接人工")
+                    # TODO: 实现转接逻辑
+                    return "intent_end"
+                elif llm_response.action == CallAction.CALLBACK:
+                    logger.info("LLM 决策: 预约回拨")
+                    # TODO: 实现回拨逻辑
+                    return "intent_end"
+                elif llm_response.action == CallAction.BLACKLIST:
+                    logger.info("LLM 决策: 加入黑名单")
+                    # TODO: 实现黑名单逻辑
+                    return "intent_end"
+
+            except RuntimeError as e:
+                logger.warning(f"对话循环中 Session 异常，退出循环: {e}")
+                return "session_closed"
 
         # 达到最大轮次
         return "max_rounds"
@@ -419,11 +515,15 @@ class OutboundCallAgent:
             if self._session is None:
                 return
             t_speak_now = time.monotonic()
-            handle = self._session.say(
-                txt.strip(),
-                allow_interruptions=allow_interruptions,
-                add_to_chat_ctx=False,
-            )
+            try:
+                handle = self._session.say(
+                    txt.strip(),
+                    allow_interruptions=allow_interruptions,
+                    add_to_chat_ctx=False,
+                )
+            except RuntimeError as e:
+                logger.warning(f"Session 已关闭，跳过流式语音播放: {e}")
+                return
             speech_handles.append(handle)
             logger.info(
                 f"[perf] session.say() 调度: text={txt.strip()[:30]}... "
@@ -513,6 +613,20 @@ class OutboundCallAgent:
             f"LLM 响应: intent={result.intent.value}, action={result.action.value}, "
             f"text={result.text[:80]}..."
         )
+
+        # 填充延迟指标供 CallRecordDetail 使用
+        if t_first_token is not None:
+            result.llm_latency_ms = int((t_first_token - t_llm_start) * 1000)
+        if t_first_sentence is not None and t_first_token is not None:
+            # TTS 延迟 = 首句发出时间 - 首 token 时间（包含句子累积 + TTS 合成）
+            result.tts_latency_ms = int((t_first_sentence - t_first_token) * 1000)
+
+        # 检查是否被用户打断：如果有 speech handle 被中断
+        for h in speech_handles:
+            if getattr(h, 'interrupted', False):
+                result.was_interrupted = True
+                break
+
         return result
 
     async def _get_llm_response(self) -> LLMResponse:
@@ -566,11 +680,16 @@ class OutboundCallAgent:
             logger.warning("Session 未初始化，无法播报")
             return
 
-        handle = self._session.say(
-            text,
-            allow_interruptions=allow_interruptions,
-            add_to_chat_ctx=False,  # 我们自己管理对话历史
-        )
+        try:
+            handle = self._session.say(
+                text,
+                allow_interruptions=allow_interruptions,
+                add_to_chat_ctx=False,  # 我们自己管理对话历史
+            )
+        except RuntimeError as e:
+            logger.warning(f"Session 已关闭，跳过语音播放: {e}")
+            return
+
         # 等待播报完成
         try:
             await handle.wait_for_playout()
@@ -602,6 +721,131 @@ class OutboundCallAgent:
             self.ctx.room.off("participant_connected", on_participant_connected)
 
     # ------------------------------------------------------------------
+    # Egress 录制管理
+    # ------------------------------------------------------------------
+
+    async def _stop_recording(self):
+        """停止 Egress 录制，等待完成，创建文件记录并更新 CDR"""
+        if not self._egress_id or not self._egress_service:
+            logger.info("无活跃 Egress 任务，跳过录制停止")
+            return
+
+        recording_file_id = None
+        recording_url = None
+
+        try:
+            # 1. 尝试停止 Egress（如果已自动完成则忽略错误，继续后续处理）
+            try:
+                await self._egress_service.stop_egress(self._egress_id)
+                logger.info(f"Egress 已停止: egress_id={self._egress_id}")
+            except Exception as stop_err:
+                # 房间删除后 Egress 会自动完成录制，此时调用 stop 会返回
+                # "cannot be stopped" 错误，属于正常情况，不应中断后续文件处理
+                logger.info(
+                    f"停止 Egress 时收到响应（可能已自动完成）: "
+                    f"egress_id={self._egress_id}, resp={stop_err}"
+                )
+
+            # 2. 等待 Egress 完成文件写入
+            egress_info = await self._egress_service.wait_for_egress_complete(
+                self._egress_id, timeout=30,
+            )
+            logger.info(f"Egress 完成信息: egress_id={self._egress_id}, raw_status={egress_info.get('status')}, file_results_count={len(egress_info.get('file_results', []))}")
+
+            # 3. 检查 Egress 状态 — ABORTED / FAILED 则跳过文件创建
+            status = egress_info.get("status")
+            # EgressStatus 枚举值: 0=STARTING, 1=ACTIVE, 2=ENDING, 3=COMPLETE,
+            #                       4=FAILED, 5=ABORTED, 6=LIMIT_REACHED
+            # MessageToDict 将 protobuf 枚举转换为字符串名称（如 "EGRESS_COMPLETE"），
+            # 因此统一按字符串比较
+            _ABORTED_STATUS_NAMES = frozenset({"EGRESS_ABORTED", "EGRESS_FAILED"})
+            status_str = status if isinstance(status, str) else str(status)
+            if status_str in _ABORTED_STATUS_NAMES:
+                error_msg = egress_info.get("error", "")
+                logger.warning(
+                    f"Egress 录制异常终止: egress_id={self._egress_id}, "
+                    f"status={status}, error={error_msg}，跳过文件记录创建"
+                )
+                # 跳过后续文件创建，直接进入 CDR 更新
+            else:
+                # 4. 从 egress info 中提取输出文件信息
+                file_results = egress_info.get("file_results", [])
+                if file_results:
+                    fr = file_results[0]
+                    storage_path = fr.get("filename", "")
+                    file_size = fr.get("size", 0)
+                    duration_sec = fr.get("duration", 0.0)
+
+                    # 5. 检查文件是否有效（size=0 或 duration=0 说明录制为空）
+                    if file_size == 0 or duration_sec == 0:
+                        logger.warning(
+                            f"Egress 录制结果为空: egress_id={self._egress_id}, "
+                            f"size={file_size}, duration={duration_sec}，跳过文件记录创建"
+                        )
+                    else:
+                        # 6. 确保 MinIO bucket 存在后创建 lk_files 记录
+                        await minio_service.ensure_bucket()
+                        recording_file_id = str(uuid.uuid4())
+                        file_name = storage_path.split("/")[-1] if storage_path else f"full_{self.call_id}.ogg"
+                        file_record = FileRecordCreate(
+                            file_id=recording_file_id,
+                            call_id=self.call_id,
+                            file_type="full_recording",
+                            storage_path=storage_path,
+                            storage_bucket=settings.minio_bucket,
+                            file_name=file_name,
+                            mime_type="audio/ogg",
+                            file_size_bytes=file_size or 0,
+                            duration_sec=duration_sec or 0.0,
+                            egress_id=self._egress_id,
+                        )
+                        await create_file_record(file_record)
+                        logger.info(f"录音文件记录已创建: file_id={recording_file_id}, path={storage_path}")
+
+                        # 7. 生成预签名 URL
+                        try:
+                            recording_url = await minio_service.get_presigned_url(
+                                bucket=settings.minio_bucket,
+                                object_name=storage_path,
+                                expires=3600,
+                            )
+                        except Exception as e:
+                            logger.warning(f"生成录音预签名 URL 失败: {e}")
+                else:
+                    logger.warning(f"Egress 完成但无文件结果: egress_id={self._egress_id}")
+
+        except BaseException as e:
+            # 捕获 BaseException（含 CancelledError）而非仅 Exception，
+            # 因为 LiveKit Agents SDK 在 room 断开后会取消 entrypoint，
+            # 导致 CancelledError 在 await 调用中抛出。
+            # 作为清理方法，必须确保清理逻辑不被中断。
+            if isinstance(e, asyncio.CancelledError):
+                logger.info(f"_stop_recording 被 CancelledError 中断，尝试继续完成清理: egress_id={self._egress_id}")
+            else:
+                logger.warning(f"停止 Egress 录制时出错（不影响通话结束）: {e}")
+        finally:
+            # 关闭 Egress 服务客户端
+            if self._egress_service:
+                try:
+                    await self._egress_service.close()
+                except Exception:
+                    pass
+                self._egress_service = None
+
+        # 8. 更新 CDR 中的录音信息
+        try:
+            update = CallRecordUpdate()
+            if recording_file_id:
+                update.recording_file_id = recording_file_id
+            if recording_url:
+                update.recording_url = recording_url
+            if update.recording_file_id or update.recording_url:
+                await call_record_service.update_record(self.call_id, update)
+                logger.info(f"CDR 录音信息已更新: call_id={self.call_id}")
+        except Exception as e:
+            logger.warning(f"更新 CDR 录音信息失败: {e}")
+
+    # ------------------------------------------------------------------
     # CDR 管理
     # ------------------------------------------------------------------
 
@@ -630,6 +874,11 @@ class OutboundCallAgent:
                 transcript=transcript_entries,
                 ended_at=datetime.now(),
             )
+
+            # 计算通话总时长
+            if self._answered_at:
+                total_duration = (datetime.now() - self._answered_at).total_seconds()
+                update.total_duration_sec = round(total_duration, 1)
 
             # 只在尚未设置终态结果时才标记为 completed
             current_result = current.get("result", "")
