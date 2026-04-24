@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     default_max_retries: int = 1
     call_timeout_sec: int = 300
     originate_timeout_sec: int = 30
+    max_conversation_rounds: int = int(os.getenv("MAX_CONVERSATION_ROUNDS", "10"))
 
     # ---- Kamailio ----
     kamailio_sip_domain: str = "localhost"

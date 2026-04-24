@@ -5,11 +5,13 @@ ws_url: ws://livekit-server:7880
 redis:
   address: redis:6379
 
-# SIP NAT 配置：解决 Docker bridge 网络下 RTP 上行单向不通
-# nat_1_to_1_ip 设置后，SDP 中的 Via/Contact/媒体地址都会使用该 IP（而非 Docker 内网 IP）
+# SIP NAT 配置：
+# nat_1_to_1_ip 影响 SIP 信令（Via/Contact），因 LiveKit SIP 与 Kamailio 在 Docker 内网，
+# 不能设为公网 IP（否则 Kamailio 转发响应到 公网IP:5060 而非 Docker 内网，导致 408 超时）
+# media_nat_1_to_1_ip 仅影响 SDP 中的 RTP 媒体地址
+#   - 设为局域网 IP(192.168.5.15) 保证本地分机(Zoiper)可达
+#   - PSTN 外呼时由 Kamailio 在转发前将 SDP 中的局域网 IP 替换为公网 IP
 # rtp_port 限制动态端口范围，便于在 docker-compose.yml 中做 UDP 端口映射
-# use_external_ip 和 nat_1_to_1_ip 不能同时设置
-nat_1_to_1_ip: "192.168.5.15"
 media_nat_1_to_1_ip: "192.168.5.15"
 sip_port: 5060
 rtp_port: "10000-10100"

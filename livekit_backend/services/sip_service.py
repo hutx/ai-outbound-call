@@ -9,10 +9,25 @@ import uuid
 from typing import Optional
 
 from livekit import api as livekit_api
+from livekit.api.twirp_client import TwirpError
 
 from livekit_backend.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class SipCallError(Exception):
+    """SIP 外呼失败异常
+
+    当 Room 已创建但 SIP 呼叫失败时抛出，
+    携带 call_id 以便调用方更新 CDR。
+    """
+
+    def __init__(self, call_id: str, message: str, *, sip_code: int = None, hangup_cause: str = None):
+        super().__init__(message)
+        self.call_id = call_id
+        self.sip_code = sip_code
+        self.hangup_cause = hangup_cause
 
 
 class SipService:
@@ -106,18 +121,59 @@ class SipService:
         logger.info(f"Room 已创建: {call_id}")
 
         # 创建 SIP 参与者（发起电话呼叫）
-        sip_participant = await self._client.sip.create_sip_participant(
-            livekit_api.CreateSIPParticipantRequest(
-                room_name=call_id,
-                sip_trunk_id=settings.sip_trunk_id,
-                sip_call_to=phone,
-                participant_identity=f"sip_{phone}",
-                participant_name=f"Phone {phone}",
-                play_dialtone=True,
-            )
-        )
+        # wait_until_answered=True：API 调用阻塞直到被叫接听才返回；
+        # 若振铃超时或对端拒接，会抛出 TwirpError（携带 SIP 状态码）。
+        # 这样 Agent 侧等到 SIP 参与者加入时已是接听状态，不会在振铃阶段播放开场白。
+        from google.protobuf import duration_pb2
+        ringing_timeout_proto = duration_pb2.Duration()
+        ringing_timeout_proto.FromSeconds(settings.originate_timeout_sec)
 
-        logger.info(f"外呼已发起: call_id={call_id}, phone={phone}")
+        try:
+            sip_participant = await self._client.sip.create_sip_participant(
+                livekit_api.CreateSIPParticipantRequest(
+                    room_name=call_id,
+                    sip_trunk_id=settings.sip_trunk_id,
+                    sip_call_to=phone,
+                    participant_identity=f"sip_{phone}",
+                    participant_name=f"Phone {phone}",
+                    play_dialtone=False,
+                    wait_until_answered=True,
+                    ringing_timeout=ringing_timeout_proto,
+                ),
+                timeout=settings.originate_timeout_sec + 5,  # HTTP 超时略长于振铃超时
+            )
+        except Exception as sip_err:
+            # Room 已创建但 SIP 呼叫失败（未接听/忙线/拒接等），
+            # 尝试提取 SIP 状态码并封装为 SipCallError
+            sip_code = None
+            hangup_cause = None
+            meta = {}
+            if isinstance(sip_err, TwirpError):
+                meta = sip_err.metadata or {}
+                sip_status_code_str = meta.get("sip_status_code", "")
+                if sip_status_code_str:
+                    try:
+                        sip_code = int(sip_status_code_str)
+                    except ValueError:
+                        pass
+                hangup_cause = meta.get("sip_status", "")[:64] or None
+            logger.warning(
+                f"SIP 呼叫失败: call_id={call_id}, phone={phone}, "
+                f"error={sip_err}, sip_code={sip_code}, hangup_cause={hangup_cause}"
+            )
+            # 清理：删除已创建的空 Room，避免 Agent Worker 空等
+            try:
+                await self._client.room.delete_room(
+                    livekit_api.DeleteRoomRequest(room=call_id)
+                )
+            except Exception:
+                pass
+            raise SipCallError(
+                call_id, str(sip_err),
+                sip_code=sip_code, hangup_cause=hangup_cause,
+            ) from sip_err
+
+        logger.info(f"外呼已发起（已接听）: call_id={call_id}, phone={phone}")
         return {
             "call_id": call_id,
             "sip_participant_id": sip_participant.participant_identity,

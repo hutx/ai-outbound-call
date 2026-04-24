@@ -7,10 +7,14 @@ import logging
 import uuid
 from typing import Optional, List, Dict, Any
 
+from livekit.api.twirp_client import TwirpError
+
 from livekit_backend.core.config import settings
-from livekit_backend.core.events import TaskStatus, PhoneStatus
+from livekit_backend.core.events import TaskStatus, PhoneStatus, CallState, CallResult
 from livekit_backend.models.task import TaskCreate, TaskResponse, TaskStats, TaskDetail
-from livekit_backend.services.sip_service import SipService
+from livekit_backend.models.call_record import CallRecordUpdate
+from livekit_backend.services.sip_service import SipService, SipCallError
+from livekit_backend.services import call_record_service
 from livekit_backend.utils import db
 
 logger = logging.getLogger(__name__)
@@ -402,6 +406,7 @@ async def _make_call(
 
     try:
         # 发起 SIP 外呼
+        call_id = None  # 预初始化，防止异常时 NameError
         result = await sip_service.create_outbound_call(
             phone=phone,
             script_id=script_id,
@@ -409,14 +414,16 @@ async def _make_call(
         )
         call_id = result["call_id"]
 
-        # 更新号码的最后呼叫ID
+        # 更新号码的最后呼叫ID 和 SIP 状态
         await db.execute(
             """
             UPDATE lk_task_phones
-            SET last_call_id = $1, updated_at = NOW()
-            WHERE id = $2
+            SET last_call_id = $1, sip_call_status = $2, sip_response_message = $3, updated_at = NOW()
+            WHERE id = $4
             """,
             call_id,
+            "success",
+            "SIP 200: Call Answered",
             phone_id,
         )
 
@@ -424,11 +431,146 @@ async def _make_call(
 
         # 等待通话完成（通过简单超时机制，实际由 Agent 回调更新状态）
         # 通话结束由 call_record_service 更新号码状态
+        # 轮询等待通话结束（每 5 秒检查一次 CDR 状态），最长等待 call_timeout_sec
+        poll_interval = 5
+        elapsed = 0
         timeout = settings.call_timeout_sec
-        await asyncio.sleep(timeout)
+        while elapsed < timeout:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            try:
+                cdr_row = await db.fetchrow(
+                    "SELECT status FROM lk_call_records WHERE call_id = $1", call_id
+                )
+                if cdr_row and cdr_row["status"] == "ended":
+                    logger.info(f"CDR 已结束，提前退出等待: call_id={call_id}, elapsed={elapsed}s")
+                    break
+            except Exception:
+                pass
+
+        # 安全网：sleep 结束后检查号码状态是否仍为 calling
+        # 如果 Agent 的 CDR 回调已触发 _sync_phone_status，status 应已更新
+        # 否则说明回调失败，需要手动兜底
+        try:
+            phone_row = await db.fetchrow(
+                "SELECT status FROM lk_task_phones WHERE id = $1", phone_id
+            )
+            if phone_row and phone_row["status"] == PhoneStatus.CALLING.value:
+                logger.warning(
+                    f"安全网触发：通话超时后号码仍为 calling，手动更新: "
+                    f"phone={phone}, phone_id={phone_id}, call_id={call_id}"
+                )
+                # 查询 CDR 获取实际通话结果
+                cdr = await db.fetchrow(
+                    "SELECT status, result, total_duration_sec, sip_code, hangup_cause FROM lk_call_records WHERE call_id = $1",
+                    call_id,
+                )
+                if cdr and cdr["status"] == "ended":
+                    cdr_result = cdr["result"] or ""
+                    success_results = {"completed", "transferred"}
+                    final_status = "completed" if cdr_result in success_results else "failed"
+                    duration = cdr["total_duration_sec"] or 0
+                    sip_code_val = cdr["sip_code"]
+                    hangup_val = cdr["hangup_cause"] or ""
+                    sip_msg = f"SIP {sip_code_val}: {hangup_val}" if sip_code_val else f"Call {cdr_result}"
+                    await db.execute(
+                        """
+                        UPDATE lk_task_phones
+                        SET status = $1, sip_call_status = $2, sip_response_message = $3,
+                            last_call_duration_sec = $4, updated_at = NOW()
+                        WHERE id = $5
+                        """,
+                        final_status, cdr_result, sip_msg, duration, phone_id,
+                    )
+                else:
+                    # CDR 也没有结束记录，标记为 failed
+                    await db.execute(
+                        """
+                        UPDATE lk_task_phones
+                        SET status = $1, sip_call_status = $2, sip_response_message = $3, updated_at = NOW()
+                        WHERE id = $4
+                        """,
+                        PhoneStatus.FAILED.value, "timeout", "Call timeout (no CDR update)", phone_id,
+                    )
+        except Exception as safety_err:
+            logger.warning(f"安全网更新失败: {safety_err}")
 
     except Exception as e:
         logger.error(f"外呼失败: task_id={task_id}, phone={phone}, error={e}")
+
+        sip_code = None
+        hangup_cause = None
+        call_result = CallResult.ERROR
+
+        # 优先处理 SipCallError（由 sip_service 封装，携带 call_id 和 SIP 详情）
+        if isinstance(e, SipCallError):
+            call_id = e.call_id
+            sip_code = e.sip_code
+            hangup_cause = e.hangup_cause
+        elif isinstance(e, TwirpError):
+            meta = e.metadata or {}
+            sip_status_code_str = meta.get("sip_status_code", "")
+            sip_status_text = meta.get("sip_status", "")
+            if sip_status_code_str:
+                try:
+                    sip_code = int(sip_status_code_str)
+                except ValueError:
+                    pass
+            if sip_status_text:
+                hangup_cause = sip_status_text[:64]
+
+        # SIP 状态码 → CallResult 映射
+        if sip_code == 480:
+            call_result = CallResult.NOT_ANSWERED
+            if not hangup_cause:
+                hangup_cause = "Temporarily Unavailable"
+        elif sip_code == 486:
+            call_result = CallResult.BUSY
+            if not hangup_cause:
+                hangup_cause = "Busy Here"
+        elif sip_code == 408:
+            call_result = CallResult.TIMEOUT
+            if not hangup_cause:
+                hangup_cause = "Request Timeout"
+        elif sip_code == 603:
+            call_result = CallResult.REJECTED
+            if not hangup_cause:
+                hangup_cause = "Decline"
+
+        logger.info(
+            f"SIP 外呼失败详情: phone={phone}, sip_code={sip_code}, "
+            f"hangup_cause={hangup_cause}, result={call_result.value}"
+        )
+
+        # 构建 sip_call_status 和 sip_response_message
+        sip_call_status = call_result.value  # 如 'not_answered', 'busy', 'rejected', 'timeout', 'error'
+        sip_response_message = f"SIP {sip_code}: {hangup_cause}" if sip_code else str(e)[:500]
+
+        # 更新 CDR：保存 SIP 状态码和挂断原因
+        try:
+            if call_id:
+                await call_record_service.update_record(
+                    call_id,
+                    CallRecordUpdate(
+                        status=CallState.ENDED,
+                        result=call_result,
+                        sip_code=sip_code,
+                        hangup_cause=hangup_cause,
+                    ),
+                )
+        except Exception as cdr_err:
+            logger.warning(f"更新外呼失败 CDR 失败: {cdr_err}")
+
+        # 设置 last_call_id（便于后续 _sync_phone_status 匹配）
+        if call_id:
+            try:
+                await db.execute(
+                    "UPDATE lk_task_phones SET last_call_id = $1 WHERE id = $2",
+                    call_id,
+                    phone_id,
+                )
+            except Exception:
+                pass
 
         # 获取当前重试次数
         row = await db.fetchrow(
@@ -437,30 +579,43 @@ async def _make_call(
         )
         retry_count = row["retry_count"] if row else 0
 
+        logger.info(
+            f"准备更新号码状态: phone_id={phone_id}, retry_count={retry_count}, "
+            f"max_retries={max_retries}, sip_call_status={sip_call_status}, "
+            f"sip_response_message={sip_response_message}"
+        )
+
         if retry_count < max_retries:
             # 重试：状态回退为 pending
             await db.execute(
                 """
                 UPDATE lk_task_phones
-                SET status = $1, retry_count = $2, last_error = $3, updated_at = NOW()
-                WHERE id = $4
+                SET status = $1, retry_count = $2, last_error = $3,
+                    sip_call_status = $4, sip_response_message = $5, updated_at = NOW()
+                WHERE id = $6
                 """,
                 PhoneStatus.PENDING.value,
                 retry_count + 1,
                 str(e)[:500],
+                sip_call_status,
+                sip_response_message,
                 phone_id,
             )
             logger.info(f"号码将重试: phone={phone}, retry={retry_count + 1}/{max_retries}")
+            logger.info(f"号码状态已更新(重试): phone_id={phone_id}, status=pending, sip_call_status={sip_call_status}")
         else:
             # 超过重试次数，标记失败
             await db.execute(
                 """
                 UPDATE lk_task_phones
-                SET status = $1, last_error = $2, updated_at = NOW()
-                WHERE id = $3
+                SET status = $1, last_error = $2,
+                    sip_call_status = $3, sip_response_message = $4, updated_at = NOW()
+                WHERE id = $5
                 """,
                 PhoneStatus.FAILED.value,
                 str(e)[:500],
+                sip_call_status,
+                sip_response_message,
                 phone_id,
             )
             # 更新任务失败计数
@@ -472,6 +627,7 @@ async def _make_call(
                 """,
                 task_id,
             )
+            logger.info(f"号码状态已更新(失败): phone_id={phone_id}, status=failed, sip_call_status={sip_call_status}")
 
     finally:
         sem.release()

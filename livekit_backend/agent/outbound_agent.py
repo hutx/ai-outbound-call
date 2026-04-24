@@ -38,8 +38,6 @@ from livekit_backend.models.file import FileRecordCreate
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONVERSATION_ROUNDS = 10
-
 
 class OutboundCallAgent:
     """外呼语音 Agent
@@ -97,7 +95,7 @@ class OutboundCallAgent:
             # 1. 初始化数据库连接
             await db.get_pool()
 
-            # 2. 创建 CDR 记录
+            # 2. 创建 CDR 记录（初始状态为 RINGING，等真正接听后再设 CONNECTED）
             cdr = await call_record_service.create_record(
                 CallRecordCreate(
                     call_id=self.call_id,
@@ -109,9 +107,8 @@ class OutboundCallAgent:
             self._call_record_id = cdr.get("id")
             await call_record_service.update_record(
                 self.call_id,
-                CallRecordUpdate(status=CallState.CONNECTED, answered_at=datetime.now()),
+                CallRecordUpdate(status=CallState.RINGING),
             )
-            self._answered_at = datetime.now()
 
             # 3. 加载话术
             script = await script_service.get_script(self.script_id)
@@ -173,40 +170,71 @@ class OutboundCallAgent:
             # 10. 连接到 Room
             await self.ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
+            # 10.1 重新解析 Room metadata（connect 后 metadata 更可靠）
+            meta = json.loads(self.ctx.room.metadata or "{}")
+            if meta.get("phone"):
+                self.script_id = meta.get("script_id", self.script_id)
+                self.task_id = meta.get("task_id", self.task_id)
+                self.phone = meta.get("phone") or self.phone
+                self.customer_info = meta.get("customer_info", self.customer_info)
+                logger.info(f"Room metadata 已重新解析: script_id={self.script_id}, task_id={self.task_id}, phone={self.phone}")
+
+            # 10.2 修正 CDR 中的 task_id 和 phone（step 2 创建时可能为空）
+            if self.task_id:
+                try:
+                    await db.execute(
+                        """
+                        UPDATE lk_call_records
+                        SET task_id = $1, phone = $2
+                        WHERE call_id = $3 AND (task_id IS NULL OR task_id = '')
+                        """,
+                        self.task_id, self.phone, self.call_id,
+                    )
+                    logger.info(f"CDR task_id 已修正: call_id={self.call_id}, task_id={self.task_id}, phone={self.phone}")
+                except Exception as e:
+                    logger.warning(f"修正 CDR task_id 失败: {e}")
+
             # 11. 等待 SIP 参与者加入
+            #    由于 sip_service 启用了 wait_until_answered=True，
+            #    SIP 参与者加入 Room 即意味着被叫已真正接听。
+            #    但实际中参与者可能在振铃阶段就加入，因此还需等待音频轨道发布
+            #    作为真正接通的确认信号。
             try:
                 participant = await asyncio.wait_for(
                     self._wait_for_sip_participant(),
-                    timeout=settings.originate_timeout_sec,
+                    timeout=settings.originate_timeout_sec + 10,  # 略长于 SIP 振铃超时
                 )
-                logger.info(f"SIP 参与者已加入: {participant.identity}")
-            except asyncio.TimeoutError:
-                logger.warning("等待 SIP 参与者超时")
+                logger.info(f"SIP 参与者已加入: {participant.identity}, 等待音频轨道确认接通...")
+
+                # 11a. 等待音频轨道发布（真正接通的确认信号）
+                await asyncio.wait_for(
+                    self._wait_for_audio_track(participant),
+                    timeout=settings.originate_timeout_sec + 10,
+                )
+                logger.info(f"SIP 参与者音频轨道已就绪（已接听）: {participant.identity}")
+
+            except (asyncio.TimeoutError, RuntimeError) as wait_err:
+                reason = "超时（未接听）" if isinstance(wait_err, asyncio.TimeoutError) else f"房间断开（{wait_err}）"
+                logger.warning(f"等待 SIP 参与者失败: {reason}")
                 await call_record_service.update_record(
                     self.call_id,
-                    CallRecordUpdate(status=CallState.ENDED, result=CallResult.TIMEOUT),
+                    CallRecordUpdate(
+                        status=CallState.ENDED,
+                        result=CallResult.NOT_ANSWERED,
+                        sip_code=408,
+                        hangup_cause="no_answer_timeout" if isinstance(wait_err, asyncio.TimeoutError) else "room_disconnected",
+                    ),
                 )
                 return
 
-            # 11.5 启动 Egress 录制
-            try:
-                # 确保 MinIO bucket 存在
-                await minio_service.ensure_bucket()
-                self._egress_service = EgressService()
-                await self._egress_service.initialize()
-                self._egress_id = await self._egress_service.start_room_composite_egress(
-                    room_name=self.call_id, call_id=self.call_id,
-                )
-                await call_record_service.update_record(
-                    self.call_id,
-                    CallRecordUpdate(egress_id=self._egress_id),
-                )
-                logger.info(f"Egress 录制已启动: egress_id={self._egress_id}")
-            except Exception as e:
-                logger.warning(f"启动 Egress 录制失败（不影响通话）: {e}")
-                self._egress_id = None
+            # 11.1 SIP 参与者音频就绪 = 被叫已接听，更新 CDR 状态（后台，不阻塞）
+            self._answered_at = datetime.now()
+            asyncio.create_task(self._update_cdr_connected())
 
-            # 12. 启动 AgentSession
+            # 11.5 启动 Egress 录制（后台，不阻塞开场白）
+            asyncio.create_task(self._start_egress_background())
+
+            # 12. 启动 AgentSession（必须等待完成，才能播报）
             await self._session.start(self._agent, room=self.ctx.room)
 
             # 13. 播放开场白
@@ -226,6 +254,9 @@ class OutboundCallAgent:
             # - "intent_end" / 其他: 用户意图结束，播放结束语并等待完毕后再断开
             if loop_result != "no_response_hangup":
                 closing_text = script.get("closing_text", "")
+                # 达到最大轮次时，在结束语前加上提示
+                if loop_result == "max_rounds" and closing_text:
+                    closing_text = "您的通话时长已到，" + closing_text
                 if closing_text:
                     logger.info(f"播放结束语: {closing_text[:50]}...")
                     await self._speak(closing_text, allow_interruptions=script.get("barge_in_closing", False))
@@ -280,7 +311,7 @@ class OutboundCallAgent:
             - "session_closed": Session 已关闭（SIP 断开等）
             - "max_rounds": 达到最大轮次
         """
-        for round_num in range(_MAX_CONVERSATION_ROUNDS):
+        for round_num in range(settings.max_conversation_rounds):
             # 每轮开始前检查 session 是否存活
             if not self._is_session_alive():
                 logger.warning("AgentSession 已关闭，退出对话循环")
@@ -410,6 +441,7 @@ class OutboundCallAgent:
                 return "session_closed"
 
         # 达到最大轮次
+        logger.info(f"达到最大对话轮次 ({settings.max_conversation_rounds})，结束通话")
         return "max_rounds"
 
     # ------------------------------------------------------------------
@@ -714,11 +746,77 @@ class OutboundCallAgent:
             if not future.done():
                 future.set_result(participant)
 
+        def on_disconnected():
+            if not future.done():
+                future.set_exception(RuntimeError("Room disconnected before SIP participant joined"))
+
         self.ctx.room.on("participant_connected", on_participant_connected)
+        self.ctx.room.on("disconnected", on_disconnected)
         try:
             return await future
         finally:
             self.ctx.room.off("participant_connected", on_participant_connected)
+            self.ctx.room.off("disconnected", on_disconnected)
+
+    async def _wait_for_audio_track(self, participant: rtc.RemoteParticipant) -> None:
+        """等待 SIP 参与者的音频轨道发布（接通确认）
+
+        SIP 通话中，音频轨道只有在对方真正接听后才会发布。
+        振铃阶段参与者可能已加入 Room 但没有音频轨道。
+        """
+        # 先检查是否已有音频轨道
+        for pub in participant.track_publications.values():
+            if pub.kind == rtc.TrackKind.KIND_AUDIO:
+                return
+
+        # 等待音频轨道发布
+        future: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+
+        def on_track_published(publication: rtc.RemoteTrackPublication, pub_participant: rtc.RemoteParticipant):
+            if pub_participant.identity == participant.identity and publication.kind == rtc.TrackKind.KIND_AUDIO:
+                if not future.done():
+                    future.set_result(None)
+
+        def on_disconnected():
+            if not future.done():
+                future.set_exception(RuntimeError("Room disconnected while waiting for audio track"))
+
+        self.ctx.room.on("track_published", on_track_published)
+        self.ctx.room.on("disconnected", on_disconnected)
+        try:
+            await future
+        finally:
+            self.ctx.room.off("track_published", on_track_published)
+            self.ctx.room.off("disconnected", on_disconnected)
+
+    async def _update_cdr_connected(self):
+        """后台更新 CDR 为已接通状态"""
+        try:
+            await call_record_service.update_record(
+                self.call_id,
+                CallRecordUpdate(status=CallState.CONNECTED, answered_at=self._answered_at),
+            )
+            logger.info(f"CDR 已更新为 CONNECTED: call_id={self.call_id}")
+        except Exception as e:
+            logger.warning(f"更新 CDR 接通状态失败（不影响通话）: {e}")
+
+    async def _start_egress_background(self):
+        """后台启动 Egress 录制（不阻塞开场白播报）"""
+        try:
+            await minio_service.ensure_bucket()
+            self._egress_service = EgressService()
+            await self._egress_service.initialize()
+            self._egress_id = await self._egress_service.start_room_composite_egress(
+                room_name=self.call_id, call_id=self.call_id,
+            )
+            await call_record_service.update_record(
+                self.call_id,
+                CallRecordUpdate(egress_id=self._egress_id),
+            )
+            logger.info(f"Egress 录制已启动（后台）: egress_id={self._egress_id}")
+        except Exception as e:
+            logger.warning(f"启动 Egress 录制失败（不影响通话）: {e}")
+            self._egress_id = None
 
     # ------------------------------------------------------------------
     # Egress 录制管理

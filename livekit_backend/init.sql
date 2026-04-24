@@ -171,3 +171,10 @@ CREATE INDEX IF NOT EXISTS idx_call_record_details_round ON lk_call_record_detai
 ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS recording_file_id VARCHAR(128);
 ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS egress_id VARCHAR(128);
 ALTER TABLE lk_call_records ADD COLUMN IF NOT EXISTS total_duration_sec REAL DEFAULT 0;
+
+-- 号码表新增 SIP 呼叫状态字段
+ALTER TABLE lk_task_phones ADD COLUMN IF NOT EXISTS sip_call_status VARCHAR(32);
+ALTER TABLE lk_task_phones ADD COLUMN IF NOT EXISTS sip_response_message TEXT;
+
+-- 号码表新增通话时长字段
+ALTER TABLE lk_task_phones ADD COLUMN IF NOT EXISTS last_call_duration_sec REAL DEFAULT 0;

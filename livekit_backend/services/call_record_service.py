@@ -216,7 +216,10 @@ async def get_records_count(
 # ── 内部辅助 ──────────────────────────────────────────────────────────
 
 async def _sync_phone_status(record: Dict[str, Any]) -> None:
-    """通话结束后同步更新任务号码状态和计数"""
+    """通话结束后同步更新任务号码状态和计数
+
+    将 CDR 中的通话结果、SIP 状态、通话时长等信息同步到 lk_task_phones 表。
+    """
     task_id = record.get("task_id")
     call_id = record.get("call_id")
     result = record.get("result", "")
@@ -228,14 +231,36 @@ async def _sync_phone_status(record: Dict[str, Any]) -> None:
     success_results = {"completed", "transferred"}
     phone_status = "completed" if result in success_results else "failed"
 
-    # 更新号码状态
+    # 构建 SIP 状态信息
+    sip_code = record.get("sip_code")
+    hangup_cause = record.get("hangup_cause", "")
+    total_duration_sec = record.get("total_duration_sec", 0) or 0
+
+    # sip_call_status: 通话正常结束为 result 值，如 completed/error/not_answered 等
+    sip_call_status = result if result else phone_status
+    # sip_response_message: 组合 SIP 状态码和原因
+    if sip_code:
+        sip_response_message = f"SIP {sip_code}: {hangup_cause}" if hangup_cause else f"SIP {sip_code}"
+    elif result:
+        sip_response_message = f"Call {result}"
+    else:
+        sip_response_message = None
+
+    # 更新号码状态、SIP 信息、通话时长
     await db.execute(
         """
         UPDATE lk_task_phones
-        SET status = $1, updated_at = NOW()
-        WHERE task_id = $2 AND last_call_id = $3
+        SET status = $1,
+            sip_call_status = $2,
+            sip_response_message = $3,
+            last_call_duration_sec = $4,
+            updated_at = NOW()
+        WHERE task_id = $5 AND last_call_id = $6
         """,
         phone_status,
+        sip_call_status,
+        sip_response_message,
+        total_duration_sec,
         task_id,
         call_id,
     )
@@ -265,7 +290,8 @@ async def _sync_phone_status(record: Dict[str, Any]) -> None:
 
     logger.info(
         f"号码状态已同步: task_id={task_id}, call_id={call_id}, "
-        f"phone_status={phone_status}"
+        f"phone_status={phone_status}, sip_call_status={sip_call_status}, "
+        f"duration={total_duration_sec}s"
     )
 
 
