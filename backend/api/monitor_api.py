@@ -1,167 +1,283 @@
-"""
-监控与指标路由
-"""
+"""监控 API + WebSocket 实时推送
 
+提供系统健康检查、活跃通话查询、实时统计，以及 WebSocket 推送。
+统一响应格式: {"code": 0, "data": ..., "message": "ok"}
+"""
 import asyncio
+import json
 import logging
 import time
-from datetime import datetime
-from typing import Callable
+from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
-from websockets.exceptions import ConnectionClosed
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.core.auth import require_auth
+from backend.core.config import settings
+from backend.utils import db
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter(tags=["monitor"])
 
-class MonitorAPI:
-    def __init__(
-        self,
-        *,
-        config,
-        metrics: dict[str, int],
-        scheduler_getter: Callable[[], object],
-        esl_pool_getter: Callable[[], object],
-        start_time: float,
-    ):
-        self._config = config
-        self._metrics = metrics
-        self._scheduler_getter = scheduler_getter
-        self._esl_pool_getter = esl_pool_getter
-        self._start_time = start_time
-        self._ws_clients: list[WebSocket] = []
-        self.router = APIRouter()
-        self._register_routes()
+# ── 应用启动时间戳 ───────────────────────────────────────────────────
+_start_time: float = time.time()
 
-    async def broadcast_stats(self):
-        if not self._ws_clients:
-            return
-        data = await self.build_monitor_data()
-        dead = []
-        for ws in self._ws_clients:
+
+# ── WebSocket 连接管理器 ──────────────────────────────────────────────
+
+class ConnectionManager:
+    """WebSocket 连接管理"""
+
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info("WebSocket 客户端已连接, 当前连接数: %d", len(self.active_connections))
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info("WebSocket 客户端已断开, 当前连接数: %d", len(self.active_connections))
+
+    async def broadcast(self, message: dict):
+        """广播消息到所有连接"""
+        dead: list[WebSocket] = []
+        for conn in self.active_connections:
             try:
-                await ws.send_json(data)
+                await conn.send_json(message)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            if ws in self._ws_clients:
-                self._ws_clients.remove(ws)
+                dead.append(conn)
+        for conn in dead:
+            if conn in self.active_connections:
+                self.active_connections.remove(conn)
 
-    async def build_monitor_data(self) -> dict:
-        scheduler = self._scheduler_getter()
-        tasks = scheduler.list_tasks() if scheduler else []
-        return {
-            "type": "stats",
-            "ts": datetime.now().isoformat(),
-            "active_calls": self._metrics["calls_active"],
-            "calls_total": self._metrics["calls_total"],
-            "active_tasks": sum(1 for t in tasks if t["status"] == "RUNNING"),
-            "tasks": tasks[:10],
-        }
 
-    def _register_routes(self):
-        @self.router.get("/api/stats")
-        async def get_stats():
-            scheduler = self._scheduler_getter()
-            tasks = scheduler.list_tasks() if scheduler else []
-            return {
-                "active_calls": self._metrics["calls_active"],
-                "calls_total": self._metrics["calls_total"],
-                "calls_completed": self._metrics["calls_completed"],
-                "calls_transferred": self._metrics["calls_transferred"],
-                "calls_error": self._metrics["calls_error"],
-                "active_tasks": sum(1 for t in tasks if t["status"] == "RUNNING"),
-                "total_tasks": len(tasks),
-                "max_concurrent": self._config.max_concurrent_calls,
-                "uptime_seconds": int(time.time() - self._start_time),
-                "tasks": tasks[:20],
-            }
+manager = ConnectionManager()
 
-        @self.router.get("/health")
-        async def health():
-            esl_pool = self._esl_pool_getter()
-            esl_ok = bool(
-                esl_pool is not None
-                and esl_pool._conns
-                and any(c.is_connected for c in esl_pool._conns)
+
+# ── 统一响应 ──────────────────────────────────────────────────────────
+
+def _ok(data=None, message: str = "ok") -> dict:
+    return {"code": 0, "data": data, "message": message}
+
+
+# ── 活跃通话状态集合 ─────────────────────────────────────────────────
+
+ACTIVE_STATUSES = (
+    "initiating",
+    "ringing",
+    "connected",
+    "ai_speaking",
+    "user_speaking",
+    "processing",
+)
+
+
+# ── 路由 ──────────────────────────────────────────────────────────────
+
+@router.get("/api/monitor/active-calls", summary="当前活跃通话列表")
+async def get_active_calls():
+    """查询 lk_call_records 表中状态为活跃的通话列表。
+
+    活跃状态包括: initiating, ringing, connected,
+    ai_speaking, user_speaking, processing
+    """
+    placeholders = ", ".join(f"${i}" for i in range(1, len(ACTIVE_STATUSES) + 1))
+    rows = await db.fetch(
+        f"""
+        SELECT id, call_id, task_id, phone, script_id, status,
+               duration_sec, rounds, started_at, answered_at
+        FROM lk_call_records
+        WHERE status IN ({placeholders})
+        ORDER BY created_at DESC
+        """,
+        *ACTIVE_STATUSES,
+    )
+    calls = [dict(r) for r in rows]
+    # 将 datetime 转为 ISO 格式字符串以便 JSON 序列化
+    for call in calls:
+        for key in ("started_at", "answered_at"):
+            val = call.get(key)
+            if val and isinstance(val, datetime):
+                call[key] = val.isoformat()
+    return _ok(calls)
+
+
+@router.get("/api/monitor/stats", summary="系统统计")
+async def get_stats():
+    """系统统计数据。
+
+    返回:
+        active_calls: 当前活跃通话数
+        today_total: 今日总通话数
+        today_completed: 今日完成通话数
+        today_success_rate: 今日成功率（百分比）
+        running_tasks: 运行中任务数
+    """
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # 活跃通话数
+    placeholders = ", ".join(f"${i}" for i in range(1, len(ACTIVE_STATUSES) + 1))
+    active_calls = await db.fetchval(
+        f"""
+        SELECT COUNT(*) FROM lk_call_records
+        WHERE status IN ({placeholders})
+        """,
+        *ACTIVE_STATUSES,
+    )
+
+    # 今日总通话
+    today_total = await db.fetchval(
+        """
+        SELECT COUNT(*) FROM lk_call_records
+        WHERE created_at >= $1
+        """,
+        today_start,
+    )
+
+    # 今日已完成通话（结果为 completed 或 transferred 视为成功）
+    today_completed = await db.fetchval(
+        """
+        SELECT COUNT(*) FROM lk_call_records
+        WHERE created_at >= $1 AND status = 'ended'
+        """,
+        today_start,
+    )
+
+    # 今日成功通话（result 为 completed 或 transferred）
+    today_success = await db.fetchval(
+        """
+        SELECT COUNT(*) FROM lk_call_records
+        WHERE created_at >= $1 AND result IN ('completed', 'transferred')
+        """,
+        today_start,
+    )
+
+    today_success_rate = round(today_success / today_total * 100, 2) if today_total > 0 else 0.0
+
+    # 运行中任务数
+    running_tasks = await db.fetchval(
+        """
+        SELECT COUNT(*) FROM lk_tasks WHERE status = 'running'
+        """
+    )
+
+    return _ok({
+        "active_calls": active_calls or 0,
+        "today_total": today_total or 0,
+        "today_completed": today_completed or 0,
+        "today_success_rate": today_success_rate,
+        "running_tasks": running_tasks or 0,
+    })
+
+
+@router.websocket("/ws/monitor")
+async def ws_monitor(websocket: WebSocket):
+    """WebSocket 实时推送。
+
+    客户端连接后，每 2 秒推送一次当前活跃通话与统计数据。
+    推送格式:
+        {"type": "update", "data": {"active_calls": [...], "stats": {...}}}
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            # 获取活跃通话
+            placeholders = ", ".join(
+                f"${i}" for i in range(1, len(ACTIVE_STATUSES) + 1)
             )
-            return {
-                "status": "ok" if esl_ok else "degraded",
-                "esl_pool": esl_ok,
-                "active_calls": self._metrics["calls_active"],
-                "timestamp": datetime.now().isoformat(),
+            rows = await db.fetch(
+                f"""
+                SELECT id, call_id, task_id, phone, script_id, status,
+                       duration_sec, rounds, started_at, answered_at
+                FROM lk_call_records
+                WHERE status IN ({placeholders})
+                ORDER BY created_at DESC
+                """,
+                *ACTIVE_STATUSES,
+            )
+            calls = [dict(r) for r in rows]
+            for call in calls:
+                for key in ("started_at", "answered_at"):
+                    val = call.get(key)
+                    if val and isinstance(val, datetime):
+                        call[key] = val.isoformat()
+
+            # 获取统计
+            now = datetime.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            active_count = len(calls)
+            today_total = await db.fetchval(
+                "SELECT COUNT(*) FROM lk_call_records WHERE created_at >= $1",
+                today_start,
+            )
+            running_tasks = await db.fetchval(
+                "SELECT COUNT(*) FROM lk_tasks WHERE status = 'running'"
+            )
+
+            stats = {
+                "active_calls": active_count,
+                "today_total": today_total or 0,
+                "running_tasks": running_tasks or 0,
             }
 
-        @self.router.get("/metrics", response_class=PlainTextResponse)
-        async def prometheus_metrics():
-            scheduler = self._scheduler_getter()
-            tasks = scheduler.list_tasks() if scheduler else []
-            active_tasks = sum(1 for t in tasks if t["status"] == "RUNNING")
-            uptime = int(time.time() - self._start_time)
-            lines = [
-                "# HELP outbound_calls_total Total outbound calls initiated",
-                "# TYPE outbound_calls_total counter",
-                f'outbound_calls_total {self._metrics["calls_total"]}',
-                "# HELP outbound_calls_active Currently active calls",
-                "# TYPE outbound_calls_active gauge",
-                f'outbound_calls_active {self._metrics["calls_active"]}',
-                "# HELP outbound_calls_completed_total Completed calls",
-                "# TYPE outbound_calls_completed_total counter",
-                f'outbound_calls_completed_total {self._metrics["calls_completed"]}',
-                "# HELP outbound_calls_transferred_total Transferred to human calls",
-                "# TYPE outbound_calls_transferred_total counter",
-                f'outbound_calls_transferred_total {self._metrics["calls_transferred"]}',
-                "# HELP outbound_calls_error_total Error calls",
-                "# TYPE outbound_calls_error_total counter",
-                f'outbound_calls_error_total {self._metrics["calls_error"]}',
-                "# HELP outbound_tasks_active Active running tasks",
-                "# TYPE outbound_tasks_active gauge",
-                f"outbound_tasks_active {active_tasks}",
-                "# HELP outbound_tasks_total Total tasks created",
-                "# TYPE outbound_tasks_total counter",
-                f'outbound_tasks_total {self._metrics["tasks_created"]}',
-                "# HELP outbound_uptime_seconds Service uptime in seconds",
-                "# TYPE outbound_uptime_seconds gauge",
-                f"outbound_uptime_seconds {uptime}",
-                "",
-            ]
-            return "\n".join(lines)
+            await websocket.send_json({
+                "type": "update",
+                "data": {
+                    "active_calls": calls,
+                    "stats": stats,
+                },
+            })
 
-        @self.router.websocket("/ws/monitor")
-        async def monitor_ws(websocket: WebSocket):
-            token = websocket.query_params.get("token", "")
-            if self._config.api_token.strip() and token != self._config.api_token.strip():
-                await websocket.close(code=4001, reason="Unauthorized")
-                return
+            # 等待 2 秒再推送下一次
+            await asyncio.sleep(2)
 
-            await websocket.accept()
-            self._ws_clients.append(websocket)
-            logger.debug(f"监控 WS 连接，当前 {len(self._ws_clients)} 个客户端")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as exc:
+        logger.error("WebSocket 推送异常: %s", exc)
+        manager.disconnect(websocket)
 
-            try:
-                await websocket.send_json(await self.build_monitor_data())
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                        if msg == "ping":
-                            await websocket.send_text("pong")
-                    except asyncio.TimeoutError:
-                        await websocket.send_text("ping")
-            except (WebSocketDisconnect, ConnectionClosed, Exception):
-                pass
-            finally:
-                if websocket in self._ws_clients:
-                    self._ws_clients.remove(websocket)
 
-        @self.router.get("/api/callbacks", dependencies=[Depends(require_auth)])
-        async def list_callbacks():
-            try:
-                from backend.utils.db import db_list_callbacks
+@router.get("/health", summary="健康检查")
+async def health_check():
+    """健康检查端点。
 
-                items = await db_list_callbacks(status="pending")
-                return {"items": items, "total": len(items)}
-            except Exception:
-                return {"items": [], "total": 0}
+    实际检测数据库与 Redis 的连接状态。
+    返回: status, uptime, version, db_connected, redis_connected
+    """
+    db_connected = False
+    redis_connected = False
+
+    # 检测数据库连接
+    try:
+        result = await db.fetchval("SELECT 1")
+        db_connected = result == 1
+    except Exception as exc:
+        logger.warning("数据库连接检查失败: %s", exc)
+
+    # 检测 Redis 连接
+    try:
+        import redis.asyncio as aioredis
+
+        r = aioredis.from_url(settings.redis_url)
+        await r.ping()
+        redis_connected = True
+        await r.aclose()
+    except Exception as exc:
+        logger.warning("Redis 连接检查失败: %s", exc)
+
+    uptime = round(time.time() - _start_time, 1)
+    status = "healthy" if (db_connected and redis_connected) else "degraded"
+
+    return _ok({
+        "status": status,
+        "uptime": uptime,
+        "version": "0.1.0",
+        "db_connected": db_connected,
+        "redis_connected": redis_connected,
+    })

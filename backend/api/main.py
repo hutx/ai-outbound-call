@@ -1,235 +1,112 @@
+"""FastAPI 主入口 - LiveKit 智能外呼系统
+
+负责应用生命周期管理、路由注册、CORS 配置、静态文件挂载。
 """
-FastAPI 主入口 — 生产级
-────────────────────────
-REST API   : 任务管理、通话记录、黑名单
-WebSocket  : /ws/monitor 实时推送
-Metrics    : /metrics  Prometheus 格式
-Auth       : Bearer Token（API_TOKEN 环境变量）
-Graceful   : SIGTERM → 等待活跃通话完成 → 关闭连接池
-"""
-import asyncio
 import logging
-import os
-import signal
-import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from backend.api.monitor_api import MonitorAPI
-from backend.api.operations_api import OperationsAPI
-from backend.core.config import config
-from backend.core.scheduler import TaskScheduler
-from backend.services.esl_service import AsyncESLPool, ESLEventListener
-from backend.services.asr_service import create_asr_client
-from backend.services.forkzstream_ws import ForkzstreamWebSocketServer
-from backend.services.tts_service import create_tts_client
-from backend.services.llm_service import LLMService
-from backend.services.crm_service import crm
+from backend.core.config import settings
+from backend.utils import db
 from backend.api.scripts_api import router as scripts_router
-from backend.utils.db import init_db, dispose_db
+from backend.api.tasks_api import router as tasks_router
+from backend.api.monitor_api import router as monitor_router
+from backend.api.calls_api import router as calls_router
+from backend.services import task_service
+from backend.services.sip_service import SipService
+from backend.services.minio_service import minio_service
 
-
-logging.basicConfig(
-    level=logging.DEBUG if config.debug else logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    force=True,
-)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# 全局单例
-# ─────────────────────────────────────────────────────────────
-_esl_pool: Optional[AsyncESLPool] = None
-_esl_listener: Optional[ESLEventListener] = None
-_forkzstream_ws_server: Optional[ForkzstreamWebSocketServer] = None
-_asr = None
-_tts = None
-_llm = None
-_scheduler: Optional[TaskScheduler] = None
-
-# 活跃通话 uuid → CallAgent（注：CallAgent 现由 ForkzstreamWebSocketServer 内部管理）
-_active_calls: dict = {}
-
-# Prometheus-style 计数器
-_metrics = {
-    "calls_total": 0,
-    "calls_active": 0,
-    "calls_completed": 0,
-    "calls_transferred": 0,
-    "calls_error": 0,
-    "tasks_created": 0,
-    "tts_errors": 0,
-    "asr_errors": 0,
-    "llm_errors": 0,
-}
-_start_time = time.time()
+# 全局 SIP 服务实例（与 task_service 模块共享同一实例）
+sip_service: SipService = task_service.sip_service
 
 
-# ─────────────────────────────────────────────────────────────
-# 生命周期
-# ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _esl_pool, _esl_listener, _forkzstream_ws_server, _asr, _tts, _llm, _scheduler
+    """应用生命周期管理"""
+    # ── 启动 ──
+    logging.basicConfig(level=getattr(logging, settings.log_level))
+    logger.info("正在启动 LiveKit 智能外呼系统...")
 
-    # ★ 显式配置日志
-    _log_level = logging.DEBUG if config.debug else logging.INFO
-    _root = logging.getLogger()
-    _root.setLevel(_log_level)
-    if not _root.handlers:
-        _h = logging.StreamHandler()
-        _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-        _root.addHandler(_h)
-    logging.getLogger("backend").setLevel(_log_level)
+    # 初始化数据库连接池
+    await db.get_pool()
+    logger.info("数据库连接池已就绪")
 
-    print("━" * 50, flush=True)
-    print("  智能外呼系统启动", flush=True)
-    print("━" * 50, flush=True)
-    logger.info("  智能外呼系统启动")
-    logger.info("━" * 50)
-
-    config.validate_runtime()
-
-    # 数据库
+    # 初始化 MinIO bucket（确保 lk-recordings 存在）
     try:
-        await init_db()
-        logger.info("✓ 数据库初始化完成")
+        await minio_service.ensure_bucket()
+        logger.info("MinIO bucket 已就绪")
     except Exception as e:
-        logger.warning(f"✗ 数据库连接失败（将在写入时重试）: {e}")
+        logger.warning(f"MinIO bucket 初始化失败（录音存储可能不可用）: {e}")
 
-    # CRM 黑名单预热
-    await crm.startup()
-    logger.info("✓ CRM 服务就绪")
+    # 初始化 SIP 服务（task_service 模块共享同一实例）
+    await sip_service.initialize()
+    logger.info("LiveKit SIP 服务已就绪")
 
-    # 服务单例
-    _asr = create_asr_client()
-    _tts = create_tts_client()
-    _llm = LLMService()
-    logger.info("✓ ASR / TTS / LLM 服务初始化完成")
+    # 将服务实例注入到 app.state，供其他模块通过 request.app.state 获取
+    app.state.sip_service = sip_service
+    app.state.task_service = task_service
 
-    # forkzstream WebSocket Server（接收 FreeSWITCH forkzstream 实时音频流，内置 CallAgent）
-    _forkzstream_ws_server = ForkzstreamWebSocketServer(
-        host="0.0.0.0",
-        port=config.freeswitch.forkzstream_port,
+    logger.info(
+        "系统启动完成 - API: %s:%s",
+        settings.api_host,
+        settings.api_port,
     )
-    try:
-        await _forkzstream_ws_server.start()
-        logger.info(f"✓ Forkzstream WebSocket 监听 :{config.freeswitch.forkzstream_port}")
-    except Exception as e:
-        logger.warning(f"✗ Forkzstream WebSocket 启动失败: {e}")
-        _forkzstream_ws_server = None
-
-    # ESL 事件监听器（持久订阅 CHANNEL_ANSWER 等事件，用于 originate 结果确认）
-    _esl_listener = ESLEventListener(
-        host=config.freeswitch.host,
-        port=config.freeswitch.port,
-        password=config.freeswitch.password,
-    )
-    try:
-        await _esl_listener.start()
-        logger.info("✓ ESL 事件监听器就绪")
-    except Exception as e:
-        logger.warning(f"✗ ESL 事件监听器启动失败（将降级轮询）: {e}")
-        _esl_listener = None
-
-    # ESL 连接池（Inbound，用于 originate / API 调用）
-    _esl_pool = AsyncESLPool(
-        host=config.freeswitch.host,
-        port=config.freeswitch.port,
-        password=config.freeswitch.password,
-        pool_size=5,
-        event_listener=_esl_listener,
-    )
-    try:
-        await _esl_pool.start()
-        logger.info("✓ ESL 连接池就绪")
-    except Exception as e:
-        logger.warning(f"✗ ESL 连接池启动失败（FreeSWITCH 未运行？）: {e}")
-
-    # 将 ESL pool 引用设置给 forkzstream server（用于 CallAgent 通话控制）
-    if _forkzstream_ws_server:
-        _forkzstream_ws_server._esl_pool = _esl_pool
-
-    # 任务调度器
-    _scheduler = TaskScheduler(esl_pool=_esl_pool)
-
-    # SIGTERM 优雅退出
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_graceful_shutdown()))
-
-    logger.info("  系统就绪，等待外呼任务")
-    logger.info("━" * 50)
 
     yield
 
-    # ── 关闭流程 ──────────────────────────────────────────────
-    logger.info("开始优雅关闭...")
-
-    if _active_calls:
-        logger.info(f"等待 {len(_active_calls)} 路活跃通话结束...")
-        await asyncio.wait_for(
-            asyncio.gather(*[a.session.hangup() for a in _active_calls.values()],
-                           return_exceptions=True),
-            timeout=10.0,
-        )
-
-    if _forkzstream_ws_server:
-        await _forkzstream_ws_server.stop()
-
-    if _esl_pool:
-        await _esl_pool.stop()
-
-    if _esl_listener:
-        await _esl_listener.stop()
-
-    await dispose_db()
-    logger.info("服务已关闭")
-
-
-async def _graceful_shutdown():
-    logger.info("收到 SIGTERM，准备优雅退出")
-    for agent in list(_active_calls.values()):
-        try:
-            await agent.session.hangup("MANAGER_REQUEST")
-        except Exception:
-            pass
+    # ── 关闭 ──
+    logger.info("正在关闭系统...")
+    await sip_service.close()
+    await db.close_pool()
+    logger.info("系统已关闭")
 
 
 app = FastAPI(
-    title="智能外呼平台",
-    description="FreeSWITCH + Claude LLM 智能外呼系统",
-    version="2.0.0",
+    title="LiveKit 智能外呼系统",
+    version="0.1.0",
     lifespan=lifespan,
-    docs_url="/docs" if os.environ.get("DEBUG") else None,
-    redoc_url=None,
 )
 
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 注册路由
 app.include_router(scripts_router)
-_monitor_api = MonitorAPI(
-    config=config,
-    metrics=_metrics,
-    scheduler_getter=lambda: _scheduler,
-    esl_pool_getter=lambda: _esl_pool,
-    start_time=_start_time,
-)
-_operations_api = OperationsAPI(
-    scheduler_getter=lambda: _scheduler,
-    metrics=_metrics,
-)
-app.include_router(_monitor_api.router)
-app.include_router(_operations_api.router)
+app.include_router(tasks_router)
+app.include_router(monitor_router)
+app.include_router(calls_router)
+
+# 静态文件（前端）
+frontend_dir = Path(__file__).parent.parent / "frontend"
+if frontend_dir.exists() and any(frontend_dir.iterdir()):
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
 
-# ─────────────────────────────────────────────────────────────
-# 前端静态文件
-# ─────────────────────────────────────────────────────────────
 @app.get("/")
-async def serve_console():
-    path = "frontend/index.html"
-    if os.path.exists(path):
-        return FileResponse(path)
-    return {"message": "Frontend not found"}
+async def root():
+    """根路由 - 返回前端页面或 API 信息"""
+    index_file = frontend_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return {
+        "code": 0,
+        "data": {
+            "message": "LiveKit 智能外呼系统 API",
+            "docs": "/docs",
+            "version": "0.1.0",
+        },
+        "message": "ok",
+    }

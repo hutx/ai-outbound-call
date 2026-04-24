@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<configuration name="audio_fork.conf" description="音频 Fork 推送配置">
-  <settings>
-    <!-- WebSocket 连接超时 -->
-    <param name="connect-timeout" value="3000"/>
-    <!-- 重连间隔 -->
-    <param name="reconnect-interval-ms" value="1000"/>
-  </settings>
-</configuration>

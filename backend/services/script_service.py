@@ -1,345 +1,275 @@
+"""话术管理服务
+
+负责话术的 CRUD 操作，使用 asyncpg 访问 lk_scripts 表，
+并提供带 TTL 的内存缓存。
 """
-话术脚本管理服务
-负责从数据库中读取、管理和更新话术脚本
-"""
-import asyncio
 import logging
-from typing import Optional, List
-from dataclasses import dataclass
+import time
+from typing import Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
-from sqlalchemy.exc import SQLAlchemyError
-
-from backend.utils.session_manager import session_manager
-from backend.models.call_script import CallScript
+from backend.utils.db import fetch, fetchrow, execute
+from backend.models.script import ScriptCreate, ScriptUpdate
 
 logger = logging.getLogger(__name__)
 
+# lk_scripts 表所有列（与 init.sql 一致），用于 SELECT / INSERT
+_COLUMNS = (
+    "id, script_id, name, description, script_type, "
+    "opening_text, opening_pause_ms, main_prompt, closing_text, "
+    "barge_in_opening, barge_in_conversation, barge_in_closing, "
+    "barge_in_protect_start_sec, barge_in_protect_end_sec, "
+    "tolerance_enabled, tolerance_ms, "
+    "no_response_timeout_sec, no_response_mode, no_response_max_count, "
+    "no_response_prompt, no_response_hangup_text, "
+    "is_active, created_at, updated_at"
+)
 
-def _format_customer_profile(customer_info: dict) -> str:
-    customer_name = customer_info.get("name", "未知")
-    customer_note = customer_info.get("note", "") or "无"
-    risk_level = customer_info.get("risk_level", "unknown")
-    found = "是" if customer_info.get("found") else "否"
-    return (
-        "【客户信息】\n"
-        f"- 姓名：{customer_name}\n"
-        f"- 是否命中客户资料：{found}\n"
-        f"- 风险等级：{risk_level}\n"
-        f"- 备注：{customer_note}\n"
-    )
+# 缓存默认 TTL（秒）
+_CACHE_TTL = 60
 
 
-@dataclass
-class ScriptConfig:
-    """话术配置项"""
-    script_id: str
-    name: str
-    description: str
-    script_type: str
-    opening_script: str
-    opening_pause: int
-    main_script: str
-    closing_script: Optional[str]
-    is_active: bool = True
-    opening_barge_in: bool = False
-    closing_barge_in: bool = False
-    conversation_barge_in: bool = True
-    barge_in_protect_start: int = 3
-    barge_in_protect_end: int = 3
-    tolerance_enabled: bool = True
-    tolerance_ms: int = 1000
-    no_response_timeout: int = 3
-    no_response_mode: str = "consecutive"
-    no_response_max_count: int = 3
-    no_response_hangup_msg: Optional[str] = None
-    no_response_hangup_enabled: bool = True
+def _record_to_dict(record) -> dict:
+    """将 asyncpg Record 转换为字典，并确保所有字段都包含在内。"""
+    if record is None:
+        return None
+    return dict(record)
 
 
 class ScriptService:
-    """话术服务类"""
+    """话术管理服务
 
-    def __init__(self):
-        self._cache: dict[str, ScriptConfig] = {}
-        self._cache_last_update = 0
+    提供 CRUD 操作，内置带 TTL 的内存缓存。
+    """
 
-    async def get_script(self, script_id: str) -> Optional[ScriptConfig]:
-        """获取指定话术脚本"""
-        # 首先尝试从缓存获取
-        if script_id in self._cache:
+    def __init__(self, cache_ttl: int = _CACHE_TTL) -> None:
+        self._cache: dict[str, dict] = {}
+        self._cache_ts: dict[str, float] = {}
+        self._cache_ttl = cache_ttl
+
+    # ------------------------------------------------------------------
+    # 缓存
+    # ------------------------------------------------------------------
+
+    def _is_cache_valid(self, script_id: str) -> bool:
+        """检查缓存是否在 TTL 内。"""
+        ts = self._cache_ts.get(script_id)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) < self._cache_ttl
+
+    def _set_cache(self, script_id: str, data: dict) -> None:
+        """写入缓存。"""
+        self._cache[script_id] = data
+        self._cache_ts[script_id] = time.monotonic()
+
+    def _invalidate(self, script_id: str) -> None:
+        """清除指定话术缓存。"""
+        self._cache.pop(script_id, None)
+        self._cache_ts.pop(script_id, None)
+
+    def clear_cache(self) -> None:
+        """清除全部缓存。"""
+        self._cache.clear()
+        self._cache_ts.clear()
+
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
+
+    async def get_script(self, script_id: str) -> Optional[dict]:
+        """获取指定话术。
+
+        先查缓存（TTL 内有效），未命中则查数据库。
+
+        Args:
+            script_id: 话术唯一标识
+
+        Returns:
+            话术字典，不存在返回 None
+        """
+        # 缓存命中
+        if self._is_cache_valid(script_id):
             return self._cache[script_id]
 
-        # 从数据库获取
-        async with session_manager.get_session() as session:
-            try:
-                stmt = select(CallScript).where(CallScript.script_id == script_id)
-                result = await session.execute(stmt)
-                db_script = result.scalar_one_or_none()
+        # 查询数据库
+        row = await fetchrow(
+            f"SELECT {_COLUMNS} FROM lk_scripts WHERE script_id = $1",
+            script_id,
+        )
+        if row is None:
+            logger.warning("话术未找到: %s", script_id)
+            return None
 
-                if not db_script:
-                    logger.warning(f"未找到话术脚本: {script_id}")
-                    return None
+        data = _record_to_dict(row)
+        self._set_cache(script_id, data)
+        return data
 
-                script_config = ScriptConfig(
-                    script_id=db_script.script_id,
-                    name=db_script.name,
-                    description=db_script.description,
-                    script_type=db_script.script_type,
-                    opening_script=db_script.opening_script,
-                    opening_pause=db_script.opening_pause,
-                    main_script=db_script.main_script,
-                    closing_script=db_script.closing_script,
-                    is_active=db_script.is_active,
-                    opening_barge_in=db_script.opening_barge_in,
-                    closing_barge_in=db_script.closing_barge_in,
-                    conversation_barge_in=db_script.conversation_barge_in,
-                    barge_in_protect_start=db_script.barge_in_protect_start,
-                    barge_in_protect_end=db_script.barge_in_protect_end,
-                    tolerance_enabled=db_script.tolerance_enabled,
-                    tolerance_ms=db_script.tolerance_ms,
-                    no_response_timeout=db_script.no_response_timeout,
-                    no_response_mode=db_script.no_response_mode,
-                    no_response_max_count=db_script.no_response_max_count,
-                    no_response_hangup_msg=db_script.no_response_hangup_msg,
-                    no_response_hangup_enabled=db_script.no_response_hangup_enabled
-                )
+    async def get_all_scripts(self, active_only: bool = True) -> list[dict]:
+        """获取话术列表。
 
-                # 加入缓存
-                self._cache[script_id] = script_config
-                return script_config
-            except SQLAlchemyError as e:
-                logger.error(f"获取话术脚本失败: {e}")
-                return None
+        Args:
+            active_only: 是否只返回活跃话术（is_active=true）
 
-    async def get_all_scripts(self) -> List[ScriptConfig]:
-        """获取所有活跃话术脚本"""
-        async with session_manager.get_session() as session:
-            try:
-                stmt = select(CallScript).where(CallScript.is_active == True)
-                result = await session.execute(stmt)
-                db_scripts = result.scalars().all()
+        Returns:
+            话术字典列表
+        """
+        if active_only:
+            rows = await fetch(
+                f"SELECT {_COLUMNS} FROM lk_scripts WHERE is_active = true ORDER BY id"
+            )
+        else:
+            rows = await fetch(
+                f"SELECT {_COLUMNS} FROM lk_scripts ORDER BY id"
+            )
+        return [_record_to_dict(r) for r in rows]
 
-                scripts = []
-                for db_script in db_scripts:
-                    script_config = ScriptConfig(
-                        script_id=db_script.script_id,
-                        name=db_script.name,
-                        description=db_script.description,
-                        script_type=db_script.script_type,
-                        opening_script=db_script.opening_script,
-                        opening_pause=db_script.opening_pause,
-                        main_script=db_script.main_script,
-                        closing_script=db_script.closing_script,
-                        is_active=db_script.is_active,
-                        opening_barge_in=db_script.opening_barge_in,
-                        closing_barge_in=db_script.closing_barge_in,
-                        conversation_barge_in=db_script.conversation_barge_in,
-                        barge_in_protect_start=db_script.barge_in_protect_start,
-                        barge_in_protect_end=db_script.barge_in_protect_end,
-                        tolerance_enabled=db_script.tolerance_enabled,
-                        tolerance_ms=db_script.tolerance_ms,
-                        no_response_timeout=db_script.no_response_timeout,
-                        no_response_mode=db_script.no_response_mode,
-                        no_response_max_count=db_script.no_response_max_count,
-                        no_response_hangup_msg=db_script.no_response_hangup_msg,
-                        no_response_hangup_enabled=db_script.no_response_hangup_enabled
-                    )
-                    scripts.append(script_config)
+    async def create_script(self, data: ScriptCreate) -> dict:
+        """创建话术。
 
-                return scripts
-            except SQLAlchemyError as e:
-                logger.error(f"获取话术脚本列表失败: {e}")
-                return []
+        Args:
+            data: 创建请求模型
 
-    async def update_script(self, script_id: str, **kwargs) -> bool:
-        """更新话术脚本"""
-        try:
-            async with session_manager.get_session() as session:
-                update_dict = {k: v for k, v in kwargs.items() if v is not None}
+        Returns:
+            创建后的完整话术字典
 
-                if update_dict:
-                    stmt = update(CallScript).where(CallScript.script_id == script_id).values(**update_dict)
-                    result = await session.execute(stmt)
+        Raises:
+            ValueError: script_id 已存在
+        """
+        # 检查 script_id 是否冲突
+        existing = await fetchrow(
+            "SELECT script_id FROM lk_scripts WHERE script_id = $1",
+            data.script_id,
+        )
+        if existing is not None:
+            raise ValueError(f"话术标识已存在: {data.script_id}")
 
-                    if result.rowcount > 0:
-                        await session.commit()
+        # 插入
+        await execute(
+            """
+            INSERT INTO lk_scripts (
+                script_id, name, description, script_type,
+                opening_text, opening_pause_ms, main_prompt, closing_text,
+                barge_in_opening, barge_in_conversation, barge_in_closing,
+                barge_in_protect_start_sec, barge_in_protect_end_sec,
+                tolerance_enabled, tolerance_ms,
+                no_response_timeout_sec, no_response_mode, no_response_max_count,
+                no_response_prompt, no_response_hangup_text
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11,
+                $12, $13,
+                $14, $15,
+                $16, $17, $18,
+                $19, $20
+            )
+            """,
+            data.script_id,
+            data.name,
+            data.description,
+            data.script_type,
+            data.opening_text,
+            data.opening_pause_ms,
+            data.main_prompt,
+            data.closing_text,
+            data.barge_in_opening,
+            data.barge_in_conversation,
+            data.barge_in_closing,
+            data.barge_in_protect_start_sec,
+            data.barge_in_protect_end_sec,
+            data.tolerance_enabled,
+            data.tolerance_ms,
+            data.no_response_timeout_sec,
+            data.no_response_mode,
+            data.no_response_max_count,
+            data.no_response_prompt,
+            data.no_response_hangup_text,
+        )
 
-                        # 清除缓存
-                        if script_id in self._cache:
-                            del self._cache[script_id]
+        # 查询完整记录并写入缓存
+        created = await self.get_script(data.script_id)
+        logger.info("话术已创建: %s", data.script_id)
+        return created  # type: ignore[return-value]
 
-                        logger.info(f"话术脚本已更新: {script_id}")
-                        return True
-                    else:
-                        logger.warning(f"未找到要更新的话术脚本: {script_id}")
-                        return False
-        except SQLAlchemyError as e:
-            logger.error(f"更新话术脚本失败: {e}")
-            return False
+    async def update_script(self, script_id: str, data: ScriptUpdate) -> Optional[dict]:
+        """更新话术。
 
-    async def create_script(self, script_config: ScriptConfig) -> bool:
-        """创建新的话术脚本"""
-        try:
-            async with session_manager.get_session() as session:
-                # 检查是否已存在
-                existing_stmt = select(CallScript).where(CallScript.script_id == script_config.script_id)
-                existing_result = await session.execute(existing_stmt)
-                existing = existing_result.scalar_one_or_none()
+        仅更新请求体中非 None 的字段。
 
-                if existing:
-                    logger.warning(f"话术脚本已存在: {script_config.script_id}")
-                    return False
+        Args:
+            script_id: 话术唯一标识
+            data: 更新请求模型
 
-                # 准备插入数据
-                new_script = CallScript(
-                    script_id=script_config.script_id,
-                    name=script_config.name,
-                    description=script_config.description,
-                    script_type=script_config.script_type,
-                    opening_script=script_config.opening_script,
-                    opening_pause=script_config.opening_pause,
-                    main_script=script_config.main_script,
-                    closing_script=script_config.closing_script,
-                    is_active=script_config.is_active,
-                    opening_barge_in=script_config.opening_barge_in,
-                    closing_barge_in=script_config.closing_barge_in,
-                    conversation_barge_in=script_config.conversation_barge_in,
-                    barge_in_protect_start=script_config.barge_in_protect_start,
-                    barge_in_protect_end=script_config.barge_in_protect_end,
-                    tolerance_enabled=script_config.tolerance_enabled,
-                    tolerance_ms=script_config.tolerance_ms,
-                    no_response_timeout=script_config.no_response_timeout,
-                    no_response_mode=script_config.no_response_mode,
-                    no_response_max_count=script_config.no_response_max_count,
-                    no_response_hangup_msg=script_config.no_response_hangup_msg,
-                    no_response_hangup_enabled=script_config.no_response_hangup_enabled
-                )
+        Returns:
+            更新后的完整话术字典，话术不存在返回 None
+        """
+        # 检查话术是否存在
+        existing = await fetchrow(
+            "SELECT script_id FROM lk_scripts WHERE script_id = $1",
+            script_id,
+        )
+        if existing is None:
+            return None
 
-                session.add(new_script)
-                await session.commit()
+        # 构建动态 SET 子句
+        update_fields = data.model_dump(exclude_none=True)
+        if not update_fields:
+            # 没有需要更新的字段，直接返回当前数据
+            return await self.get_script(script_id)
 
-                # 清除缓存
-                if script_config.script_id in self._cache:
-                    del self._cache[script_config.script_id]
+        set_clauses: list[str] = []
+        args: list = []
+        idx = 1
+        for col, val in update_fields.items():
+            set_clauses.append(f"{col} = ${idx}")
+            args.append(val)
+            idx += 1
 
-                logger.info(f"话术脚本已创建: {script_config.script_id}")
-                return True
-        except SQLAlchemyError as e:
-            logger.error(f"创建话术脚本失败: {e}")
-            return False
+        # updated_at 直接写在 SQL 中，不作为参数传入
+        set_clauses.append("updated_at = NOW()")
+
+        args.append(script_id)
+        sql = (
+            f"UPDATE lk_scripts SET {', '.join(set_clauses)} "
+            f"WHERE script_id = ${idx}"
+        )
+        await execute(sql, *args)
+
+        # 清除缓存并重新加载
+        self._invalidate(script_id)
+        updated = await self.get_script(script_id)
+        logger.info("话术已更新: %s", script_id)
+        return updated
 
     async def delete_script(self, script_id: str) -> bool:
-        """删除话术脚本（软删除，设置is_active为False）"""
-        try:
-            async with session_manager.get_session() as session:
-                stmt = update(CallScript).where(CallScript.script_id == script_id).values(is_active=False)
-                result = await session.execute(stmt)
+        """软删除话术（设置 is_active=false）。
 
-                if result.rowcount > 0:
-                    await session.commit()
+        Args:
+            script_id: 话术唯一标识
 
-                    # 清除缓存
-                    if script_id in self._cache:
-                        del self._cache[script_id]
-
-                    logger.info(f"话术脚本已删除（软删除）: {script_id}")
-                    return True
-                else:
-                    logger.warning(f"未找到要删除的话术脚本: {script_id}")
-                    return False
-        except SQLAlchemyError as e:
-            logger.error(f"删除话术脚本失败: {e}")
+        Returns:
+            是否删除成功（话术不存在返回 False）
+        """
+        result = await execute(
+            """
+            UPDATE lk_scripts
+            SET is_active = false, updated_at = NOW()
+            WHERE script_id = $1
+            """,
+            script_id,
+        )
+        # asyncpg execute 返回类似 "UPDATE 1" 的字符串
+        affected = int(result.split()[-1]) if result else 0
+        if affected == 0:
+            logger.warning("软删除话术未命中: %s", script_id)
             return False
 
-    async def refresh_cache(self):
-        """刷新缓存"""
-        self._cache.clear()
+        # 清除缓存
+        self._invalidate(script_id)
+        logger.info("话术已软删除: %s", script_id)
+        return True
 
 
 # 全局话术服务实例
 script_service = ScriptService()
 
-
-async def build_system_prompt_from_db(script_id: str, customer_info: dict) -> str:
-    """
-    从数据库构建系统Prompt
-    """
-    script_config = await script_service.get_script(script_id)
-    if not script_config:
-        logger.warning(f"话术脚本未找到: {script_id}，使用默认话术")
-        # 返回默认话术
-        main_script_text = "【推介产品】默认产品\n【产品介绍】默认产品描述\n【目标客群】默认客户"
-    else:
-        main_script_text = script_config.main_script
-    customer_profile = _format_customer_profile(customer_info)
-
-    return f"""
-
-{main_script_text}
-
-{customer_profile}
-
-【输出格式 - 严格遵守】
-你必须返回合法的 JSON，格式如下：
-{{
-  "reply": "你要说的话（纯文字，不含 markdown）",
-  "intent": "用户意图：interested|need_more_info|not_interested|busy|request_human|callback|unknown",
-  "action": "下一步动作：continue|transfer|callback|send_sms|blacklist|end",
-  "action_params": {{
-    "extension": "转人工分机，可选",
-    "callback_time": "回拨时间，可选，格式 YYYY-MM-DD HH:MM",
-    "note": "回拨或黑名单备注，可选",
-    "template_id": "短信模板，可选",
-    "vars": {{}},
-    "farewell": "结束通话时的告别语，可选",
-    "reason": "加入黑名单原因，可选"
-  }}
-}}
-
-不要在 JSON 外面加任何文字或 markdown 代码块。"""
-
-
-async def build_opening_from_db(script_id: str, customer_info: dict) -> dict:
-    """
-    从数据库生成开场白
-    """
-    script_config = await script_service.get_script(script_id)
-    if not script_config:
-        logger.warning(f"话术脚本未找到: {script_id}，使用默认开场白")
-        # 返回默认开场白
-        customer_name = customer_info.get("name", "")
-        name_part = f"{customer_name}您好" if customer_name else "您好"
-        opening_text = f"{name_part}，我是XX银行的智能客服小智，本通话由人工智能完成，请放心。请问您现在方便说话吗？"
-        pause_time = 2000  # 默认2秒
-    else:
-        # 使用数据库中的开场白
-        opening_text = script_config.opening_script
-        pause_time = script_config.opening_pause
-
-    return {
-        "reply": opening_text,
-        "pause_ms": pause_time,  # 停顿时长
-        "intent": "unknown",
-        "action": "continue",
-        "action_params": {},
-    }
-
-
-async def init_scripts_if_empty():
-    """
-    初始化话术脚本（如果数据库中没有数据）
-    """
-    scripts = await script_service.get_all_scripts()
-    if not scripts:
-        logger.info("数据库中没有话术脚本，正在初始化种子数据...")
-        try:
-            from backend.scripts.seed_scripts import seed_scripts
-            results = await seed_scripts()
-            for r in results:
-                logger.info(f"  {r}")
-            logger.info(f"话术脚本初始化完成")
-        except Exception as e:
-            logger.error(f"话术脚本初始化失败: {e}")
-    else:
-        logger.info(f"已从数据库加载 {len(scripts)} 个话术脚本")

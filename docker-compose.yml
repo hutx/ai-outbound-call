@@ -1,0 +1,207 @@
+services:
+  # LiveKit Server - 实时音视频服务器
+  # 注意: 版本需与 egress 兼容，pin 到同一发布版本
+  livekit-server:
+    image: livekit/livekit-server:v1.7.2
+    ports:
+      - "7880:7880"   # HTTP/WebSocket
+      - "7881:7881"   # RTC (TCP)
+      - "7882:7882/udp"  # RTC (UDP)
+    volumes:
+      - ./docker/livekit.yaml:/etc/livekit.yaml
+    command: ["--config", "/etc/livekit.yaml"]
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # LiveKit SIP - SIP 网关
+  livekit-sip:
+    image: livekit/sip:latest
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      # RTP 媒体端口范围（与 sip-config.yaml rtp_port 对应）
+      # 必须暴露 UDP 端口，否则 Zoiper 发送到 external_ip:RTP_PORT 的包无法到达容器
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - ./docker/sip-config.yaml:/sip/config.yaml
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - LIVEKIT_API_KEY=${LK_LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LK_LIVEKIT_API_SECRET:-secret}
+    depends_on:
+      - livekit-server
+    restart: unless-stopped
+
+  # FastAPI 服务
+  api:
+    build:
+      context: backend
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    command: ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - postgres
+      - redis
+      - livekit-server
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    restart: unless-stopped
+
+  # SIP Trunk 初始化（一次性运行）
+  sip-init:
+    build:
+      context: backend
+      dockerfile: Dockerfile.backend
+    env_file:
+      - .env
+    environment:
+      - LK_LIVEKIT_URL=http://livekit-server:7880
+    command: ["python", "-m", "scripts.init_sip_trunk"]
+    depends_on:
+      livekit-server:
+        condition: service_started
+      kamailio:
+        condition: service_started
+    restart: "no"
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+
+  # Agent Worker
+  agent:
+    build:
+      context: backend
+      dockerfile: Dockerfile.backend
+    env_file:
+      - .env
+    command: ["python", "-m", "agent.worker", "start"]
+    depends_on:
+      livekit-server:
+        condition: service_started
+      sip-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    restart: unless-stopped
+
+  # PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${LK_PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${LK_PG_PASSWORD:-postgres}
+      POSTGRES_DB: ${LK_PG_DATABASE:-ai_outbound_livekit}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Kamailio 数据库初始化（一次性运行，使用 postgres 镜像以获取 psql 工具）
+  kamailio-init:
+    image: postgres:16-alpine
+    volumes:
+      - ./docker/kamailio/kamctlrc:/etc/kamailio/kamctlrc:ro
+      - ./docker/kamailio/init_kamailio_db.sh:/init_kamailio_db.sh:ro
+    env_file:
+      - .env
+    environment:
+      - LK_KAMAILIO_SIP_DOMAIN=${LK_KAMAILIO_SIP_DOMAIN:-localhost}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/init_kamailio_db.sh"]
+    restart: "no"
+
+  # Kamailio SIP Server - 软电话注册与路由
+  # 使用 bridge 模式 + 端口映射 5080:5060
+  # kamailio.cfg 中配置了 advertise 192.168.5.15:5080，确保 Via/Record-Route 使用可达地址
+  # 同时启用 fix_nated_sdp 修复 SDP 中的 NAT 地址，解决 RTP 媒体流不通问题
+  kamailio:
+    image: kamailio/kamailio-ci:5.4.7-alpine
+    ports:
+      - "5080:5060/udp"    # SIP UDP（用 5080 避免与 livekit-sip 的 5060 冲突）
+      - "5080:5060/tcp"    # SIP TCP
+    volumes:
+      - ./docker/kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+      - ./docker/kamailio/kamctlrc:/etc/kamailio/kamctlrc:ro
+    environment:
+      - SIP_DOMAIN=${LK_KAMAILIO_SIP_DOMAIN:-localhost}
+    depends_on:
+      kamailio-init:
+        condition: service_completed_successfully
+      livekit-sip:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - kamailio
+
+  # MinIO - S3 兼容存储（录音文件存储）
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${LK_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${LK_MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ./docker/minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+  # LiveKit Egress - 录制/导出服务
+  # 注意: 版本需与 livekit-server 兼容，pin 到同一发布版本
+  livekit-egress:
+    image: livekit/egress:v1.8.2
+    container_name: livekit-egress
+    environment:
+      EGRESS_CONFIG_BODY: |
+        log_level: debug
+        api_key: ${LK_LIVEKIT_API_KEY}
+        api_secret: ${LK_LIVEKIT_API_SECRET}
+        ws_url: ws://livekit-server:7880
+        redis:
+          address: redis:6379
+        s3:
+          access_key: ${LK_MINIO_ACCESS_KEY:-minioadmin}
+          secret: ${LK_MINIO_SECRET_KEY:-minioadmin}
+          region: us-east-1
+          endpoint: http://minio:9000
+          bucket: ${LK_MINIO_BUCKET:-lk-recordings}
+          force_path_style: true
+    depends_on:
+      - livekit-server
+      - redis
+      - minio
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
